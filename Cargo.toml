@@ -1,0 +1,19 @@
+[package]
+name = "terminal"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+nix = { version = "0.31.3", features = ["term", "process", "ioctl", "signal"] }
+libc = "0.2"
+vte = "0.15.0"
+winit = "0.30.13"
+wgpu = "30.0.0"
+pollster = "0.3"
+font-kit = "0.14.3"
+fontdue = "0.9.3"
+bitflags = "2"
+bytemuck = { version = "1", features = ["derive"] }
+unicode-width = "0.1"
+log = "0.4"
+env_logger = "0.11"
