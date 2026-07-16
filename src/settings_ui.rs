@@ -164,6 +164,13 @@ pub struct SettingsWindow {
     draft: ConfigDraft,
     category: Category,
     available_fonts: Vec<String>,
+    /// Set while `list_monospace_fonts` is still running on a background
+    /// thread. Walking every installed font family through CoreText to
+    /// check `is_monospace()` is slow enough (hundreds of families on a
+    /// typical Mac) that doing it synchronously on the main thread made
+    /// opening Preferences visibly freeze the whole app, not just this
+    /// window. Polled once per frame in `redraw`.
+    fonts_loading: Option<std::sync::mpsc::Receiver<Vec<String>>>,
     available_shells: Vec<String>,
 }
 
@@ -196,7 +203,7 @@ impl SettingsWindow {
             .create_surface(window.clone())
             .expect("failed to create settings window surface");
         let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
-            power_preference: wgpu::PowerPreference::LowPower,
+            power_preference: wgpu::PowerPreference::HighPerformance,
             compatible_surface: Some(&surface),
             ..Default::default()
         }))
@@ -234,6 +241,11 @@ impl SettingsWindow {
             egui_wgpu::RendererOptions::default(),
         );
 
+        let (fonts_tx, fonts_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = fonts_tx.send(list_monospace_fonts());
+        });
+
         SettingsWindow {
             window,
             surface,
@@ -245,7 +257,8 @@ impl SettingsWindow {
             egui_renderer,
             draft: ConfigDraft::from(config),
             category: Category::Font,
-            available_fonts: list_monospace_fonts(),
+            available_fonts: Vec::new(),
+            fonts_loading: Some(fonts_rx),
             available_shells: list_shells(),
         }
     }
@@ -280,17 +293,32 @@ impl SettingsWindow {
     }
 
     fn redraw(&mut self) -> SettingsAction {
+        if let Some(rx) = &self.fonts_loading {
+            match rx.try_recv() {
+                Ok(fonts) => {
+                    self.available_fonts = fonts;
+                    self.fonts_loading = None;
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => self.fonts_loading = None,
+                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                    // Still loading; keep polling on the next frame.
+                    self.window.request_redraw();
+                }
+            }
+        }
+
         let raw_input = self.egui_state.take_egui_input(&self.window);
 
         let category = &mut self.category;
         let draft = &mut self.draft;
         let available_fonts = &self.available_fonts;
+        let fonts_loading = self.fonts_loading.is_some();
         let available_shells = &self.available_shells;
         let mut saved_config = None;
         let full_output = self.egui_ctx.run_ui(raw_input, |ui| {
             draw_sidebar(ui, category);
             draw_footer(ui, draft, &mut saved_config);
-            draw_category_page(ui, *category, draft, available_fonts, available_shells);
+            draw_category_page(ui, *category, draft, available_fonts, fonts_loading, available_shells);
         });
 
         self.egui_state
@@ -437,13 +465,14 @@ fn draw_category_page(
     category: Category,
     draft: &mut ConfigDraft,
     available_fonts: &[String],
+    fonts_loading: bool,
     available_shells: &[String],
 ) {
     let frame =
         egui::Frame::central_panel(ui.style()).inner_margin(egui::Margin::symmetric(24, 20));
     egui::CentralPanel::default().frame(frame).show(ui, |ui| {
         egui::ScrollArea::vertical().show(ui, |ui| match category {
-            Category::Font => draw_font_page(ui, draft, available_fonts),
+            Category::Font => draw_font_page(ui, draft, available_fonts, fonts_loading),
             Category::Colors => draw_colors_page(ui, draft),
             Category::Shell => draw_shell_page(ui, draft, available_shells),
             Category::Scrollback => draw_scrollback_page(ui, draft),
@@ -463,7 +492,7 @@ fn field_description(ui: &mut egui::Ui, text: &str) {
     ui.add_space(4.0);
 }
 
-fn draw_font_page(ui: &mut egui::Ui, draft: &mut ConfigDraft, available_fonts: &[String]) {
+fn draw_font_page(ui: &mut egui::Ui, draft: &mut ConfigDraft, available_fonts: &[String], fonts_loading: bool) {
     page_title(ui, "Font");
 
     ui.label("Family");
@@ -474,15 +503,17 @@ fn draw_font_page(ui: &mut egui::Ui, draft: &mut ConfigDraft, available_fonts: &
     } else {
         draft.font_family.clone()
     };
-    egui::ComboBox::from_id_salt("font_family_combo")
-        .width(260.0)
-        .selected_text(selected_text)
-        .show_ui(ui, |ui| {
-            ui.selectable_value(&mut draft.font_family, String::new(), "Auto");
-            for name in available_fonts {
-                ui.selectable_value(&mut draft.font_family, name.clone(), name.as_str());
-            }
-        });
+    ui.add_enabled_ui(!fonts_loading, |ui| {
+        egui::ComboBox::from_id_salt("font_family_combo")
+            .width(260.0)
+            .selected_text(if fonts_loading { "Loading fonts..." } else { &selected_text })
+            .show_ui(ui, |ui| {
+                ui.selectable_value(&mut draft.font_family, String::new(), "Auto");
+                for name in available_fonts {
+                    ui.selectable_value(&mut draft.font_family, name.clone(), name.as_str());
+                }
+            });
+    });
     ui.add_space(4.0);
     ui.add(
         egui::TextEdit::singleline(&mut draft.font_family)
