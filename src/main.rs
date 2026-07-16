@@ -247,7 +247,9 @@ fn main() {
     event_loop.set_control_flow(ControlFlow::Wait);
     let proxy: EventLoopProxy<UserEvent> = event_loop.create_proxy();
 
-    menu::install(proxy.clone());
+    // Must stay alive for the whole run: the native menu bar holds raw
+    // pointers back into this value (see `menu::install`'s doc comment).
+    let _menu = menu::install(proxy.clone());
 
     let reader_master = Arc::clone(&pty_master);
     std::thread::spawn(move || {

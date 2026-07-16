@@ -83,6 +83,33 @@ fn non_empty(s: &str) -> Option<String> {
     }
 }
 
+const ANSI_NAMES: [&str; 16] = [
+    "Black", "Red", "Green", "Yellow", "Blue", "Magenta", "Cyan", "White",
+    "Bright Black", "Bright Red", "Bright Green", "Bright Yellow",
+    "Bright Blue", "Bright Magenta", "Bright Cyan", "Bright White",
+];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Category {
+    Font,
+    Colors,
+    Shell,
+    Scrollback,
+}
+
+impl Category {
+    const ALL: [Category; 4] = [Category::Font, Category::Colors, Category::Shell, Category::Scrollback];
+
+    fn title(self) -> &'static str {
+        match self {
+            Category::Font => "Font",
+            Category::Colors => "Colors",
+            Category::Shell => "Shell",
+            Category::Scrollback => "Scrollback",
+        }
+    }
+}
+
 pub struct SettingsWindow {
     window: Arc<Window>,
     surface: wgpu::Surface<'static>,
@@ -93,6 +120,7 @@ pub struct SettingsWindow {
     egui_state: egui_winit::State,
     egui_renderer: egui_wgpu::Renderer,
     draft: ConfigDraft,
+    category: Category,
 }
 
 impl SettingsWindow {
@@ -107,8 +135,9 @@ impl SettingsWindow {
     /// having to hold the whole terminal renderer back on an older wgpu.
     pub fn new(event_loop: &ActiveEventLoop, config: &Config) -> Self {
         let attrs = Window::default_attributes()
-            .with_title("Terminal Preferences")
-            .with_inner_size(winit::dpi::LogicalSize::new(480.0, 620.0));
+            .with_title("Preferences")
+            .with_inner_size(winit::dpi::LogicalSize::new(680.0, 520.0))
+            .with_min_inner_size(winit::dpi::LogicalSize::new(520.0, 400.0));
         let window = Arc::new(
             event_loop
                 .create_window(attrs)
@@ -171,6 +200,7 @@ impl SettingsWindow {
             egui_state,
             egui_renderer,
             draft: ConfigDraft::from(config),
+            category: Category::Font,
         }
     }
 
@@ -206,10 +236,13 @@ impl SettingsWindow {
     fn redraw(&mut self) -> SettingsAction {
         let raw_input = self.egui_state.take_egui_input(&self.window);
 
+        let category = &mut self.category;
         let draft = &mut self.draft;
         let mut saved_config = None;
         let full_output = self.egui_ctx.run_ui(raw_input, |ui| {
-            saved_config = build_form(ui, draft);
+            draw_sidebar(ui, category);
+            draw_footer(ui, draft, &mut saved_config);
+            draw_category_page(ui, *category, draft);
         });
 
         self.egui_state
@@ -268,7 +301,7 @@ impl SettingsWindow {
                     depth_slice: None,
                     resolve_target: None,
                     ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color { r: 0.12, g: 0.12, b: 0.13, a: 1.0 }),
+                        load: wgpu::LoadOp::Clear(wgpu::Color { r: 0.106, g: 0.106, b: 0.106, a: 1.0 }),
                         store: wgpu::StoreOp::Store,
                     },
                 })],
@@ -293,26 +326,110 @@ impl SettingsWindow {
     }
 }
 
-/// Draws the settings form. Returns `Some(config)` the frame the Save
-/// button is clicked.
-fn build_form(ui: &mut egui::Ui, draft: &mut ConfigDraft) -> Option<Config> {
-    let mut saved = None;
+/// Left-hand category list, VS Code settings style.
+fn draw_sidebar(ui: &mut egui::Ui, category: &mut Category) {
+    let frame = egui::Frame::side_top_panel(ui.style()).fill(egui::Color32::from_gray(24));
+    egui::Panel::left("categories").resizable(false).exact_size(160.0).frame(frame).show(ui, |ui| {
+        ui.add_space(12.0);
+        ui.horizontal(|ui| {
+            ui.add_space(12.0);
+            ui.heading("Preferences");
+        });
+        ui.add_space(8.0);
+        ui.separator();
+        ui.add_space(4.0);
 
-    ui.heading("Font");
-    egui::Grid::new("font_grid").num_columns(2).show(ui, |ui| {
-        ui.label("Family (blank = auto)");
-        ui.text_edit_singleline(&mut draft.font_family);
-        ui.end_row();
-
-        ui.label("Size");
-        ui.add(egui::DragValue::new(&mut draft.font_size).range(6.0..=72.0).speed(0.5));
-        ui.end_row();
+        for c in Category::ALL {
+            ui.add_space(2.0);
+            ui.horizontal(|ui| {
+                ui.add_space(8.0);
+                let selected = *category == c;
+                if ui
+                    .add_sized([136.0, 28.0], egui::Button::selectable(selected, c.title()))
+                    .clicked()
+                {
+                    *category = c;
+                }
+            });
+        }
     });
+}
 
-    ui.add_space(8.0);
+/// Bottom bar: Save button and status text, always visible regardless of
+/// which category page is showing or how far it's scrolled.
+fn draw_footer(ui: &mut egui::Ui, draft: &mut ConfigDraft, saved: &mut Option<Config>) {
+    let frame =
+        egui::Frame::side_top_panel(ui.style()).inner_margin(egui::Margin::symmetric(16, 10));
+    egui::Panel::bottom("footer").frame(frame).show(ui, |ui| {
+        ui.horizontal(|ui| {
+            if ui.add(egui::Button::new("Save").min_size(egui::vec2(80.0, 26.0))).clicked() {
+                let config = draft.to_config();
+                match config.save() {
+                    Ok(()) => {
+                        draft.status = Some(
+                            "Saved. Colors and scrollback apply immediately; font and shell \
+                             changes take effect on next launch."
+                                .to_string(),
+                        )
+                    }
+                    Err(e) => draft.status = Some(format!("Failed to save: {e}")),
+                }
+                *saved = Some(config);
+            }
+            if let Some(status) = &draft.status {
+                ui.add_space(8.0);
+                ui.label(egui::RichText::new(status).weak().small());
+            }
+        });
+    });
+}
+
+fn draw_category_page(ui: &mut egui::Ui, category: Category, draft: &mut ConfigDraft) {
+    let frame =
+        egui::Frame::central_panel(ui.style()).inner_margin(egui::Margin::symmetric(24, 20));
+    egui::CentralPanel::default().frame(frame).show(ui, |ui| {
+        egui::ScrollArea::vertical().show(ui, |ui| match category {
+            Category::Font => draw_font_page(ui, draft),
+            Category::Colors => draw_colors_page(ui, draft),
+            Category::Shell => draw_shell_page(ui, draft),
+            Category::Scrollback => draw_scrollback_page(ui, draft),
+        });
+    });
+}
+
+fn page_title(ui: &mut egui::Ui, title: &str) {
+    ui.heading(title);
+    ui.add_space(4.0);
     ui.separator();
-    ui.heading("Colors");
-    egui::Grid::new("base_color_grid").num_columns(2).show(ui, |ui| {
+    ui.add_space(12.0);
+}
+
+fn field_description(ui: &mut egui::Ui, text: &str) {
+    ui.label(egui::RichText::new(text).weak().small());
+    ui.add_space(4.0);
+}
+
+fn draw_font_page(ui: &mut egui::Ui, draft: &mut ConfigDraft) {
+    page_title(ui, "Font");
+
+    ui.label("Family");
+    field_description(ui, "Leave blank to use SF Mono, falling back to Menlo.");
+    ui.add(
+        egui::TextEdit::singleline(&mut draft.font_family)
+            .hint_text("SF Mono")
+            .desired_width(260.0),
+    );
+
+    ui.add_space(16.0);
+    ui.label("Size");
+    field_description(ui, "Point size before Retina scaling.");
+    ui.add(egui::DragValue::new(&mut draft.font_size).range(6.0..=72.0).speed(0.5).suffix(" pt"));
+}
+
+fn draw_colors_page(ui: &mut egui::Ui, draft: &mut ConfigDraft) {
+    page_title(ui, "Colors");
+
+    egui::Grid::new("base_color_grid").num_columns(2).spacing([16.0, 10.0]).show(ui, |ui| {
         ui.label("Background");
         ui.color_edit_button_srgb(&mut draft.background);
         ui.end_row();
@@ -322,55 +439,53 @@ fn build_form(ui: &mut egui::Ui, draft: &mut ConfigDraft) -> Option<Config> {
         ui.end_row();
     });
 
-    ui.add_space(4.0);
-    ui.label("ANSI palette (0-15)");
-    egui::Grid::new("ansi_color_grid").num_columns(8).show(ui, |ui| {
-        for (i, slot) in draft.ansi.iter_mut().enumerate() {
-            ui.color_edit_button_srgb(slot);
-            if i % 8 == 7 {
+    ui.add_space(20.0);
+    ui.label("ANSI palette");
+    field_description(ui, "The 16 standard/bright colors escape sequences select from.");
+    ui.add_space(6.0);
+
+    egui::Grid::new("ansi_color_grid").num_columns(4).spacing([20.0, 12.0]).show(ui, |ui| {
+        for (i, (slot, name)) in draft.ansi.iter_mut().zip(ANSI_NAMES).enumerate() {
+            ui.horizontal(|ui| {
+                ui.color_edit_button_srgb(slot);
+                ui.label(name);
+            });
+            if i % 4 == 3 {
                 ui.end_row();
             }
         }
     });
+}
 
-    ui.add_space(8.0);
-    ui.separator();
-    ui.heading("Shell");
-    egui::Grid::new("shell_grid").num_columns(2).show(ui, |ui| {
-        ui.label("Command (blank = $SHELL)");
-        ui.text_edit_singleline(&mut draft.shell_command);
-        ui.end_row();
+fn draw_shell_page(ui: &mut egui::Ui, draft: &mut ConfigDraft) {
+    page_title(ui, "Shell");
 
-        ui.label("Extra args");
-        ui.text_edit_singleline(&mut draft.shell_args);
-        ui.end_row();
-    });
+    ui.label("Command");
+    field_description(ui, "Leave blank to use $SHELL.");
+    ui.add(
+        egui::TextEdit::singleline(&mut draft.shell_command)
+            .hint_text("/bin/zsh")
+            .desired_width(260.0),
+    );
 
-    ui.add_space(8.0);
-    ui.separator();
-    ui.heading("Scrollback");
+    ui.add_space(16.0);
+    ui.label("Extra arguments");
+    field_description(ui, "Space-separated, appended after the login-shell argv0.");
+    ui.add(
+        egui::TextEdit::singleline(&mut draft.shell_args)
+            .hint_text("-l")
+            .desired_width(260.0),
+    );
+}
+
+fn draw_scrollback_page(ui: &mut egui::Ui, draft: &mut ConfigDraft) {
+    page_title(ui, "Scrollback");
+
+    ui.label("Lines");
+    field_description(ui, "How many lines of history to keep above the visible screen.");
     ui.add(
         egui::DragValue::new(&mut draft.scrollback_lines)
             .range(0..=1_000_000)
             .speed(50.0),
     );
-
-    ui.add_space(16.0);
-    ui.separator();
-    ui.horizontal(|ui| {
-        if ui.button("Save").clicked() {
-            let config = draft.to_config();
-            match config.save() {
-                Ok(()) => draft.status = Some("Saved. Colors and scrollback apply immediately; \
-                    font and shell changes take effect on next launch.".to_string()),
-                Err(e) => draft.status = Some(format!("Failed to save: {e}")),
-            }
-            saved = Some(config);
-        }
-    });
-    if let Some(status) = &draft.status {
-        ui.label(status);
-    }
-
-    saved
 }

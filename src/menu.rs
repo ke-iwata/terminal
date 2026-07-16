@@ -9,7 +9,16 @@ pub const PREFERENCES_ID: &str = "preferences";
 /// (Cmd+,), and Quit. Must be called once at startup, and pairs with
 /// `EventLoopBuilder::with_default_menu(false)` on the event loop so
 /// winit's own placeholder menu doesn't fight this one.
-pub fn install(proxy: EventLoopProxy<UserEvent>) {
+///
+/// Returns the `Menu` -- the caller MUST keep it alive for as long as the
+/// app runs. `init_for_nsapp` hands the native NSMenu to AppKit, but the
+/// native menu items still hold raw pointers back into muda's Rust-side
+/// state; dropping this value lets that state (and those pointers) go
+/// dangling, which crashes -- often with a bizarre, unrelated-looking
+/// panic -- the next time a menu item is clicked. See
+/// https://github.com/tauri-apps/muda/issues/233.
+#[must_use = "dropping the returned Menu detaches the native menu bar and leaves dangling pointers behind it"]
+pub fn install(proxy: EventLoopProxy<UserEvent>) -> Menu {
     let menu = Menu::new();
     let app_menu = Submenu::new("Terminal", true);
 
@@ -38,4 +47,6 @@ pub fn install(proxy: EventLoopProxy<UserEvent>) {
             let _ = proxy.send_event(UserEvent::OpenSettings);
         }
     }));
+
+    menu
 }
