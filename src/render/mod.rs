@@ -1,15 +1,14 @@
 mod font;
 mod pipeline;
 
-use crate::term::color::{DEFAULT_BG, DEFAULT_FG};
+use crate::config::FontConfig;
+use crate::term::color::Palette;
 use crate::term::grid::CellFlags;
 use crate::term::Term;
 use font::FontAtlas;
 use pipeline::{CellPipeline, Instance};
 use std::sync::Arc;
 use winit::window::Window;
-
-const FONT_POINT_SIZE: f32 = 14.0;
 
 pub struct Renderer {
     surface: wgpu::Surface<'static>,
@@ -18,10 +17,11 @@ pub struct Renderer {
     config: wgpu::SurfaceConfiguration,
     pipeline: CellPipeline,
     atlas: FontAtlas,
+    palette: Palette,
 }
 
 impl Renderer {
-    pub fn new(window: Arc<Window>) -> Self {
+    pub fn new(window: Arc<Window>, font: &FontConfig, palette: Palette) -> Self {
         let size = window.inner_size();
         let scale_factor = window.scale_factor();
 
@@ -54,8 +54,8 @@ impl Renderer {
 
         // Rasterize at physical pixels (point size * scale factor) so text
         // stays crisp on Retina displays instead of being upscaled/blurry.
-        let px_size = FONT_POINT_SIZE * scale_factor as f32;
-        let atlas = FontAtlas::new(px_size);
+        let px_size = font.size.max(1.0) * scale_factor as f32;
+        let atlas = FontAtlas::new(px_size, font.family.as_deref());
         let atlas_texture = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("glyph atlas"),
             size: wgpu::Extent3d {
@@ -101,11 +101,16 @@ impl Renderer {
             config,
             pipeline,
             atlas,
+            palette,
         }
     }
 
     pub fn cell_size(&self) -> (f32, f32) {
         (self.atlas.cell_width, self.atlas.cell_height)
+    }
+
+    pub fn set_palette(&mut self, palette: Palette) {
+        self.palette = palette;
     }
 
     pub fn resize(&mut self, new_size: winit::dpi::PhysicalSize<u32>) {
@@ -161,12 +166,7 @@ impl Renderer {
                     depth_slice: None,
                     resolve_target: None,
                     ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color {
-                            r: 0.04,
-                            g: 0.04,
-                            b: 0.06,
-                            a: 1.0,
-                        }),
+                        load: wgpu::LoadOp::Clear(palette_clear_color(&self.palette)),
                         store: wgpu::StoreOp::Store,
                     },
                 })],
@@ -191,14 +191,20 @@ impl Renderer {
                 let cell = &line[col];
                 let reverse = cell.flags.contains(CellFlags::REVERSE);
                 let (fg_default, bg_default) = if reverse {
-                    (DEFAULT_BG, DEFAULT_FG)
+                    (self.palette.background, self.palette.foreground)
                 } else {
-                    (DEFAULT_FG, DEFAULT_BG)
+                    (self.palette.foreground, self.palette.background)
                 };
                 let (fg, bg) = if reverse {
-                    (cell.bg.to_rgb(fg_default), cell.fg.to_rgb(bg_default))
+                    (
+                        cell.bg.to_rgb(fg_default, &self.palette),
+                        cell.fg.to_rgb(bg_default, &self.palette),
+                    )
                 } else {
-                    (cell.fg.to_rgb(fg_default), cell.bg.to_rgb(bg_default))
+                    (
+                        cell.fg.to_rgb(fg_default, &self.palette),
+                        cell.bg.to_rgb(bg_default, &self.palette),
+                    )
                 };
 
                 let cell_x = col as f32 * cw;
@@ -248,4 +254,14 @@ impl Renderer {
 
 fn rgb_to_color((r, g, b): (u8, u8, u8)) -> [f32; 4] {
     [r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0, 1.0]
+}
+
+fn palette_clear_color(palette: &Palette) -> wgpu::Color {
+    let (r, g, b) = palette.background;
+    wgpu::Color {
+        r: r as f64 / 255.0,
+        g: g as f64 / 255.0,
+        b: b as f64 / 255.0,
+        a: 1.0,
+    }
 }

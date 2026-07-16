@@ -1,0 +1,38 @@
+# Example config for this terminal emulator.
+#
+# Copy this file to ~/.terminal.config.toml and edit it, or open it from
+# the app's menu bar under Terminal > Preferences... (Cmd+,), which edits
+# and saves this same file for you.
+#
+# Every field is optional; anything you omit falls back to its default
+# (shown below). A malformed file is ignored with a warning printed to
+# the terminal that launched the app -- it never prevents startup.
+
+scrollback_lines = 10000
+
+[font]
+# System font family name. Left unset, or set to a name that isn't
+# installed, falls back through "SF Mono" -> "Menlo" -> the system's
+# default monospace font.
+# family = "SF Mono"
+size = 14.0
+
+[colors]
+background = "#000000"
+foreground = "#e5e5e5"
+# The 16 standard/bright ANSI colors, in order:
+# black, red, green, yellow, blue, magenta, cyan, white,
+# bright black, bright red, bright green, bright yellow,
+# bright blue, bright magenta, bright cyan, bright white.
+ansi = [
+    "#000000", "#cd0000", "#00cd00", "#cdcd00",
+    "#0000ee", "#cd00cd", "#00cdcd", "#e5e5e5",
+    "#7f7f7f", "#ff0000", "#00ff00", "#ffff00",
+    "#5c5cff", "#ff00ff", "#00ffff", "#ffffff",
+]
+
+[shell]
+# Overrides $SHELL when set.
+# command = "/bin/zsh"
+# Extra arguments appended after the login-shell argv0.
+args = []

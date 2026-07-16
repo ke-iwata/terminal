@@ -12,6 +12,9 @@ escape sequences itself, and renders every cell with a GPU pipeline it owns.
 - [`winit`](https://docs.rs/winit) — window and input event handling
 - [`wgpu`](https://docs.rs/wgpu) — GPU-accelerated (Metal) rendering
 - [`font-kit`](https://docs.rs/font-kit) + [`fontdue`](https://docs.rs/fontdue) — system font lookup and glyph rasterization
+- [`muda`](https://docs.rs/muda) — native macOS menu bar
+- [`egui`](https://docs.rs/egui) + `egui-winit` + `egui-wgpu` — the Preferences window
+- [`toml`](https://docs.rs/toml) + `serde` — config file read/write
 
 ## Features
 
@@ -23,12 +26,26 @@ escape sequences itself, and renders every cell with a GPU pipeline it owns.
 - Retina-aware glyph rendering via a font atlas
 - Window resizing kept in sync with the pty and the character grid
 - Scrollback with mouse-wheel scrolling (suspended while an alt-screen app is active)
+- Configurable via `~/.terminal.config.toml`, editable either by hand or
+  through Terminal > Preferences... (⌘,) in the menu bar
+
+## Configuration
+
+Settings live in `~/.terminal.config.toml`. See [config.example.toml](config.example.toml)
+for every field and its default. The file is optional — a missing or
+malformed one just falls back to defaults (a parse error is printed to
+the terminal that launched the app, but never blocks startup).
+
+Open **Terminal > Preferences...** (⌘,) from the menu bar for a GUI form
+covering the same fields (font, colors, shell, scrollback). Saving writes
+back to the same TOML file. Color and scrollback changes apply immediately;
+font and shell changes take effect on the next launch.
 
 ## Not implemented
 
-Tabs/panes, a config file, clipboard copy-paste, font ligatures/fallback,
-image protocols (sixel etc.), and OSC 8 hyperlinks. See the codebase's
-module layout below for where these would plug in.
+Tabs/panes, clipboard copy-paste, font ligatures/fallback, image protocols
+(sixel etc.), and OSC 8 hyperlinks. See the codebase's module layout below
+for where these would plug in.
 
 ## Running
 
@@ -47,8 +64,9 @@ cargo test
 ```
 
 Covers the VT parser and Grid model (cursor movement, SGR, scroll regions,
-alt screen, line wrapping, scrollback), key-to-byte-sequence encoding, and
-font atlas construction against the real system font.
+alt screen, line wrapping, scrollback), key-to-byte-sequence encoding, font
+atlas construction against the real system font, and config TOML
+parsing/round-tripping (including validating `config.example.toml` itself).
 
 ## Layout
 
@@ -57,15 +75,27 @@ src/
   main.rs        winit ApplicationHandler: owns the window, pty, and Term
   pty.rs         forkpty, login shell exec, TIOCSWINSZ resize
   input.rs       keyboard event -> pty byte sequence encoding
+  config.rs      Config/FontConfig/ColorConfig/ShellConfig, TOML load/save
+  menu.rs        native macOS menu bar (muda), Preferences (Cmd+,)
+  settings_ui.rs egui Preferences window: form UI, its own wgpu device
   term/
     mod.rs       Term: cursor, modes, active/alt Grid, line wrapping
     grid.rs      Grid/Cell/Row, scrollback, resize
     perform.rs   vte::Perform impl (CSI/OSC/ESC dispatch)
-    color.rs     16/256-color palette, Color -> RGB resolution
+    color.rs     16/256-color palette (Palette), Color -> RGB resolution
   render/
     mod.rs       wgpu surface/device setup, Grid -> instance buffer
     pipeline.rs  instanced quad render pipeline
     font.rs      font-kit lookup + fontdue rasterization into a glyph atlas
 shaders/
   cell.wgsl      vertex/fragment shader for cell background + glyph quads
+config.example.toml  every config field documented with its default
 ```
+
+### Why the Preferences window has its own GPU device
+
+`egui-wgpu` 0.35 depends on `wgpu` 29.x while the terminal renderer uses
+`wgpu` 30.x — two distinct, type-incompatible copies of the crate. Rather
+than hold the whole terminal renderer back on an older wgpu, the settings
+window gets its own small, independent wgpu instance/device instead of
+sharing the main window's.

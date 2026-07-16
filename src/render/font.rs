@@ -34,8 +34,8 @@ impl FontAtlas {
     /// available system monospace font at `px_size` physical pixels
     /// (already multiplied by the window's scale factor by the caller, so
     /// glyphs come out crisp on Retina displays).
-    pub fn new(px_size: f32) -> Self {
-        let font = load_system_monospace_font();
+    pub fn new(px_size: f32, family: Option<&str>) -> Self {
+        let font = load_system_monospace_font(family);
 
         let line = font.horizontal_line_metrics(px_size).unwrap_or(fontdue::LineMetrics {
             ascent: px_size * 0.8,
@@ -124,19 +124,22 @@ impl FontAtlas {
     }
 }
 
-/// Look up a system monospace font via CoreText, preferring SF Mono (not
-/// always resolvable through the public font API depending on macOS
-/// version) and falling back to Menlo, which is always available.
-fn load_system_monospace_font() -> fontdue::Font {
+/// Look up a system monospace font via CoreText. If `family` is given it's
+/// tried first; an unrecognized name (typo, uninstalled font) just falls
+/// through to the same SF Mono -> Menlo -> generic-monospace chain used
+/// when no family is configured at all, so a bad config value never
+/// prevents startup.
+fn load_system_monospace_font(family: Option<&str>) -> fontdue::Font {
+    let mut names = Vec::new();
+    if let Some(family) = family {
+        names.push(FamilyName::Title(family.to_string()));
+    }
+    names.push(FamilyName::Title("SF Mono".to_string()));
+    names.push(FamilyName::Title("Menlo".to_string()));
+    names.push(FamilyName::Monospace);
+
     let handle = SystemSource::new()
-        .select_best_match(
-            &[
-                FamilyName::Title("SF Mono".to_string()),
-                FamilyName::Title("Menlo".to_string()),
-                FamilyName::Monospace,
-            ],
-            &Properties::new(),
-        )
+        .select_best_match(&names, &Properties::new())
         .expect("no monospace font available on this system");
 
     let font_kit_font = handle.load().expect("failed to load system font");
@@ -157,7 +160,7 @@ mod tests {
         // Exercises the actual CoreText -> font-kit -> fontdue pipeline
         // (no mocking), since that boundary can't be checked at compile
         // time and this sandbox can't visually confirm rendering.
-        let atlas = FontAtlas::new(28.0);
+        let atlas = FontAtlas::new(28.0, None);
 
         assert!(atlas.cell_width > 0.0);
         assert!(atlas.cell_height > 0.0);
@@ -175,5 +178,12 @@ mod tests {
         let wx = (atlas.white_uv[0] * atlas.width as f32) as usize;
         let wy = (atlas.white_uv[1] * atlas.height as f32) as usize;
         assert_eq!(atlas.pixels[wy * atlas.width as usize + wx], 255);
+    }
+
+    #[test]
+    fn unknown_family_falls_back_instead_of_panicking() {
+        let atlas = FontAtlas::new(20.0, Some("Definitely Not An Installed Font Name"));
+        assert!(atlas.cell_width > 0.0);
+        assert!(atlas.glyph('A').is_some());
     }
 }

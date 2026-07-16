@@ -1,7 +1,14 @@
+mod config;
 mod input;
+mod menu;
 mod pty;
 mod render;
+mod settings_ui;
 mod term;
+
+use config::Config;
+use settings_ui::{SettingsAction, SettingsWindow};
+use term::color::Palette;
 
 use std::os::fd::{AsFd, OwnedFd};
 use std::sync::Arc;
@@ -11,6 +18,7 @@ use winit::application::ApplicationHandler;
 use winit::event::{MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
 use winit::keyboard::ModifiersState;
+use winit::platform::macos::EventLoopBuilderExtMacOS;
 use winit::window::{Window, WindowId};
 
 use render::Renderer;
@@ -19,9 +27,11 @@ use term::Term;
 enum UserEvent {
     PtyData(Vec<u8>),
     PtyExited,
+    OpenSettings,
 }
 
 struct App {
+    config: Config,
     window: Option<Arc<Window>>,
     renderer: Option<Renderer>,
     term: Option<Term>,
@@ -31,11 +41,13 @@ struct App {
     /// How many lines back into scrollback the view is currently scrolled.
     /// 0 means "showing the live bottom of the screen".
     scroll_offset: usize,
+    settings_window: Option<SettingsWindow>,
 }
 
 impl App {
-    fn new(pty_master: Arc<OwnedFd>, pty_child: Pid) -> Self {
+    fn new(config: Config, pty_master: Arc<OwnedFd>, pty_child: Pid) -> Self {
         App {
+            config,
             window: None,
             renderer: None,
             term: None,
@@ -43,6 +55,25 @@ impl App {
             pty_child,
             modifiers: ModifiersState::empty(),
             scroll_offset: 0,
+            settings_window: None,
+        }
+    }
+
+    /// Apply a saved config live where it's cheap and safe to (colors,
+    /// scrollback). Font and shell changes are picked up on next launch --
+    /// rebuilding the glyph atlas or restarting the shell mid-session is
+    /// out of scope for this iteration.
+    fn apply_saved_config(&mut self, config: Config) {
+        let palette = Palette::from(&config.colors);
+        if let Some(renderer) = &mut self.renderer {
+            renderer.set_palette(palette);
+        }
+        if let Some(term) = &mut self.term {
+            term.set_scrollback_limit(config.scrollback_lines);
+        }
+        self.config = config;
+        if let Some(window) = &self.window {
+            window.request_redraw();
         }
     }
 
@@ -75,7 +106,8 @@ impl ApplicationHandler<UserEvent> for App {
                 .create_window(attrs)
                 .expect("failed to create window"),
         );
-        let renderer = Renderer::new(window.clone());
+        let palette = Palette::from(&self.config.colors);
+        let renderer = Renderer::new(window.clone(), &self.config.font, palette);
         let (cell_w, cell_h) = renderer.cell_size();
         let size = window.inner_size();
         let cols = ((size.width as f32 / cell_w).floor() as usize).max(1);
@@ -83,7 +115,7 @@ impl ApplicationHandler<UserEvent> for App {
 
         self.window = Some(window);
         self.renderer = Some(renderer);
-        self.term = Some(Term::new(cols, rows));
+        self.term = Some(Term::new(cols, rows, self.config.scrollback_lines));
         pty::resize(self.pty_master.as_fd(), cols as u16, rows as u16);
 
         self.window.as_ref().unwrap().request_redraw();
@@ -104,10 +136,28 @@ impl ApplicationHandler<UserEvent> for App {
                 let _ = nix::sys::wait::waitpid(self.pty_child, None);
                 event_loop.exit();
             }
+            UserEvent::OpenSettings => {
+                if let Some(settings) = &self.settings_window {
+                    settings.request_redraw();
+                } else {
+                    self.settings_window = Some(SettingsWindow::new(event_loop, &self.config));
+                }
+            }
         }
     }
 
-    fn window_event(&mut self, event_loop: &ActiveEventLoop, _window_id: WindowId, event: WindowEvent) {
+    fn window_event(&mut self, event_loop: &ActiveEventLoop, window_id: WindowId, event: WindowEvent) {
+        if let Some(settings) = &mut self.settings_window {
+            if window_id == settings.window_id() {
+                match settings.on_window_event(&event) {
+                    SettingsAction::None => {}
+                    SettingsAction::Saved(config) => self.apply_saved_config(config),
+                    SettingsAction::Close => self.settings_window = None,
+                }
+                return;
+            }
+        }
+
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
             WindowEvent::Resized(new_size) => {
@@ -182,15 +232,22 @@ impl ApplicationHandler<UserEvent> for App {
 fn main() {
     env_logger::init();
 
-    let pty_handle = pty::spawn_shell();
+    let config = Config::load();
+
+    let pty_handle = pty::spawn_shell(&config.shell);
     let pty_master = Arc::new(pty_handle.master);
     let pty_child = pty_handle.child;
 
+    // winit would otherwise install its own placeholder macOS menu bar,
+    // which would fight the one built in `menu::install`.
     let event_loop: EventLoop<UserEvent> = EventLoop::with_user_event()
+        .with_default_menu(false)
         .build()
         .expect("failed to create event loop");
     event_loop.set_control_flow(ControlFlow::Wait);
     let proxy: EventLoopProxy<UserEvent> = event_loop.create_proxy();
+
+    menu::install(proxy.clone());
 
     let reader_master = Arc::clone(&pty_master);
     std::thread::spawn(move || {
@@ -208,6 +265,6 @@ fn main() {
         let _ = proxy.send_event(UserEvent::PtyExited);
     });
 
-    let mut app = App::new(pty_master, pty_child);
+    let mut app = App::new(config, pty_master, pty_child);
     event_loop.run_app(&mut app).expect("event loop error");
 }

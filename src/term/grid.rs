@@ -46,13 +46,13 @@ pub struct Grid {
 }
 
 impl Grid {
-    pub fn new(cols: usize, rows: usize) -> Self {
+    pub fn new(cols: usize, rows: usize, scrollback_limit: usize) -> Self {
         Grid {
             cols,
             rows,
             lines: vec![vec![Cell::default(); cols]; rows],
             scrollback: VecDeque::new(),
-            scrollback_limit: 10_000,
+            scrollback_limit,
         }
     }
 
@@ -97,6 +97,15 @@ impl Grid {
         self.lines.resize(rows, vec![Cell::default(); cols]);
         self.cols = cols;
         self.rows = rows;
+    }
+
+    /// Update the scrollback cap, trimming immediately if it shrank. Used
+    /// when settings are changed live from the settings window.
+    pub fn set_scrollback_limit(&mut self, limit: usize) {
+        self.scrollback_limit = limit;
+        while self.scrollback.len() > self.scrollback_limit {
+            self.scrollback.pop_front();
+        }
     }
 
     /// Scroll the inclusive region [top, bottom] up by `n` lines, filling

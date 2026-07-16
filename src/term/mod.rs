@@ -50,19 +50,20 @@ pub struct Term {
     pub modes: TermModes,
     scroll_top: usize,
     scroll_bottom: usize,
+    scrollback_limit: usize,
     pub title: String,
 }
 
 impl Term {
-    pub fn new(cols: usize, rows: usize) -> Self {
+    pub fn new(cols: usize, rows: usize, scrollback_limit: usize) -> Self {
         let cols = cols.max(1);
         let rows = rows.max(1);
         Term {
             parser: vte::Parser::new(),
             cols,
             rows,
-            grid: Grid::new(cols, rows),
-            alt_grid: Grid::new(cols, rows),
+            grid: Grid::new(cols, rows, scrollback_limit),
+            alt_grid: Grid::new(cols, rows, scrollback_limit),
             using_alt_screen: false,
             cursor: Cursor::default(),
             saved_cursor: Cursor::default(),
@@ -71,8 +72,18 @@ impl Term {
             modes: TermModes::default(),
             scroll_top: 0,
             scroll_bottom: rows - 1,
+            scrollback_limit,
             title: String::new(),
         }
+    }
+
+    /// Update the scrollback cap on both screens, trimming immediately if
+    /// it shrank. Used when settings are changed live from the settings
+    /// window.
+    pub fn set_scrollback_limit(&mut self, limit: usize) {
+        self.scrollback_limit = limit;
+        self.grid.set_scrollback_limit(limit);
+        self.alt_grid.set_scrollback_limit(limit);
     }
 
     pub fn advance(&mut self, bytes: &[u8]) {
@@ -318,8 +329,8 @@ impl Term {
 
     fn reset(&mut self) {
         let (cols, rows) = (self.cols, self.rows);
-        self.grid = Grid::new(cols, rows);
-        self.alt_grid = Grid::new(cols, rows);
+        self.grid = Grid::new(cols, rows, self.scrollback_limit);
+        self.alt_grid = Grid::new(cols, rows, self.scrollback_limit);
         self.using_alt_screen = false;
         self.cursor = Cursor::default();
         self.saved_cursor = Cursor::default();
@@ -338,7 +349,7 @@ mod tests {
 
     #[test]
     fn sgr_named_color() {
-        let mut term = Term::new(10, 3);
+        let mut term = Term::new(10, 3, 10_000);
         term.advance(b"\x1b[31mA");
         assert_eq!(term.grid().cell(0, 0).c, 'A');
         assert_eq!(term.grid().cell(0, 0).fg, Color::Indexed(1));
@@ -346,7 +357,7 @@ mod tests {
 
     #[test]
     fn sgr_256_and_truecolor() {
-        let mut term = Term::new(10, 3);
+        let mut term = Term::new(10, 3, 10_000);
         term.advance(b"\x1b[38;5;196mZ");
         assert_eq!(term.grid().cell(0, 0).fg, Color::Indexed(196));
 
@@ -356,7 +367,7 @@ mod tests {
 
     #[test]
     fn sgr_reset_clears_attributes() {
-        let mut term = Term::new(10, 3);
+        let mut term = Term::new(10, 3, 10_000);
         term.advance(b"\x1b[1;31mA\x1b[0mB");
         assert_eq!(term.grid().cell(0, 0).flags, CellFlags::BOLD);
         assert_eq!(term.grid().cell(0, 0).fg, Color::Indexed(1));
@@ -366,7 +377,7 @@ mod tests {
 
     #[test]
     fn cursor_position_csi() {
-        let mut term = Term::new(10, 5);
+        let mut term = Term::new(10, 5, 10_000);
         term.advance(b"\x1b[3;5H");
         term.advance(b"X");
         assert_eq!(term.grid().cell(2, 4).c, 'X');
@@ -374,7 +385,7 @@ mod tests {
 
     #[test]
     fn cursor_relative_movement() {
-        let mut term = Term::new(10, 5);
+        let mut term = Term::new(10, 5, 10_000);
         term.advance(b"\x1b[3;3H"); // row 2, col 2 (0-based)
         term.advance(b"\x1b[1A"); // up 1 -> row 1
         term.advance(b"\x1b[2C"); // right 2 -> col 4
@@ -384,7 +395,7 @@ mod tests {
 
     #[test]
     fn line_wrap_deferred() {
-        let mut term = Term::new(5, 3);
+        let mut term = Term::new(5, 3, 10_000);
         term.advance(b"ABCDE"); // exactly fills row 0
         term.advance(b"F"); // should wrap to row 1, not overwrite row 0
         assert_eq!(term.grid().cell(0, 4).c, 'E');
@@ -395,7 +406,7 @@ mod tests {
 
     #[test]
     fn scroll_pushes_to_scrollback() {
-        let mut term = Term::new(5, 2);
+        let mut term = Term::new(5, 2, 10_000);
         term.advance(b"11111\r\n22222\r\n33333");
         assert_eq!(term.grid().cell(0, 0).c, '2');
         assert_eq!(term.grid().cell(1, 0).c, '3');
@@ -405,7 +416,7 @@ mod tests {
 
     #[test]
     fn resize_truncates_and_pads() {
-        let mut term = Term::new(5, 3);
+        let mut term = Term::new(5, 3, 10_000);
         term.advance(b"ABCDE\r\nFGHIJ");
         term.resize(3, 2);
         assert_eq!(term.cols(), 3);
@@ -422,7 +433,7 @@ mod tests {
 
     #[test]
     fn scrollback_line_at_walks_history_then_live_grid() {
-        let mut term = Term::new(5, 2);
+        let mut term = Term::new(5, 2, 10_000);
         // Push five lines through a 2-row screen so scrollback accumulates
         // several old lines behind the two still on screen.
         term.advance(b"11111\r\n22222\r\n33333\r\n44444\r\n55555");
@@ -444,7 +455,7 @@ mod tests {
 
     #[test]
     fn alt_screen_preserves_primary_and_cursor() {
-        let mut term = Term::new(10, 3);
+        let mut term = Term::new(10, 3, 10_000);
         term.advance(b"hello");
         let (row_before, col_before) = (term.cursor.row, term.cursor.col);
 
@@ -462,7 +473,7 @@ mod tests {
 
     #[test]
     fn erase_in_display_full_clears_screen() {
-        let mut term = Term::new(5, 2);
+        let mut term = Term::new(5, 2, 10_000);
         term.advance(b"AAAAA\r\nBBBBB");
         term.advance(b"\x1b[2J");
         assert_eq!(term.grid().cell(0, 0).c, ' ');
@@ -471,7 +482,7 @@ mod tests {
 
     #[test]
     fn osc_sets_title() {
-        let mut term = Term::new(10, 3);
+        let mut term = Term::new(10, 3, 10_000);
         term.advance(b"\x1b]0;my title\x07");
         assert_eq!(term.title, "my title");
     }
@@ -485,7 +496,7 @@ mod tests {
             .args(["--color=always", "-la", "/"])
             .output()
             .expect("failed to run ls");
-        let mut term = Term::new(80, 24);
+        let mut term = Term::new(80, 24, 10_000);
         term.advance(&output.stdout);
         assert!(term.cursor.row < term.rows());
         assert!(term.cursor.col <= term.cols());
@@ -493,7 +504,7 @@ mod tests {
 
     #[test]
     fn decckm_mode_toggle() {
-        let mut term = Term::new(10, 3);
+        let mut term = Term::new(10, 3, 10_000);
         assert!(!term.modes.app_cursor_keys);
         term.advance(b"\x1b[?1h");
         assert!(term.modes.app_cursor_keys);
