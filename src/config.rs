@@ -78,19 +78,13 @@ impl Default for FontConfig {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ShellConfig {
     /// Overrides `$SHELL` when set.
     pub command: Option<String>,
     /// Extra arguments appended after the login-shell argv0.
     pub args: Vec<String>,
-}
-
-impl Default for ShellConfig {
-    fn default() -> Self {
-        ShellConfig { command: None, args: Vec::new() }
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

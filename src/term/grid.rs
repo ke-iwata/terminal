@@ -64,6 +64,9 @@ impl Grid {
         &mut self.lines[idx]
     }
 
+    // Only exercised by tests today (production code reads whole rows via
+    // `line_at`), so it's flagged dead code outside `cargo test`.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn cell(&self, row: usize, col: usize) -> &Cell {
         &self.lines[row][col]
     }

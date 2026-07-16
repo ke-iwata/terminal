@@ -187,8 +187,7 @@ impl Renderer {
 
         for row in 0..grid.rows {
             let line = grid.line_at(row, scroll_offset);
-            for col in 0..grid.cols {
-                let cell = &line[col];
+            for (col, cell) in line.iter().enumerate() {
                 let reverse = cell.flags.contains(CellFlags::REVERSE);
                 let (fg_default, bg_default) = if reverse {
                     (self.palette.background, self.palette.foreground)

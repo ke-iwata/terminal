@@ -1,5 +1,6 @@
 use font_kit::family_name::FamilyName;
-use font_kit::properties::Properties;
+use font_kit::font::Font as FontKitFont;
+use font_kit::properties::{Properties, Style};
 use font_kit::source::SystemSource;
 use std::collections::HashMap;
 
@@ -130,25 +131,59 @@ impl FontAtlas {
 /// when no family is configured at all, so a bad config value never
 /// prevents startup.
 fn load_system_monospace_font(family: Option<&str>) -> fontdue::Font {
-    let mut names = Vec::new();
-    if let Some(family) = family {
-        names.push(FamilyName::Title(family.to_string()));
-    }
-    names.push(FamilyName::Title("SF Mono".to_string()));
-    names.push(FamilyName::Title("Menlo".to_string()));
-    names.push(FamilyName::Monospace);
-
-    let handle = SystemSource::new()
-        .select_best_match(&names, &Properties::new())
-        .expect("no monospace font available on this system");
-
-    let font_kit_font = handle.load().expect("failed to load system font");
+    let font_kit_font = select_regular_font(family);
     let data = font_kit_font
         .copy_font_data()
         .expect("system font has no accessible byte data");
 
     fontdue::Font::from_bytes(data.as_slice(), fontdue::FontSettings::default())
         .unwrap_or_else(|e| panic!("fontdue failed to parse system font: {e}"))
+}
+
+/// Resolve `family` (or the SF Mono -> Menlo fallback chain) to a specific,
+/// non-italic, non-bold font-kit `Font`.
+///
+/// Deliberately does NOT use `SystemSource::select_best_match`: on at least
+/// one real macOS install it returned "Menlo Italic" for a plain "Menlo"
+/// request with `Properties::new()` (i.e. `Style::Normal`) -- font-kit's
+/// CoreText backend doesn't reliably filter by style when a family has
+/// multiple faces. Instead, each candidate family is resolved with
+/// `select_family_by_name` and its faces are inspected directly so the
+/// upright, regular-weight member is picked explicitly.
+fn select_regular_font(family: Option<&str>) -> FontKitFont {
+    let source = SystemSource::new();
+
+    let candidates = family
+        .map(str::to_string)
+        .into_iter()
+        .chain(["SF Mono".to_string(), "Menlo".to_string()]);
+
+    for name in candidates {
+        if let Some(font) = regular_face_in_family(&source, &name) {
+            return font;
+        }
+    }
+
+    // Last resort: whatever CoreText considers "the" generic monospace
+    // family. select_best_match's style filtering is unreliable (see
+    // above), but at this point there's no specific family left to
+    // hand-inspect, so it's the best option remaining.
+    let handle = source
+        .select_best_match(&[FamilyName::Monospace], &Properties::new())
+        .expect("no monospace font available on this system");
+    handle.load().expect("failed to load system font")
+}
+
+fn regular_face_in_family(source: &SystemSource, family_name: &str) -> Option<FontKitFont> {
+    let family = source.select_family_by_name(family_name).ok()?;
+    let faces: Vec<FontKitFont> = family.fonts().iter().filter_map(|h| h.load().ok()).collect();
+
+    faces
+        .iter()
+        .find(|f| f.properties().style == Style::Normal && f.properties().weight.0 <= 500.0)
+        .or_else(|| faces.iter().find(|f| f.properties().style == Style::Normal))
+        .or_else(|| faces.first())
+        .cloned()
 }
 
 #[cfg(test)]
@@ -185,5 +220,22 @@ mod tests {
         let atlas = FontAtlas::new(20.0, Some("Definitely Not An Installed Font Name"));
         assert!(atlas.cell_width > 0.0);
         assert!(atlas.glyph('A').is_some());
+    }
+
+    #[test]
+    fn default_font_is_upright_not_italic() {
+        // Regression test: font-kit's SystemSource::select_best_match has
+        // been observed returning "Menlo Italic" for a plain "Menlo"
+        // request even with Properties::new() (Style::Normal) -- this
+        // exercises the real CoreText lookup to make sure the regular,
+        // upright face is what actually gets picked.
+        let font = select_regular_font(None);
+        assert_eq!(font.properties().style, Style::Normal, "resolved font is {}", font.full_name());
+    }
+
+    #[test]
+    fn named_family_is_upright_not_italic() {
+        let font = select_regular_font(Some("Menlo"));
+        assert_eq!(font.properties().style, Style::Normal, "resolved font is {}", font.full_name());
     }
 }
