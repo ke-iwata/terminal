@@ -24,7 +24,9 @@ escape sequences itself, and renders every cell with a GPU pipeline it owns.
 - Alternate screen buffer (full-screen apps like vim, less, htop work)
 - DECCKM application cursor keys
 - Retina-aware glyph rendering via a font atlas
-- Window resizing kept in sync with the pty and the character grid
+- Window resizing kept in sync with the pty and the character grid, reflowing
+  wrapped lines at the new width instead of truncating them (shrink then
+  grow back and the content is still there)
 - Scrollback with mouse-wheel scrolling (suspended while an alt-screen app is active)
 - Configurable via `~/.terminal.config.toml`, editable either by hand or
   through Terminal > Preferences... (⌘,) in the menu bar

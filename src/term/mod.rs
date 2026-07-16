@@ -104,20 +104,40 @@ impl Term {
         self.using_alt_screen
     }
 
+    /// Resize both screens to a new column/row count. The primary screen
+    /// reflows its content at the new width (see `Grid::resize_reflow`)
+    /// and the cursor is remapped to stay attached to the same character;
+    /// the alternate screen just truncates/pads, since full-screen apps
+    /// redraw themselves on `SIGWINCH` rather than relying on the terminal
+    /// to preserve their content.
     pub fn resize(&mut self, cols: usize, rows: usize) {
         let cols = cols.max(1);
         let rows = rows.max(1);
         if cols == self.cols && rows == self.rows {
             return;
         }
-        self.grid.resize(cols, rows);
-        self.alt_grid.resize(cols, rows);
+        let primary_cursor = if self.using_alt_screen {
+            (self.saved_cursor.row, self.saved_cursor.col)
+        } else {
+            (self.cursor.row, self.cursor.col)
+        };
+        let new_primary_cursor = self.grid.resize_reflow(cols, rows, primary_cursor);
+        self.alt_grid.resize_truncate(cols, rows);
+
         self.cols = cols;
         self.rows = rows;
         self.scroll_top = 0;
         self.scroll_bottom = rows - 1;
         self.wrap_pending = false;
-        self.clamp_cursor();
+
+        if self.using_alt_screen {
+            self.saved_cursor.row = new_primary_cursor.0;
+            self.saved_cursor.col = new_primary_cursor.1;
+            self.clamp_cursor();
+        } else {
+            self.cursor.row = new_primary_cursor.0;
+            self.cursor.col = new_primary_cursor.1;
+        }
     }
 
     pub fn grid(&self) -> &Grid {
@@ -243,13 +263,18 @@ impl Term {
                 for col in cur_col..cols {
                     *grid.cell_mut(cur_row, col) = Cell::default();
                 }
+                // The row's tail (through its last column) is now blank,
+                // so it can't be a wrap continuation of the next row.
+                grid.set_wrapped(cur_row, false);
                 for row in (cur_row + 1)..rows {
                     grid.row_mut(row).fill(Cell::default());
+                    grid.set_wrapped(row, false);
                 }
             }
             1 => {
                 for row in 0..cur_row {
                     grid.row_mut(row).fill(Cell::default());
+                    grid.set_wrapped(row, false);
                 }
                 for col in 0..=cur_col.min(cols - 1) {
                     *grid.cell_mut(cur_row, col) = Cell::default();
@@ -270,6 +295,7 @@ impl Term {
                 for col in cur_col..cols {
                     *grid.cell_mut(cur_row, col) = Cell::default();
                 }
+                grid.set_wrapped(cur_row, false);
             }
             1 => {
                 for col in 0..=cur_col.min(cols - 1) {
@@ -278,6 +304,7 @@ impl Term {
             }
             2 => {
                 grid.row_mut(cur_row).fill(Cell::default());
+                grid.set_wrapped(cur_row, false);
             }
             _ => {}
         }
@@ -293,11 +320,15 @@ impl Term {
 
         if self.wrap_pending {
             self.wrap_pending = false;
+            let leaving_row = self.cursor.row;
+            self.active_grid_mut().set_wrapped(leaving_row, true);
             self.index_down();
             self.cursor.col = 0;
         }
 
         if self.cursor.col + width > self.cols {
+            let leaving_row = self.cursor.row;
+            self.active_grid_mut().set_wrapped(leaving_row, true);
             self.index_down();
             self.cursor.col = 0;
         }
@@ -415,20 +446,95 @@ mod tests {
     }
 
     #[test]
-    fn resize_truncates_and_pads() {
+    fn resize_pads_with_blanks_when_nothing_wraps() {
         let mut term = Term::new(5, 3, 10_000);
-        term.advance(b"ABCDE\r\nFGHIJ");
+        term.advance(b"ABCDE\r\nFGHIJ"); // two separate hard-broken lines
         term.resize(3, 2);
         assert_eq!(term.cols(), 3);
         assert_eq!(term.rows(), 2);
-        assert_eq!(term.grid().cell(0, 0).c, 'A');
-        assert_eq!(term.grid().cell(0, 2).c, 'C');
-        assert_eq!(term.grid().cell(1, 0).c, 'F');
 
         term.resize(6, 4);
-        assert_eq!(term.grid().cell(0, 0).c, 'A');
         assert_eq!(term.grid().cell(0, 5).c, ' ');
         assert_eq!(term.grid().cell(3, 0).c, ' ');
+    }
+
+    #[test]
+    fn resize_reflows_a_wrapped_line_instead_of_truncating_it() {
+        // The bug this guards against: shrinking the terminal used to
+        // truncate every row to the new width, permanently destroying
+        // whatever didn't fit -- and growing back afterward didn't bring
+        // it back, since it was already gone.
+        let mut term = Term::new(10, 3, 10_000);
+        term.advance(b"ABCDEFGHIJKLMNO"); // 15 chars: forces a real wrap at col 10
+        assert_eq!(term.grid().cell(0, 0).c, 'A');
+        assert_eq!(term.grid().cell(1, 0).c, 'K');
+
+        // Shrink narrower than the logical line: it must re-wrap across
+        // more rows rather than lose the tail. The unused blank row below
+        // the content doesn't need to occupy a row of its own, so this
+        // fits in the same 3 rows without touching scrollback at all.
+        term.resize(5, 3);
+        assert_eq!(term.grid().cell(0, 0).c, 'A');
+        assert_eq!(term.grid().cell(0, 4).c, 'E');
+        assert_eq!(term.grid().cell(1, 0).c, 'F');
+        assert_eq!(term.grid().cell(2, 0).c, 'K');
+        assert_eq!(term.grid().cell(2, 4).c, 'O');
+        assert_eq!(term.grid().scrollback.len(), 0);
+
+        // Growing back out reflows the same content back into exactly the
+        // original two-row layout.
+        term.resize(10, 3);
+        assert_eq!(term.grid().cell(0, 0).c, 'A');
+        assert_eq!(term.grid().cell(0, 9).c, 'J');
+        assert_eq!(term.grid().cell(1, 0).c, 'K');
+        assert_eq!(term.grid().cell(1, 4).c, 'O');
+        assert_eq!(term.grid().scrollback.len(), 0);
+    }
+
+    #[test]
+    fn resize_does_not_merge_separate_hard_broken_lines() {
+        // Only a real terminal-forced wrap should cause reflow; lines the
+        // program ended with an actual newline must stay separate even if
+        // one of them happens to exactly fill the old width.
+        let mut term = Term::new(5, 3, 10_000);
+        term.advance(b"ABCDE\r\nFG");
+        term.resize(3, 4);
+        assert_eq!(term.grid().cell(0, 0).c, 'A');
+        assert_eq!(term.grid().cell(0, 2).c, 'C');
+        assert_eq!(term.grid().cell(1, 0).c, 'D');
+        assert_eq!(term.grid().cell(2, 0).c, 'F');
+        assert_eq!(term.grid().cell(2, 1).c, 'G');
+    }
+
+    #[test]
+    fn resize_keeps_cursor_attached_to_the_same_character() {
+        let mut term = Term::new(10, 3, 10_000);
+        term.advance(b"ABCDEFGHIJKLMNO"); // cursor ends right after the 'O'
+        assert_eq!(term.cursor.row, 1);
+        assert_eq!(term.cursor.col, 5);
+
+        term.resize(5, 5);
+        assert_eq!((term.cursor.row, term.cursor.col), (2, 4));
+        assert_eq!(term.grid().cell(2, 4).c, 'O');
+
+        term.resize(10, 3);
+        assert_eq!((term.cursor.row, term.cursor.col), (1, 4));
+        assert_eq!(term.grid().cell(1, 4).c, 'O');
+    }
+
+    #[test]
+    fn resize_row_count_pushes_and_pulls_scrollback() {
+        let mut term = Term::new(5, 2, 10_000);
+        term.advance(b"11111\r\n22222");
+        term.resize(5, 1);
+        assert_eq!(term.grid().cell(0, 0).c, '2');
+        assert_eq!(term.grid().scrollback.len(), 1);
+        assert_eq!(term.grid().scrollback[0][0].c, '1');
+
+        term.resize(5, 2);
+        assert_eq!(term.grid().cell(0, 0).c, '1');
+        assert_eq!(term.grid().cell(1, 0).c, '2');
+        assert_eq!(term.grid().scrollback.len(), 0);
     }
 
     #[test]
