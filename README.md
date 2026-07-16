@@ -50,6 +50,11 @@ changes take effect on the next launch.
 - **Shell**: a dropdown of the login shells listed in `/etc/shells`, or type
   a custom path.
 
+If you edit `~/.terminal.config.toml` by hand while the app is running, pick
+**Terminal > Reload Config** (⌘R) from the menu bar to pick up the change
+without restarting (same live-apply rules as saving from Preferences: colors
+and scrollback apply immediately, font and shell need a restart).
+
 ## Not implemented
 
 Tabs/panes, clipboard copy-paste, font ligatures/fallback, image protocols

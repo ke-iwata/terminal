@@ -28,6 +28,7 @@ enum UserEvent {
     PtyData(Vec<u8>),
     PtyExited,
     OpenSettings,
+    ReloadConfig,
 }
 
 struct App {
@@ -61,11 +62,12 @@ impl App {
         }
     }
 
-    /// Apply a saved config live where it's cheap and safe to (colors,
+    /// Apply a config (just saved from the settings window, or reloaded
+    /// from disk via the menu) live where it's cheap and safe to (colors,
     /// scrollback). Font and shell changes are picked up on next launch --
     /// rebuilding the glyph atlas or restarting the shell mid-session is
     /// out of scope for this iteration.
-    fn apply_saved_config(&mut self, config: Config) {
+    fn apply_config(&mut self, config: Config) {
         let palette = Palette::from(&config.colors);
         if let Some(renderer) = &mut self.renderer {
             renderer.set_palette(palette);
@@ -74,6 +76,11 @@ impl App {
             term.set_scrollback_limit(config.scrollback_lines);
         }
         self.config = config;
+        // Keep an open settings window's form in sync, so it doesn't show
+        // stale values after a reload.
+        if let Some(settings) = &mut self.settings_window {
+            settings.reset_draft(&self.config);
+        }
         if let Some(window) = &self.window {
             window.request_redraw();
         }
@@ -171,6 +178,9 @@ impl ApplicationHandler<UserEvent> for App {
                     self.settings_window = Some(SettingsWindow::new(event_loop, &self.config));
                 }
             }
+            UserEvent::ReloadConfig => {
+                self.apply_config(Config::load());
+            }
         }
     }
 
@@ -179,7 +189,7 @@ impl ApplicationHandler<UserEvent> for App {
             if window_id == settings.window_id() {
                 match settings.on_window_event(&event) {
                     SettingsAction::None => {}
-                    SettingsAction::Saved(config) => self.apply_saved_config(config),
+                    SettingsAction::Saved(config) => self.apply_config(config),
                     SettingsAction::Close => self.settings_window = None,
                 }
                 return;

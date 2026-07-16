@@ -4,6 +4,7 @@ use muda::{Menu, MenuEvent, MenuItem, PredefinedMenuItem, Submenu};
 use winit::event_loop::EventLoopProxy;
 
 pub const PREFERENCES_ID: &str = "preferences";
+pub const RELOAD_CONFIG_ID: &str = "reload_config";
 
 /// Build and attach the macOS menu bar: an app menu with About, Preferences
 /// (Cmd+,), and Quit. Must be called once at startup, and pairs with
@@ -28,12 +29,19 @@ pub fn install(proxy: EventLoopProxy<UserEvent>) -> Menu {
         true,
         Some(Accelerator::new(Some(Modifiers::SUPER), Code::Comma)),
     );
+    let reload_config = MenuItem::with_id(
+        RELOAD_CONFIG_ID,
+        "Reload Config",
+        true,
+        Some(Accelerator::new(Some(Modifiers::SUPER), Code::KeyR)),
+    );
 
     app_menu
         .append_items(&[
             &PredefinedMenuItem::about(None, None),
             &PredefinedMenuItem::separator(),
             &preferences,
+            &reload_config,
             &PredefinedMenuItem::separator(),
             &PredefinedMenuItem::quit(None),
         ])
@@ -45,6 +53,8 @@ pub fn install(proxy: EventLoopProxy<UserEvent>) -> Menu {
     MenuEvent::set_event_handler(Some(move |event: MenuEvent| {
         if event.id() == PREFERENCES_ID {
             let _ = proxy.send_event(UserEvent::OpenSettings);
+        } else if event.id() == RELOAD_CONFIG_ID {
+            let _ = proxy.send_event(UserEvent::ReloadConfig);
         }
     }));
 

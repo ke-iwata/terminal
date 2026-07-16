@@ -271,6 +271,15 @@ impl SettingsWindow {
         self.window.request_redraw();
     }
 
+    /// Discard unsaved edits and repopulate the form from `config`. Used
+    /// when the config is reloaded from disk (menu bar > Reload Config)
+    /// while this window happens to be open, so it doesn't keep showing
+    /// stale values.
+    pub fn reset_draft(&mut self, config: &Config) {
+        self.draft = ConfigDraft::from(config);
+        self.request_redraw();
+    }
+
     pub fn on_window_event(&mut self, event: &WindowEvent) -> SettingsAction {
         let response = self.egui_state.on_window_event(&self.window, event);
         if response.repaint {
