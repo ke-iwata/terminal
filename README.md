@@ -37,9 +37,18 @@ malformed one just falls back to defaults (a parse error is printed to
 the terminal that launched the app, but never blocks startup).
 
 Open **Terminal > Preferences...** (⌘,) from the menu bar for a GUI form
-covering the same fields (font, colors, shell, scrollback). Saving writes
-back to the same TOML file. Color and scrollback changes apply immediately;
-font and shell changes take effect on the next launch.
+covering the same fields (font, colors, shell, scrollback), laid out as a
+category sidebar rather than one long page. Saving writes back to the same
+TOML file. Color and scrollback changes apply immediately; font and shell
+changes take effect on the next launch.
+
+- **Colors**: pick a built-in theme (Default Dark/Light, Dracula, Nord,
+  Solarized Dark/Light) to set background/foreground/ANSI all at once, then
+  hand-tweak any swatch afterward.
+- **Font**: a dropdown of the system's installed monospace fonts (detected
+  via font-kit), or type a custom family name.
+- **Shell**: a dropdown of the login shells listed in `/etc/shells`, or type
+  a custom path.
 
 ## Not implemented
 
@@ -77,7 +86,9 @@ src/
   input.rs       keyboard event -> pty byte sequence encoding
   config.rs      Config/FontConfig/ColorConfig/ShellConfig, TOML load/save
   menu.rs        native macOS menu bar (muda), Preferences (Cmd+,)
-  settings_ui.rs egui Preferences window: form UI, its own wgpu device
+  settings_ui.rs egui Preferences window: sidebar form UI, its own wgpu device
+  settings_ui/
+    themes.rs    built-in color theme presets (Dracula, Nord, Solarized, ...)
   term/
     mod.rs       Term: cursor, modes, active/alt Grid, line wrapping
     grid.rs      Grid/Cell/Row, scrollback, resize

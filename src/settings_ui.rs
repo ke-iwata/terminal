@@ -1,3 +1,5 @@
+mod themes;
+
 use crate::config::{ColorConfig, Config, FontConfig, HexColor, ShellConfig};
 use egui_wgpu::wgpu;
 use std::sync::Arc;
@@ -110,6 +112,46 @@ impl Category {
     }
 }
 
+/// Monospace font family names available on the system, for the Font
+/// page's picker. Queried once per settings-window open (CoreText lookups
+/// are fast, but there's no need to repeat this every frame).
+fn list_monospace_fonts() -> Vec<String> {
+    use font_kit::source::SystemSource;
+
+    let source = SystemSource::new();
+    let Ok(families) = source.all_families() else {
+        return Vec::new();
+    };
+
+    let mut names: Vec<String> = families
+        .into_iter()
+        .filter(|name| {
+            source
+                .select_family_by_name(name)
+                .ok()
+                .and_then(|family| family.fonts().first().cloned())
+                .and_then(|handle| handle.load().ok())
+                .is_some_and(|font| font.is_monospace())
+        })
+        .collect();
+    names.sort();
+    names.dedup();
+    names
+}
+
+/// Valid login shells from `/etc/shells`, for the Shell page's picker.
+fn list_shells() -> Vec<String> {
+    let Ok(contents) = std::fs::read_to_string("/etc/shells") else {
+        return Vec::new();
+    };
+    contents
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .map(String::from)
+        .collect()
+}
+
 pub struct SettingsWindow {
     window: Arc<Window>,
     surface: wgpu::Surface<'static>,
@@ -121,6 +163,8 @@ pub struct SettingsWindow {
     egui_renderer: egui_wgpu::Renderer,
     draft: ConfigDraft,
     category: Category,
+    available_fonts: Vec<String>,
+    available_shells: Vec<String>,
 }
 
 impl SettingsWindow {
@@ -201,6 +245,8 @@ impl SettingsWindow {
             egui_renderer,
             draft: ConfigDraft::from(config),
             category: Category::Font,
+            available_fonts: list_monospace_fonts(),
+            available_shells: list_shells(),
         }
     }
 
@@ -238,11 +284,13 @@ impl SettingsWindow {
 
         let category = &mut self.category;
         let draft = &mut self.draft;
+        let available_fonts = &self.available_fonts;
+        let available_shells = &self.available_shells;
         let mut saved_config = None;
         let full_output = self.egui_ctx.run_ui(raw_input, |ui| {
             draw_sidebar(ui, category);
             draw_footer(ui, draft, &mut saved_config);
-            draw_category_page(ui, *category, draft);
+            draw_category_page(ui, *category, draft, available_fonts, available_shells);
         });
 
         self.egui_state
@@ -384,14 +432,20 @@ fn draw_footer(ui: &mut egui::Ui, draft: &mut ConfigDraft, saved: &mut Option<Co
     });
 }
 
-fn draw_category_page(ui: &mut egui::Ui, category: Category, draft: &mut ConfigDraft) {
+fn draw_category_page(
+    ui: &mut egui::Ui,
+    category: Category,
+    draft: &mut ConfigDraft,
+    available_fonts: &[String],
+    available_shells: &[String],
+) {
     let frame =
         egui::Frame::central_panel(ui.style()).inner_margin(egui::Margin::symmetric(24, 20));
     egui::CentralPanel::default().frame(frame).show(ui, |ui| {
         egui::ScrollArea::vertical().show(ui, |ui| match category {
-            Category::Font => draw_font_page(ui, draft),
+            Category::Font => draw_font_page(ui, draft, available_fonts),
             Category::Colors => draw_colors_page(ui, draft),
-            Category::Shell => draw_shell_page(ui, draft),
+            Category::Shell => draw_shell_page(ui, draft, available_shells),
             Category::Scrollback => draw_scrollback_page(ui, draft),
         });
     });
@@ -409,14 +463,30 @@ fn field_description(ui: &mut egui::Ui, text: &str) {
     ui.add_space(4.0);
 }
 
-fn draw_font_page(ui: &mut egui::Ui, draft: &mut ConfigDraft) {
+fn draw_font_page(ui: &mut egui::Ui, draft: &mut ConfigDraft, available_fonts: &[String]) {
     page_title(ui, "Font");
 
     ui.label("Family");
     field_description(ui, "Leave blank to use SF Mono, falling back to Menlo.");
+
+    let selected_text = if draft.font_family.is_empty() {
+        "Auto".to_string()
+    } else {
+        draft.font_family.clone()
+    };
+    egui::ComboBox::from_id_salt("font_family_combo")
+        .width(260.0)
+        .selected_text(selected_text)
+        .show_ui(ui, |ui| {
+            ui.selectable_value(&mut draft.font_family, String::new(), "Auto");
+            for name in available_fonts {
+                ui.selectable_value(&mut draft.font_family, name.clone(), name.as_str());
+            }
+        });
+    ui.add_space(4.0);
     ui.add(
         egui::TextEdit::singleline(&mut draft.font_family)
-            .hint_text("SF Mono")
+            .hint_text("...or type a custom family name")
             .desired_width(260.0),
     );
 
@@ -428,6 +498,22 @@ fn draw_font_page(ui: &mut egui::Ui, draft: &mut ConfigDraft) {
 
 fn draw_colors_page(ui: &mut egui::Ui, draft: &mut ConfigDraft) {
     page_title(ui, "Colors");
+
+    ui.label("Theme");
+    field_description(ui, "Applies all colors below at once; tweak any swatch afterward.");
+    egui::ComboBox::from_id_salt("theme_combo").width(260.0).selected_text("Choose a preset...").show_ui(
+        ui,
+        |ui| {
+            for (name, palette) in themes::THEMES {
+                if ui.selectable_label(false, *name).clicked() {
+                    draft.background = [palette.background.0, palette.background.1, palette.background.2];
+                    draft.foreground = [palette.foreground.0, palette.foreground.1, palette.foreground.2];
+                    draft.ansi = palette.ansi.map(|(r, g, b)| [r, g, b]);
+                }
+            }
+        },
+    );
+    ui.add_space(16.0);
 
     egui::Grid::new("base_color_grid").num_columns(2).spacing([16.0, 10.0]).show(ui, |ui| {
         ui.label("Background");
@@ -457,14 +543,30 @@ fn draw_colors_page(ui: &mut egui::Ui, draft: &mut ConfigDraft) {
     });
 }
 
-fn draw_shell_page(ui: &mut egui::Ui, draft: &mut ConfigDraft) {
+fn draw_shell_page(ui: &mut egui::Ui, draft: &mut ConfigDraft, available_shells: &[String]) {
     page_title(ui, "Shell");
 
     ui.label("Command");
     field_description(ui, "Leave blank to use $SHELL.");
+
+    let selected_text = if draft.shell_command.is_empty() {
+        "Auto ($SHELL)".to_string()
+    } else {
+        draft.shell_command.clone()
+    };
+    egui::ComboBox::from_id_salt("shell_command_combo")
+        .width(260.0)
+        .selected_text(selected_text)
+        .show_ui(ui, |ui| {
+            ui.selectable_value(&mut draft.shell_command, String::new(), "Auto ($SHELL)");
+            for shell in available_shells {
+                ui.selectable_value(&mut draft.shell_command, shell.clone(), shell.as_str());
+            }
+        });
+    ui.add_space(4.0);
     ui.add(
         egui::TextEdit::singleline(&mut draft.shell_command)
-            .hint_text("/bin/zsh")
+            .hint_text("...or type a custom path")
             .desired_width(260.0),
     );
 
