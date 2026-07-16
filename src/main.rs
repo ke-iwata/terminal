@@ -37,6 +37,7 @@ struct App {
     term: Option<Term>,
     pty_master: Arc<OwnedFd>,
     pty_child: Pid,
+    proxy: EventLoopProxy<UserEvent>,
     modifiers: ModifiersState,
     /// How many lines back into scrollback the view is currently scrolled.
     /// 0 means "showing the live bottom of the screen".
@@ -45,7 +46,7 @@ struct App {
 }
 
 impl App {
-    fn new(config: Config, pty_master: Arc<OwnedFd>, pty_child: Pid) -> Self {
+    fn new(config: Config, pty_master: Arc<OwnedFd>, pty_child: Pid, proxy: EventLoopProxy<UserEvent>) -> Self {
         App {
             config,
             window: None,
@@ -53,6 +54,7 @@ impl App {
             term: None,
             pty_master,
             pty_child,
+            proxy,
             modifiers: ModifiersState::empty(),
             scroll_offset: 0,
             settings_window: None,
@@ -119,6 +121,32 @@ impl ApplicationHandler<UserEvent> for App {
         pty::resize(self.pty_master.as_fd(), cols as u16, rows as u16);
 
         self.window.as_ref().unwrap().request_redraw();
+
+        // Only start reading the pty now that `self.term` exists: the
+        // shell starts producing output the moment it's forked (in
+        // `main`, before the event loop even runs), and any bytes read
+        // before `self.term` is `Some` would be silently dropped by
+        // `user_event`'s `PtyData` handler -- which used to lose the
+        // shell's very first prompt if it arrived before this point,
+        // showing nothing until the next keypress produced fresh output.
+        // The pty's kernel-side buffer holds onto that early output
+        // until we're ready to read it, so nothing is lost by waiting.
+        let reader_master = Arc::clone(&self.pty_master);
+        let proxy = self.proxy.clone();
+        std::thread::spawn(move || {
+            let mut buf = [0u8; 4096];
+            loop {
+                match nix::unistd::read(reader_master.as_fd(), &mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        if proxy.send_event(UserEvent::PtyData(buf[..n].to_vec())).is_err() {
+                            break;
+                        }
+                    }
+                }
+            }
+            let _ = proxy.send_event(UserEvent::PtyExited);
+        });
     }
 
     fn user_event(&mut self, event_loop: &ActiveEventLoop, event: UserEvent) {
@@ -251,22 +279,8 @@ fn main() {
     // pointers back into this value (see `menu::install`'s doc comment).
     let _menu = menu::install(proxy.clone());
 
-    let reader_master = Arc::clone(&pty_master);
-    std::thread::spawn(move || {
-        let mut buf = [0u8; 4096];
-        loop {
-            match nix::unistd::read(reader_master.as_fd(), &mut buf) {
-                Ok(0) | Err(_) => break,
-                Ok(n) => {
-                    if proxy.send_event(UserEvent::PtyData(buf[..n].to_vec())).is_err() {
-                        break;
-                    }
-                }
-            }
-        }
-        let _ = proxy.send_event(UserEvent::PtyExited);
-    });
-
-    let mut app = App::new(config, pty_master, pty_child);
+    // The pty reader thread is started in `resumed()` instead of here, once
+    // `self.term` exists to receive its output -- see the comment there.
+    let mut app = App::new(config, pty_master, pty_child, proxy);
     event_loop.run_app(&mut app).expect("event loop error");
 }
