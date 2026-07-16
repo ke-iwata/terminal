@@ -10,6 +10,8 @@ use config::Config;
 use settings_ui::{SettingsAction, SettingsWindow};
 use term::color::Palette;
 
+use nix::sys::signal::{kill, Signal};
+
 use std::os::fd::{AsFd, OwnedFd};
 use std::sync::Arc;
 
@@ -25,8 +27,11 @@ use render::Renderer;
 use term::Term;
 
 enum UserEvent {
-    PtyData(Vec<u8>),
-    PtyExited,
+    /// Bytes read from the pty, tagged with the generation of the shell
+    /// session that produced them (see `App::pty_generation`).
+    PtyData(u64, Vec<u8>),
+    /// A pty reader thread hit EOF/error, tagged with its generation.
+    PtyExited(u64),
     OpenSettings,
     ReloadConfig,
 }
@@ -38,6 +43,11 @@ struct App {
     term: Option<Term>,
     pty_master: Arc<OwnedFd>,
     pty_child: Pid,
+    /// Bumped every time the shell is restarted (config reload with a
+    /// changed `shell` section). Lets `user_event` tell current pty
+    /// reader-thread events apart from stale ones still in flight from a
+    /// shell session that's already been replaced -- see `restart_shell`.
+    pty_generation: u64,
     proxy: EventLoopProxy<UserEvent>,
     modifiers: ModifiersState,
     /// How many lines back into scrollback the view is currently scrolled.
@@ -55,6 +65,7 @@ impl App {
             term: None,
             pty_master,
             pty_child,
+            pty_generation: 0,
             proxy,
             modifiers: ModifiersState::empty(),
             scroll_offset: 0,
@@ -63,10 +74,11 @@ impl App {
     }
 
     /// Apply a config (just saved from the settings window, or reloaded
-    /// from disk via the menu) live where it's cheap and safe to (colors,
-    /// scrollback). Font and shell changes are picked up on next launch --
-    /// rebuilding the glyph atlas or restarting the shell mid-session is
-    /// out of scope for this iteration.
+    /// from disk via the menu) so every field takes effect right away:
+    /// colors and scrollback are cheap in-place updates, a changed font
+    /// rebuilds the glyph atlas and re-fits the grid to the window, and a
+    /// changed shell restarts the pty session (see `restart_shell` for
+    /// what that does to the currently running shell).
     fn apply_config(&mut self, config: Config) {
         let palette = Palette::from(&config.colors);
         if let Some(renderer) = &mut self.renderer {
@@ -75,7 +87,18 @@ impl App {
         if let Some(term) = &mut self.term {
             term.set_scrollback_limit(config.scrollback_lines);
         }
+
+        let font_changed = config.font != self.config.font;
+        let shell_changed = config.shell != self.config.shell;
         self.config = config;
+
+        if font_changed {
+            self.apply_font_change();
+        }
+        if shell_changed {
+            self.restart_shell();
+        }
+
         // Keep an open settings window's form in sync, so it doesn't show
         // stale values after a reload.
         if let Some(settings) = &mut self.settings_window {
@@ -84,6 +107,44 @@ impl App {
         if let Some(window) = &self.window {
             window.request_redraw();
         }
+    }
+
+    /// Rebuild the glyph atlas for `self.config.font` and re-fit the grid
+    /// to the window at the new cell size.
+    fn apply_font_change(&mut self) {
+        let Some(scale_factor) = self.window.as_ref().map(|w| w.scale_factor()) else {
+            return;
+        };
+        if let Some(renderer) = &mut self.renderer {
+            renderer.set_font(&self.config.font, scale_factor);
+        }
+        self.sync_size_to_window();
+    }
+
+    /// End the current shell session and start a fresh one for
+    /// `self.config.shell`. This sends SIGHUP to the running shell (the
+    /// same signal it would get from a real terminal closing), which also
+    /// reaches any foreground job via normal terminal session semantics --
+    /// there's no way to swap the shell command without ending whatever
+    /// was running under the old one. The screen is cleared for the new
+    /// session; scrollback from the old one is discarded.
+    fn restart_shell(&mut self) {
+        let _ = kill(self.pty_child, Signal::SIGHUP);
+        let _ = nix::sys::wait::waitpid(self.pty_child, None);
+
+        let handle = pty::spawn_shell(&self.config.shell);
+        self.pty_master = Arc::new(handle.master);
+        self.pty_child = handle.child;
+        self.pty_generation += 1;
+        self.scroll_offset = 0;
+
+        if let Some(term) = &self.term {
+            let (cols, rows) = (term.cols(), term.rows());
+            self.term = Some(Term::new(cols, rows, self.config.scrollback_lines));
+            pty::resize(self.pty_master.as_fd(), cols as u16, rows as u16);
+        }
+
+        self.spawn_pty_reader();
     }
 
     /// Recompute the terminal's cell grid from the current window size and
@@ -101,6 +162,31 @@ impl App {
         if let Some(term) = &mut self.term {
             term.resize(cols, rows);
         }
+    }
+
+    /// Spawn the thread that blocking-reads `self.pty_master` and forwards
+    /// bytes to the event loop, tagged with the current `pty_generation`.
+    fn spawn_pty_reader(&self) {
+        let reader_master = Arc::clone(&self.pty_master);
+        let proxy = self.proxy.clone();
+        let generation = self.pty_generation;
+        std::thread::spawn(move || {
+            let mut buf = [0u8; 4096];
+            loop {
+                match nix::unistd::read(reader_master.as_fd(), &mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        if proxy
+                            .send_event(UserEvent::PtyData(generation, buf[..n].to_vec()))
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                }
+            }
+            let _ = proxy.send_event(UserEvent::PtyExited(generation));
+        });
     }
 }
 
@@ -138,27 +224,18 @@ impl ApplicationHandler<UserEvent> for App {
         // showing nothing until the next keypress produced fresh output.
         // The pty's kernel-side buffer holds onto that early output
         // until we're ready to read it, so nothing is lost by waiting.
-        let reader_master = Arc::clone(&self.pty_master);
-        let proxy = self.proxy.clone();
-        std::thread::spawn(move || {
-            let mut buf = [0u8; 4096];
-            loop {
-                match nix::unistd::read(reader_master.as_fd(), &mut buf) {
-                    Ok(0) | Err(_) => break,
-                    Ok(n) => {
-                        if proxy.send_event(UserEvent::PtyData(buf[..n].to_vec())).is_err() {
-                            break;
-                        }
-                    }
-                }
-            }
-            let _ = proxy.send_event(UserEvent::PtyExited);
-        });
+        self.spawn_pty_reader();
     }
 
     fn user_event(&mut self, event_loop: &ActiveEventLoop, event: UserEvent) {
         match event {
-            UserEvent::PtyData(bytes) => {
+            UserEvent::PtyData(generation, bytes) => {
+                // Ignore output from a shell session that's since been
+                // replaced by `restart_shell` -- its reader thread can
+                // still have bytes in flight for a moment after that.
+                if generation != self.pty_generation {
+                    return;
+                }
                 if let Some(term) = &mut self.term {
                     term.advance(&bytes);
                 }
@@ -167,7 +244,13 @@ impl ApplicationHandler<UserEvent> for App {
                     window.request_redraw();
                 }
             }
-            UserEvent::PtyExited => {
+            UserEvent::PtyExited(generation) => {
+                if generation != self.pty_generation {
+                    // The old shell from before a restart; `restart_shell`
+                    // already reaped it directly, and the app shouldn't
+                    // quit just because that old session ended.
+                    return;
+                }
                 let _ = nix::sys::wait::waitpid(self.pty_child, None);
                 event_loop.exit();
             }

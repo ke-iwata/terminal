@@ -61,7 +61,7 @@ fn config_path() -> Option<PathBuf> {
     Some(PathBuf::from(home).join(".terminal.config.toml"))
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct FontConfig {
     /// System font family name (e.g. "SF Mono"). When absent, the terminal
@@ -78,7 +78,7 @@ impl Default for FontConfig {
     }
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ShellConfig {
     /// Overrides `$SHELL` when set.

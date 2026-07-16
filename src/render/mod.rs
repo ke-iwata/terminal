@@ -55,43 +55,7 @@ impl Renderer {
         // Rasterize at physical pixels (point size * scale factor) so text
         // stays crisp on Retina displays instead of being upscaled/blurry.
         let px_size = font.size.max(1.0) * scale_factor as f32;
-        let atlas = FontAtlas::new(px_size, font.family.as_deref());
-        let atlas_texture = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("glyph atlas"),
-            size: wgpu::Extent3d {
-                width: atlas.width,
-                height: atlas.height,
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::R8Unorm,
-            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-            view_formats: &[],
-        });
-        queue.write_texture(
-            wgpu::TexelCopyTextureInfo {
-                texture: &atlas_texture,
-                mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
-                aspect: wgpu::TextureAspect::All,
-            },
-            &atlas.pixels,
-            wgpu::TexelCopyBufferLayout {
-                offset: 0,
-                bytes_per_row: Some(atlas.width),
-                rows_per_image: Some(atlas.height),
-            },
-            wgpu::Extent3d {
-                width: atlas.width,
-                height: atlas.height,
-                depth_or_array_layers: 1,
-            },
-        );
-        let atlas_view = atlas_texture.create_view(&wgpu::TextureViewDescriptor::default());
-
-        let pipeline = CellPipeline::new(&device, config.format, &atlas_view);
+        let (atlas, pipeline) = build_atlas_and_pipeline(&device, &queue, config.format, px_size, font.family.as_deref());
         pipeline.set_screen_size(&queue, config.width as f32, config.height as f32);
 
         Renderer {
@@ -111,6 +75,25 @@ impl Renderer {
 
     pub fn set_palette(&mut self, palette: Palette) {
         self.palette = palette;
+    }
+
+    /// Rebuild the glyph atlas and cell pipeline for a new font (family
+    /// and/or size). `scale_factor` is the window's current
+    /// `scale_factor()`, needed to keep glyphs crisp on Retina displays.
+    /// The caller is responsible for re-deriving cols/rows from the new
+    /// `cell_size()` afterward and resizing the pty/Term to match.
+    pub fn set_font(&mut self, font: &FontConfig, scale_factor: f64) {
+        let px_size = font.size.max(1.0) * scale_factor as f32;
+        let (atlas, pipeline) = build_atlas_and_pipeline(
+            &self.device,
+            &self.queue,
+            self.config.format,
+            px_size,
+            font.family.as_deref(),
+        );
+        pipeline.set_screen_size(&self.queue, self.config.width as f32, self.config.height as f32);
+        self.atlas = atlas;
+        self.pipeline = pipeline;
     }
 
     pub fn resize(&mut self, new_size: winit::dpi::PhysicalSize<u32>) {
@@ -253,6 +236,55 @@ impl Renderer {
 
 fn rgb_to_color((r, g, b): (u8, u8, u8)) -> [f32; 4] {
     [r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0, 1.0]
+}
+
+/// Rasterize `family` (or the auto-fallback chain) at `px_size` into a
+/// fresh glyph atlas texture and the cell pipeline bound to it. Shared by
+/// initial construction and by `Renderer::set_font`'s live font swap.
+fn build_atlas_and_pipeline(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    surface_format: wgpu::TextureFormat,
+    px_size: f32,
+    family: Option<&str>,
+) -> (FontAtlas, CellPipeline) {
+    let atlas = FontAtlas::new(px_size, family);
+    let atlas_texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("glyph atlas"),
+        size: wgpu::Extent3d {
+            width: atlas.width,
+            height: atlas.height,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::R8Unorm,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+    queue.write_texture(
+        wgpu::TexelCopyTextureInfo {
+            texture: &atlas_texture,
+            mip_level: 0,
+            origin: wgpu::Origin3d::ZERO,
+            aspect: wgpu::TextureAspect::All,
+        },
+        &atlas.pixels,
+        wgpu::TexelCopyBufferLayout {
+            offset: 0,
+            bytes_per_row: Some(atlas.width),
+            rows_per_image: Some(atlas.height),
+        },
+        wgpu::Extent3d {
+            width: atlas.width,
+            height: atlas.height,
+            depth_or_array_layers: 1,
+        },
+    );
+    let atlas_view = atlas_texture.create_view(&wgpu::TextureViewDescriptor::default());
+    let pipeline = CellPipeline::new(device, surface_format, &atlas_view);
+    (atlas, pipeline)
 }
 
 fn palette_clear_color(palette: &Palette) -> wgpu::Color {

@@ -39,21 +39,24 @@ the terminal that launched the app, but never blocks startup).
 Open **Terminal > Preferences...** (⌘,) from the menu bar for a GUI form
 covering the same fields (font, colors, shell, scrollback), laid out as a
 category sidebar rather than one long page. Saving writes back to the same
-TOML file. Color and scrollback changes apply immediately; font and shell
-changes take effect on the next launch.
+TOML file and applies every field immediately — no restart needed.
 
 - **Colors**: pick a built-in theme (Default Dark/Light, Dracula, Nord,
   Solarized Dark/Light) to set background/foreground/ANSI all at once, then
   hand-tweak any swatch afterward.
 - **Font**: a dropdown of the system's installed monospace fonts (detected
-  via font-kit), or type a custom family name.
+  via font-kit), or type a custom family name. Changing it rebuilds the
+  glyph atlas and re-fits the grid to the window on the spot.
 - **Shell**: a dropdown of the login shells listed in `/etc/shells`, or type
-  a custom path.
+  a custom path. Changing it restarts the pty session: the running shell
+  gets `SIGHUP` (same as a real terminal closing) and a new one starts in
+  its place, so anything running in the old shell is interrupted. The
+  screen clears for the fresh session; old scrollback is discarded.
 
 If you edit `~/.terminal.config.toml` by hand while the app is running, pick
 **Terminal > Reload Config** (⌘R) from the menu bar to pick up the change
-without restarting (same live-apply rules as saving from Preferences: colors
-and scrollback apply immediately, font and shell need a restart).
+without restarting the app (same live-apply behavior as saving from
+Preferences, including the shell-restart caveat above).
 
 ## Not implemented
 
