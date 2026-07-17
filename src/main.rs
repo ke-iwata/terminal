@@ -328,6 +328,14 @@ impl App {
         let tab = &mut self.tabs[self.active];
         let master = tab.pty_master.as_fd();
         let (fg_name, cwd) = match self.proc_info.foreground_process_name(master) {
+            // The shell itself sitting at its prompt: use the name we
+            // derived from the configured shell path at spawn time rather
+            // than whatever sysinfo reports for the pid. Right after a
+            // tab opens, that pid can still be the pre-exec fork of this
+            // binary (named "terminal"), and losing that race used to
+            // mistitle the tab -- the shell's own name is a fact we
+            // already know, so never ask the process table for it.
+            Some((pid, _)) if pid == tab.pty_child => (tab.shell_name.clone(), self.proc_info.process_cwd(pid)),
             Some((pid, name)) => (name, self.proc_info.process_cwd(pid)),
             None => (tab.shell_name.clone(), self.proc_info.process_cwd(tab.pty_child)),
         };

@@ -7,9 +7,9 @@ use std::os::fd::BorrowedFd;
 use std::path::{Path, PathBuf};
 use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
 
-/// Thin wrapper around a `sysinfo::System` kept alive across calls so
-/// looking up one process doesn't re-scan the whole process table each time
-/// the caller only asked to refresh a couple of specific pids.
+/// Process lookups scoped to a couple of specific pids -- `System::new()`
+/// starts empty and `ProcessesToUpdate::Some` only queries the listed
+/// pids, so none of this ever scans the whole process table.
 pub struct ProcInfo {
     sys: System,
 }
@@ -20,6 +20,18 @@ impl ProcInfo {
     }
 
     fn refresh(&mut self, pid: NixPid) {
+        // Start from an empty table every time instead of refreshing into
+        // the previous one: sysinfo only reads a process's NAME when it
+        // first learns about that pid, and a pid's name legitimately
+        // changes here -- a freshly forked shell is briefly a copy of
+        // this binary ("terminal") until execvp swaps in bash, and a
+        // shell fork is briefly "bash" until it execs the real command.
+        // With a persistent table, whichever name won the race against
+        // exec got cached forever, which is exactly how tabs sometimes
+        // came up titled "terminal" instead of "bash". A from-scratch
+        // query of one pid is far too cheap to matter at the status
+        // bar's throttled refresh rate.
+        self.sys = System::new();
         let pid = Pid::from_u32(pid.as_raw() as u32);
         self.sys.refresh_processes_specifics(
             ProcessesToUpdate::Some(&[pid]),

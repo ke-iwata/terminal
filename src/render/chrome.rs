@@ -114,13 +114,17 @@ pub fn tab_bar_layout(titles: &[String], window_width: f32, cell_w: f32) -> TabB
         let x0 = origin + (i * tab_cols) as f32 * cell_w;
         let x1 = x0 + tab_cols as f32 * cell_w;
         let close_x0 = x1 - CLOSE_COLS as f32 * cell_w;
+        // "1: bash" -- the number is the tab's current position in the
+        // strip (not a stable id), matching how every browser/terminal
+        // numbers its Cmd+N tab shortcuts.
+        let label = format!("{}: {}", i + 1, title);
         tabs.push(TabRect {
             index: i,
             x0,
             x1,
             close_x0,
             close_x1: x1,
-            label: truncate(title, label_cols),
+            label: truncate(&label, label_cols),
         });
     }
 
