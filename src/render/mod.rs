@@ -13,13 +13,22 @@ use std::sync::Arc;
 use winit::window::Window;
 
 /// What happened when `Renderer::render` was asked to draw a frame.
+///
+/// This exists because silently skipping a failed frame caused the
+/// "blank window until first keypress" startup bug -- with
+/// `ControlFlow::Wait`, a dropped first frame is never retried unless
+/// the caller is told about it. See `App::presented_once` in `main.rs`
+/// for the full failure story and the other layers of that fix; keep
+/// the two in sync when changing anything here.
 pub enum RenderOutcome {
     Presented,
     /// The surface wasn't ready yet (most common right after the window is
-    /// first created) -- ask for another redraw immediately.
+    /// first created) -- the caller should request another redraw
+    /// immediately.
     Retry,
-    /// Not currently visible; nothing to do until a real event (resize,
-    /// becoming visible again) prompts a redraw on its own.
+    /// Not currently visible (occluded/minimized); retrying now would
+    /// draw to nothing. The caller must redraw when visibility returns
+    /// (`WindowEvent::Occluded(false)`) instead.
     Skipped,
 }
 
@@ -66,6 +75,16 @@ impl Renderer {
         let mut config = surface
             .get_default_config(&adapter, size.width.max(1), size.height.max(1))
             .expect("surface is not supported by the adapter");
+        // Prefer a non-sRGB swapchain format: the shader passes color
+        // values through untouched, and ours are already sRGB-encoded
+        // (straight from `#rrggbb` config values). On an `*Srgb` format
+        // the hardware would re-encode them on write -- treating them as
+        // linear -- which visibly washes out every mid-tone (e.g. a
+        // #17181c chrome rendered as ~#545454 gray).
+        let caps = surface.get_capabilities(&adapter);
+        if let Some(format) = caps.formats.iter().copied().find(|f| !f.is_srgb()) {
+            config.format = format;
+        }
         // `get_default_config` normally picks an opaque compositing mode.
         // Our shader always writes straight (non-premultiplied) color and
         // alpha, so `PostMultiplied` -- where the compositor does the
@@ -73,7 +92,7 @@ impl Renderer {
         // correctly against the desktop; opt into it when the adapter
         // offers it. If it doesn't, `opacity` below the max just won't be
         // visible -- a harmless degradation rather than wrong colors.
-        if surface.get_capabilities(&adapter).alpha_modes.contains(&wgpu::CompositeAlphaMode::PostMultiplied) {
+        if caps.alpha_modes.contains(&wgpu::CompositeAlphaMode::PostMultiplied) {
             config.alpha_mode = wgpu::CompositeAlphaMode::PostMultiplied;
         }
         surface.configure(&device, &config);
@@ -185,8 +204,8 @@ impl Renderer {
 
         let titles: Vec<String> = tabs.iter().map(|t| t.title.clone()).collect();
         let tab_layout = chrome::tab_bar_layout(&titles, window_width, self.atlas.cell_width);
-        instances.extend(chrome::build_tab_bar_instances(&self.atlas, &self.palette, &tab_layout, active, window_width, tab_bar_h, self.opacity));
-        instances.extend(chrome::build_status_bar_instances(&self.atlas, &self.palette, status, window_width, window_height, status_bar_h, self.opacity));
+        instances.extend(chrome::build_tab_bar_instances(&self.atlas, &tab_layout, active, window_width, tab_bar_h));
+        instances.extend(chrome::build_status_bar_instances(&self.atlas, status, window_width, window_height, status_bar_h));
 
         let instance_count = self
             .pipeline

@@ -65,6 +65,39 @@ struct App {
     cached_status: chrome::StatusInfo,
     last_status_refresh: Option<Instant>,
     cursor_pos: (f32, f32),
+    /// Whether at least one frame has actually reached the screen.
+    ///
+    /// REGRESSION GUARD -- the "window stays blank until the first
+    /// keypress" startup bug. Do not simplify the first-frame machinery
+    /// without re-testing cold launches many times; the bug is timing
+    /// dependent and only shows up on some launches.
+    ///
+    /// Why it happens: this app uses `ControlFlow::Wait`, so nothing
+    /// draws unless an event asks for it. During the first ~100ms of a
+    /// window's life on macOS, both of the triggers we rely on can be
+    /// silently dropped:
+    ///   1. `request_redraw()` calls made before the window is actually
+    ///      visible may never produce a `RedrawRequested` event.
+    ///   2. Even a delivered `RedrawRequested` can fail inside
+    ///      `Renderer::render` -- the Metal layer may not hand out a
+    ///      drawable yet (`Timeout`/`Outdated`/`Lost`).
+    ///
+    /// If the shell's first prompt output happens to arrive inside
+    /// that window (it usually does -- bash starts in tens of ms), its
+    /// redraw request is lost with it, and with no further events the
+    /// screen stays blank until the user presses a key.
+    ///
+    /// The fix is layered; all three parts matter:
+    ///   - `about_to_wait` keeps re-requesting redraws on a short
+    ///     `WaitUntil` timer for as long as this flag is false, so the
+    ///     first frame does not depend on any external event arriving.
+    ///     Once a frame has been presented, control flow reverts to
+    ///     plain `Wait` (zero idle wakeups).
+    ///   - `RedrawRequested` retries when `render` reports
+    ///     `RenderOutcome::Retry` (transient surface failure).
+    ///   - `WindowEvent::Occluded(false)` requests a redraw, since a
+    ///     frame skipped while occluded is otherwise never re-drawn.
+    presented_once: bool,
 }
 
 impl App {
@@ -83,6 +116,7 @@ impl App {
             cached_status: chrome::StatusInfo { shell: String::new(), cwd: String::new(), branch: None, tty: String::new() },
             last_status_refresh: None,
             cursor_pos: (0.0, 0.0),
+            presented_once: false,
         }
     }
 
@@ -510,6 +544,15 @@ impl ApplicationHandler<UserEvent> for App {
             WindowEvent::MouseInput { state: ElementState::Pressed, button: MouseButton::Left, .. } => {
                 self.handle_tab_bar_click(event_loop);
             }
+            // A frame skipped while occluded (see `RenderOutcome::Skipped`)
+            // is never retried on its own -- redraw as soon as the window
+            // becomes visible again. Part of the first-frame regression
+            // guard documented on `App::presented_once`.
+            WindowEvent::Occluded(false) => {
+                if let Some(window) = &self.window {
+                    window.request_redraw();
+                }
+            }
             WindowEvent::RedrawRequested => {
                 self.refresh_status();
                 let scroll_offset = self.tabs[self.active].scroll_offset;
@@ -517,14 +560,39 @@ impl ApplicationHandler<UserEvent> for App {
                     .renderer
                     .as_mut()
                     .map(|renderer| renderer.render(&self.tabs, self.active, scroll_offset, &self.cached_status));
-                if let Some(render::RenderOutcome::Retry) = outcome {
-                    if let Some(window) = &self.window {
-                        window.request_redraw();
+                match outcome {
+                    Some(render::RenderOutcome::Presented) => self.presented_once = true,
+                    Some(render::RenderOutcome::Retry) => {
+                        if let Some(window) = &self.window {
+                            window.request_redraw();
+                        }
                     }
+                    Some(render::RenderOutcome::Skipped) | None => {}
                 }
             }
             _ => {}
         }
+    }
+
+    /// Runs after every batch of events, just before the loop sleeps.
+    ///
+    /// Until the first frame has actually been presented, keep the loop
+    /// awake on a short timer and re-request a redraw on every pass --
+    /// this is the layer of the first-frame fix that does NOT depend on
+    /// any event being delivered (see `App::presented_once` for the full
+    /// story; `request_redraw` calls and pty output can both be dropped
+    /// or mistimed during the window's first moments). Once something is
+    /// on screen, revert to pure `Wait` so an idle terminal costs zero
+    /// wakeups.
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        if self.presented_once {
+            event_loop.set_control_flow(ControlFlow::Wait);
+            return;
+        }
+        if let Some(window) = &self.window {
+            window.request_redraw();
+        }
+        event_loop.set_control_flow(ControlFlow::WaitUntil(Instant::now() + Duration::from_millis(16)));
     }
 }
 

@@ -50,11 +50,17 @@ pub fn tty_name(master: BorrowedFd) -> Option<String> {
 /// Fork a new pty and exec the user's shell as a login shell in the child.
 ///
 /// # Safety / ordering
-/// Must be called before any other threads exist in this process (i.e.
-/// before winit initializes AppKit). `forkpty` only allows async-signal-safe
-/// calls in the child until `execve`, and `execvp` allocates internally to
-/// build its argv array; that's only sound here because no other thread can
-/// be holding the allocator lock at fork time.
+/// The very first call must happen before any other threads exist (i.e.
+/// before winit initializes AppKit) -- `main()` spawns the first tab's
+/// shell that early for exactly this reason. Later calls (opening a new
+/// tab) necessarily run with reader threads alive; strictly speaking only
+/// async-signal-safe calls are allowed in a forked child then, and
+/// `setenv`/`execvp` both allocate. In practice the fork-to-exec window is
+/// a handful of instructions and every parent-side thread here is either
+/// parked in `read(2)` or the event loop rather than mid-`malloc`, so the
+/// deadlock window is vanishingly small -- but if a new tab ever hangs
+/// before exec, this is the place to suspect (the fix would be
+/// `posix_spawn` plus manual pty plumbing).
 pub fn spawn_shell(shell: &ShellConfig) -> PtyHandle {
     let shell_path = shell
         .command

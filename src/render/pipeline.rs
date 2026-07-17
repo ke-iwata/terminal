@@ -11,8 +11,8 @@ pub struct Instance {
     pub uv_min: [f32; 2],
     pub uv_max: [f32; 2],
     pub color: [f32; 4],
-    /// >0 rounds this quad's top two corners (see `cell.wgsl`); 0 for a
-    /// plain rectangle.
+    /// Radius above zero rounds this quad's top two corners (see
+    /// `cell.wgsl`); 0 draws a plain rectangle.
     pub top_corner_radius: f32,
 }
 

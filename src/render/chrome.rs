@@ -10,7 +10,25 @@
 
 use super::font::FontAtlas;
 use super::pipeline::Instance;
-use crate::term::color::Palette;
+
+// Fixed chrome colors, deliberately NOT derived from the terminal palette:
+// deriving them from the configured background made the active tab blend
+// into the grid below it (both were the palette background), and made the
+// whole strip shift with every theme change. A neutral dark chrome -- the
+// same choice browsers make -- stays readable over any terminal theme.
+// These are also always drawn fully opaque: the window-opacity setting
+// only lets the desktop show through the terminal *content*, never
+// through the frame around it.
+const CHROME_BACKDROP: (u8, u8, u8) = (0x17, 0x18, 0x1c);
+const CHROME_TAB_ACTIVE: (u8, u8, u8) = (0x3c, 0x3f, 0x46);
+const CHROME_TAB_INACTIVE: (u8, u8, u8) = (0x24, 0x26, 0x2b);
+const CHROME_FG_ACTIVE: (u8, u8, u8) = (0xe8, 0xea, 0xed);
+const CHROME_FG_INACTIVE: (u8, u8, u8) = (0x8b, 0x8f, 0x97);
+const CHROME_FG_DIM: (u8, u8, u8) = (0x6a, 0x6e, 0x76);
+const CHROME_ACCENT: (u8, u8, u8) = (0x4d, 0x9f, 0xff);
+const CHROME_STATUS_BG: (u8, u8, u8) = (0x1d, 0x1f, 0x24);
+const CHROME_STATUS_EDGE: (u8, u8, u8) = (0x3a, 0x3d, 0x44);
+const CHROME_STATUS_BRANCH: (u8, u8, u8) = (0x7e, 0xc9, 0x7a);
 
 /// Tabs shrink toward this floor as more are opened; below it they stop
 /// shrinking and the strip simply overflows the window (no scrolling in
@@ -86,9 +104,14 @@ pub fn tab_bar_layout(titles: &[String], window_width: f32, cell_w: f32) -> TabB
     let tab_cols = (available_for_tabs / n).clamp(MIN_TAB_COLS, MAX_TAB_COLS);
     let label_cols = tab_cols.saturating_sub(LEFT_PAD_COLS + CLOSE_COLS);
 
+    // Breathing room before the first tab, so its rounded corner doesn't
+    // sit flush against the window edge. Applied here (not at draw time)
+    // so click hit-testing shares the exact same offset.
+    let origin = cell_w * 0.5;
+
     let mut tabs = Vec::with_capacity(titles.len());
     for (i, title) in titles.iter().enumerate() {
-        let x0 = (i * tab_cols) as f32 * cell_w;
+        let x0 = origin + (i * tab_cols) as f32 * cell_w;
         let x1 = x0 + tab_cols as f32 * cell_w;
         let close_x0 = x1 - CLOSE_COLS as f32 * cell_w;
         tabs.push(TabRect {
@@ -101,7 +124,7 @@ pub fn tab_bar_layout(titles: &[String], window_width: f32, cell_w: f32) -> TabB
         });
     }
 
-    let new_tab_x0 = (titles.len() * tab_cols) as f32 * cell_w;
+    let new_tab_x0 = origin + (titles.len() * tab_cols) as f32 * cell_w;
     TabBarLayout {
         tabs,
         new_tab_x0,
@@ -132,24 +155,10 @@ pub struct StatusInfo {
     pub tty: String,
 }
 
-pub fn build_tab_bar_instances(atlas: &FontAtlas, palette: &Palette, layout: &TabBarLayout, active: usize, bar_width: f32, bar_height: f32, opacity: f32) -> Vec<Instance> {
+pub fn build_tab_bar_instances(atlas: &FontAtlas, layout: &TabBarLayout, active: usize, bar_width: f32, bar_height: f32) -> Vec<Instance> {
     let mut instances = Vec::new();
 
-    let backdrop = mix(palette.background, palette.foreground, 0.07);
-    let active_bg = palette.background;
-    let inactive_bg = mix(palette.background, palette.foreground, 0.14);
-    // A bright accent (not just a color/darkness change) is what actually
-    // reads as "selected" at a glance -- a background-only difference
-    // between tabs is too subtle to register as a real distinction. Kept
-    // fully opaque (unlike the backgrounds) so it stays a crisp marker
-    // even at low window opacity.
-    let accent = mix(palette.ansi[12], palette.background, 0.05);
-    let active_fg = palette.foreground;
-    let inactive_fg = mix(palette.foreground, palette.background, 0.45);
-    let close_fg = mix(palette.foreground, palette.background, 0.6);
-    let new_tab_fg = mix(palette.foreground, palette.background, 0.4);
-
-    push_rect(&mut instances, atlas, 0.0, 0.0, bar_width, bar_height, backdrop, opacity, 0.0);
+    push_rect(&mut instances, atlas, [0.0, 0.0, bar_width, bar_height], CHROME_BACKDROP, 0.0);
 
     let text_y = (bar_height - atlas.cell_height) / 2.0;
     let accent_h = (bar_height * 0.08).max(2.0);
@@ -161,40 +170,41 @@ pub fn build_tab_bar_instances(atlas: &FontAtlas, palette: &Palette, layout: &Ta
 
     for tab in &layout.tabs {
         let is_active = tab.index == active;
-        let bg = if is_active { active_bg } else { inactive_bg };
-        push_rect(&mut instances, atlas, tab.x0, 0.0, tab.x1 - tab.x0, bar_height, bg, opacity, tab_radius);
+        let bg = if is_active { CHROME_TAB_ACTIVE } else { CHROME_TAB_INACTIVE };
+        push_rect(&mut instances, atlas, [tab.x0, 0.0, tab.x1 - tab.x0, bar_height], bg, tab_radius);
 
-        let fg = if is_active { active_fg } else { inactive_fg };
+        let fg = if is_active { CHROME_FG_ACTIVE } else { CHROME_FG_INACTIVE };
         push_text(&mut instances, atlas, &tab.label, tab.x0 + atlas.cell_width * LEFT_PAD_COLS as f32, text_y, fg);
-        push_text(&mut instances, atlas, "x", tab.close_x0 + atlas.cell_width * 0.5, text_y, close_fg);
+        push_text(&mut instances, atlas, "x", tab.close_x0 + atlas.cell_width * 0.5, text_y, CHROME_FG_DIM);
 
+        // A bright accent (not just a background-darkness change) is what
+        // actually reads as "selected" at a glance.
         if is_active {
-            push_rect(&mut instances, atlas, tab.x0, bar_height - accent_h, tab.x1 - tab.x0, accent_h, accent, 1.0, 0.0);
+            push_rect(&mut instances, atlas, [tab.x0, bar_height - accent_h, tab.x1 - tab.x0, accent_h], CHROME_ACCENT, 0.0);
         }
     }
 
-    push_text(&mut instances, atlas, "+", layout.new_tab_x0 + atlas.cell_width, text_y, new_tab_fg);
+    push_text(&mut instances, atlas, "+", layout.new_tab_x0 + atlas.cell_width, text_y, CHROME_FG_INACTIVE);
 
     instances
 }
 
-pub fn build_status_bar_instances(atlas: &FontAtlas, palette: &Palette, status: &StatusInfo, window_width: f32, window_height: f32, bar_height: f32, opacity: f32) -> Vec<Instance> {
+pub fn build_status_bar_instances(atlas: &FontAtlas, status: &StatusInfo, window_width: f32, window_height: f32, bar_height: f32) -> Vec<Instance> {
     let mut instances = Vec::new();
     let y = window_height - bar_height;
 
-    push_rect(&mut instances, atlas, 0.0, y, window_width, bar_height, mix(palette.background, palette.foreground, 0.09), opacity, 0.0);
+    push_rect(&mut instances, atlas, [0.0, y, window_width, bar_height], CHROME_STATUS_BG, 0.0);
     // A crisp top edge separates the bar from live terminal content more
-    // clearly than a flat background-tint difference alone -- kept fully
-    // opaque like the tab's accent underline.
-    push_rect(&mut instances, atlas, 0.0, y, window_width, 1.0, mix(palette.background, palette.foreground, 0.26), 1.0, 0.0);
+    // clearly than a flat background-tint difference alone.
+    push_rect(&mut instances, atlas, [0.0, y, window_width, 1.0], CHROME_STATUS_EDGE, 0.0);
 
-    let sep_color = mix(palette.foreground, palette.background, 0.6);
-    let shell_color = mix(palette.foreground, palette.background, 0.35);
-    let cwd_color = mix(palette.foreground, palette.background, 0.08);
+    let sep_color = CHROME_FG_DIM;
+    let shell_color = CHROME_FG_INACTIVE;
+    let cwd_color = CHROME_FG_ACTIVE;
     // Green reads as "git branch" at a glance in most shell prompts/themes
     // -- reuse that association instead of just dimming the text.
-    let branch_color = mix(palette.ansi[10], palette.background, 0.05);
-    let tty_color = mix(palette.foreground, palette.background, 0.55);
+    let branch_color = CHROME_STATUS_BRANCH;
+    let tty_color = CHROME_FG_DIM;
 
     let mut parts: Vec<(&str, (u8, u8, u8))> = vec![(status.shell.as_str(), shell_color), (status.cwd.as_str(), cwd_color)];
     if let Some(branch) = &status.branch {
@@ -229,26 +239,19 @@ pub fn build_status_bar_instances(atlas: &FontAtlas, palette: &Palette, status: 
     instances
 }
 
-fn mix(a: (u8, u8, u8), b: (u8, u8, u8), t: f32) -> (u8, u8, u8) {
-    let lerp = |x: u8, y: u8| (x as f32 + (y as f32 - x as f32) * t).round().clamp(0.0, 255.0) as u8;
-    (lerp(a.0, b.0), lerp(a.1, b.1), lerp(a.2, b.2))
-}
-
 fn rgb_to_color((r, g, b): (u8, u8, u8)) -> [f32; 4] {
     [r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0, 1.0]
 }
 
-fn rgba_to_color((r, g, b): (u8, u8, u8), a: f32) -> [f32; 4] {
-    [r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0, a]
-}
-
-fn push_rect(instances: &mut Vec<Instance>, atlas: &FontAtlas, x: f32, y: f32, w: f32, h: f32, color: (u8, u8, u8), alpha: f32, top_corner_radius: f32) {
+/// `rect` is `[x, y, w, h]` in window pixels.
+fn push_rect(instances: &mut Vec<Instance>, atlas: &FontAtlas, rect: [f32; 4], color: (u8, u8, u8), top_corner_radius: f32) {
+    let [x, y, w, h] = rect;
     instances.push(Instance {
         pos: [x, y],
         size: [w, h],
         uv_min: atlas.white_uv,
         uv_max: atlas.white_uv,
-        color: rgba_to_color(color, alpha),
+        color: rgb_to_color(color),
         top_corner_radius,
     });
 }
