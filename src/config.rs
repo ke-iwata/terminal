@@ -9,6 +9,10 @@ pub struct Config {
     pub colors: ColorConfig,
     pub shell: ShellConfig,
     pub scrollback_lines: usize,
+    /// Window background opacity, 0 (fully see-through) to 1 (opaque).
+    /// Only the background fill is affected -- text and the cursor stay
+    /// fully opaque so the window stays readable at any setting.
+    pub opacity: f32,
 }
 
 impl Default for Config {
@@ -18,6 +22,7 @@ impl Default for Config {
             colors: ColorConfig::default(),
             shell: ShellConfig::default(),
             scrollback_lines: 10_000,
+            opacity: 1.0,
         }
     }
 }

@@ -1,7 +1,7 @@
 use crate::config::ShellConfig;
 use nix::pty::{forkpty, ForkptyResult, Winsize};
 use nix::unistd::{execvp, Pid};
-use std::ffi::CString;
+use std::ffi::{CStr, CString};
 use std::os::fd::{AsRawFd, BorrowedFd, OwnedFd};
 
 pub struct PtyHandle {
@@ -26,6 +26,25 @@ pub fn resize(fd: BorrowedFd, cols: u16, rows: u16) {
     // Safety: `fd` is a valid, open pty master descriptor for the lifetime
     // of this call, and `ws` is a valid, fully-initialized Winsize.
     let _ = unsafe { set_window_size(fd.as_raw_fd(), &ws) };
+}
+
+/// The short device name (e.g. `"ttys003"`) of the pty's slave side, for
+/// display in the status bar. `ptsname` works on the master fd of any
+/// BSD-style pty pair, not just ones opened via `posix_openpt`, so this is
+/// safe to call on the fd `forkpty` handed back. Not thread-safe (the
+/// non-reentrant libc call reuses a static buffer), but this is only ever
+/// called from the main thread while constructing a `Tab`, never from a
+/// pty reader thread.
+pub fn tty_name(master: BorrowedFd) -> Option<String> {
+    // Safety: `master` is a valid, open pty master fd.
+    let ptr = unsafe { libc::ptsname(master.as_raw_fd()) };
+    if ptr.is_null() {
+        return None;
+    }
+    // Safety: a non-null return is a valid NUL-terminated C string owned by
+    // libc's static buffer, live until the next `ptsname` call.
+    let path = unsafe { CStr::from_ptr(ptr) }.to_str().ok()?;
+    Some(path.rsplit('/').next().unwrap_or(path).to_string())
 }
 
 /// Fork a new pty and exec the user's shell as a login shell in the child.
@@ -55,6 +74,16 @@ pub fn spawn_shell(shell: &ShellConfig) -> PtyHandle {
 
     match unsafe { forkpty(None, None) }.expect("forkpty failed") {
         ForkptyResult::Child => {
+            // Force a known-good TERM regardless of whatever the parent
+            // process happened to have (Finder-launched apps, or a script
+            // that spawned this one, often have no TERM at all) -- an
+            // empty/missing TERM leaves the shell's readline without a
+            // terminfo entry, so e.g. Ctrl-L's clear-screen binding
+            // silently no-ops. This emulator understands roughly xterm's
+            // escape sequences, so advertise that.
+            // Safety: single-threaded child right after fork, before
+            // execvp -- same invariant the rest of this function relies on.
+            unsafe { std::env::set_var("TERM", "xterm-256color") };
             let _ = execvp(&shell_c, &argv);
             // execvp only returns on failure.
             std::process::exit(1);

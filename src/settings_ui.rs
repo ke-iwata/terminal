@@ -28,6 +28,7 @@ struct ConfigDraft {
     shell_command: String,
     shell_args: String,
     scrollback_lines: u32,
+    opacity: f32,
     status: Option<String>,
 }
 
@@ -42,6 +43,7 @@ impl From<&Config> for ConfigDraft {
             shell_command: c.shell.command.clone().unwrap_or_default(),
             shell_args: c.shell.args.join(" "),
             scrollback_lines: c.scrollback_lines as u32,
+            opacity: c.opacity,
             status: None,
         }
     }
@@ -64,6 +66,7 @@ impl ConfigDraft {
                 args: self.shell_args.split_whitespace().map(String::from).collect(),
             },
             scrollback_lines: self.scrollback_lines as usize,
+            opacity: self.opacity.clamp(0.0, 1.0),
         }
     }
 }
@@ -564,6 +567,11 @@ fn draw_colors_page(ui: &mut egui::Ui, draft: &mut ConfigDraft) {
         ui.color_edit_button_srgb(&mut draft.foreground);
         ui.end_row();
     });
+
+    ui.add_space(20.0);
+    ui.label("Window Opacity");
+    field_description(ui, "How much of the desktop behind the window shows through. Text and the cursor always stay fully opaque.");
+    ui.add(egui::Slider::new(&mut draft.opacity, 0.3..=1.0).show_value(true));
 
     ui.add_space(20.0);
     ui.label("ANSI palette");

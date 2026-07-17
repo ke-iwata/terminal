@@ -1,7 +1,9 @@
+pub mod chrome;
 mod font;
 mod pipeline;
 
 use crate::config::FontConfig;
+use crate::tab::Tab;
 use crate::term::color::Palette;
 use crate::term::grid::CellFlags;
 use crate::term::Term;
@@ -9,6 +11,17 @@ use font::FontAtlas;
 use pipeline::{CellPipeline, Instance};
 use std::sync::Arc;
 use winit::window::Window;
+
+/// What happened when `Renderer::render` was asked to draw a frame.
+pub enum RenderOutcome {
+    Presented,
+    /// The surface wasn't ready yet (most common right after the window is
+    /// first created) -- ask for another redraw immediately.
+    Retry,
+    /// Not currently visible; nothing to do until a real event (resize,
+    /// becoming visible again) prompts a redraw on its own.
+    Skipped,
+}
 
 pub struct Renderer {
     surface: wgpu::Surface<'static>,
@@ -18,10 +31,13 @@ pub struct Renderer {
     pipeline: CellPipeline,
     atlas: FontAtlas,
     palette: Palette,
+    /// Window background opacity (0..1). Only background fills respect
+    /// this -- glyphs and the cursor are always drawn fully opaque.
+    opacity: f32,
 }
 
 impl Renderer {
-    pub fn new(window: Arc<Window>, font: &FontConfig, palette: Palette) -> Self {
+    pub fn new(window: Arc<Window>, font: &FontConfig, palette: Palette, opacity: f32) -> Self {
         let size = window.inner_size();
         let scale_factor = window.scale_factor();
 
@@ -47,9 +63,19 @@ impl Renderer {
         }))
         .expect("failed to request wgpu device");
 
-        let config = surface
+        let mut config = surface
             .get_default_config(&adapter, size.width.max(1), size.height.max(1))
             .expect("surface is not supported by the adapter");
+        // `get_default_config` normally picks an opaque compositing mode.
+        // Our shader always writes straight (non-premultiplied) color and
+        // alpha, so `PostMultiplied` -- where the compositor does the
+        // premultiplication -- is the one mode that actually blends
+        // correctly against the desktop; opt into it when the adapter
+        // offers it. If it doesn't, `opacity` below the max just won't be
+        // visible -- a harmless degradation rather than wrong colors.
+        if surface.get_capabilities(&adapter).alpha_modes.contains(&wgpu::CompositeAlphaMode::PostMultiplied) {
+            config.alpha_mode = wgpu::CompositeAlphaMode::PostMultiplied;
+        }
         surface.configure(&device, &config);
 
         // Rasterize at physical pixels (point size * scale factor) so text
@@ -66,6 +92,7 @@ impl Renderer {
             pipeline,
             atlas,
             palette,
+            opacity,
         }
     }
 
@@ -75,6 +102,10 @@ impl Renderer {
 
     pub fn set_palette(&mut self, palette: Palette) {
         self.palette = palette;
+    }
+
+    pub fn set_opacity(&mut self, opacity: f32) {
+        self.opacity = opacity.clamp(0.0, 1.0);
     }
 
     /// Rebuild the glyph atlas and cell pipeline for a new font (family
@@ -107,31 +138,56 @@ impl Renderer {
             .set_screen_size(&self.queue, self.config.width as f32, self.config.height as f32);
     }
 
-    pub fn render(&mut self, term: &Term, scroll_offset: usize) {
+    /// Draw the active tab's grid framed by the tab strip (top) and status
+    /// bar (bottom). `tabs`/`active` drive the tab strip's labels and
+    /// highlight; `status` is pre-resolved shell/cwd/git/tty info --
+    /// process/filesystem lookups have no business happening in the
+    /// renderer.
+    pub fn render(&mut self, tabs: &[Tab], active: usize, scroll_offset: usize, status: &chrome::StatusInfo) -> RenderOutcome {
         let surface_texture = match self.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(t) => t,
             wgpu::CurrentSurfaceTexture::Suboptimal(t) => {
                 self.surface.configure(&self.device, &self.config);
                 t
             }
-            wgpu::CurrentSurfaceTexture::Timeout | wgpu::CurrentSurfaceTexture::Occluded => {
-                return;
-            }
-            wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Lost => {
+            // Not visible right now (minimized, fully covered); don't spin
+            // retrying since nothing would be seen anyway. The next resize
+            // or occlusion-state change requests a redraw on its own.
+            wgpu::CurrentSurfaceTexture::Occluded => return RenderOutcome::Skipped,
+            // Transient -- most commonly seen on the very first frame,
+            // before the native surface is fully ready. With
+            // `ControlFlow::Wait` these used to just silently skip the
+            // frame and leave the window blank until some unrelated event
+            // (a keypress, a resize) happened to trigger another
+            // `request_redraw` -- worth an immediate retry instead so the
+            // very first frame shows up on its own.
+            wgpu::CurrentSurfaceTexture::Timeout | wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Lost => {
                 self.surface.configure(&self.device, &self.config);
-                return;
+                return RenderOutcome::Retry;
             }
-            wgpu::CurrentSurfaceTexture::Validation => return,
+            wgpu::CurrentSurfaceTexture::Validation => return RenderOutcome::Skipped,
         };
 
         let view = surface_texture
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
 
+        let active_term = &tabs[active].term;
         // Full-screen apps (vim, less, htop, ...) manage their own scrolling
         // and don't expect the terminal to scroll their alternate screen.
-        let effective_offset = if term.using_alt_screen() { 0 } else { scroll_offset };
-        let instances = self.build_instances_from_grid(term, effective_offset);
+        let effective_offset = if active_term.using_alt_screen() { 0 } else { scroll_offset };
+        let tab_bar_h = chrome::tab_bar_height(self.atlas.cell_height);
+        let status_bar_h = chrome::status_bar_height(self.atlas.cell_height);
+        let window_width = self.config.width as f32;
+        let window_height = self.config.height as f32;
+
+        let mut instances = self.build_instances_from_grid(active_term, effective_offset, tab_bar_h);
+
+        let titles: Vec<String> = tabs.iter().map(|t| t.title.clone()).collect();
+        let tab_layout = chrome::tab_bar_layout(&titles, window_width, self.atlas.cell_width);
+        instances.extend(chrome::build_tab_bar_instances(&self.atlas, &self.palette, &tab_layout, active, window_width, tab_bar_h, self.opacity));
+        instances.extend(chrome::build_status_bar_instances(&self.atlas, &self.palette, status, window_width, window_height, status_bar_h, self.opacity));
+
         let instance_count = self
             .pipeline
             .upload_instances(&self.device, &self.queue, &instances);
@@ -149,7 +205,7 @@ impl Renderer {
                     depth_slice: None,
                     resolve_target: None,
                     ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(palette_clear_color(&self.palette)),
+                        load: wgpu::LoadOp::Clear(palette_clear_color(&self.palette, self.opacity)),
                         store: wgpu::StoreOp::Store,
                     },
                 })],
@@ -161,9 +217,10 @@ impl Renderer {
 
         self.queue.submit(std::iter::once(encoder.finish()));
         self.queue.present(surface_texture);
+        RenderOutcome::Presented
     }
 
-    fn build_instances_from_grid(&self, term: &Term, scroll_offset: usize) -> Vec<Instance> {
+    fn build_instances_from_grid(&self, term: &Term, scroll_offset: usize, y_offset: f32) -> Vec<Instance> {
         let grid = term.grid();
         let (cw, ch) = (self.atlas.cell_width, self.atlas.cell_height);
         let mut instances = Vec::with_capacity(grid.cols * grid.rows * 2);
@@ -190,14 +247,15 @@ impl Renderer {
                 };
 
                 let cell_x = col as f32 * cw;
-                let cell_y = row as f32 * ch;
+                let cell_y = row as f32 * ch + y_offset;
 
                 instances.push(Instance {
                     pos: [cell_x, cell_y],
                     size: [cw, ch],
                     uv_min: self.atlas.white_uv,
                     uv_max: self.atlas.white_uv,
-                    color: rgb_to_color(bg),
+                    color: rgba_to_color(bg, self.opacity),
+                    top_corner_radius: 0.0,
                 });
 
                 if cell.c != ' ' {
@@ -211,6 +269,7 @@ impl Renderer {
                                 uv_min: glyph.uv_min,
                                 uv_max: glyph.uv_max,
                                 color: rgb_to_color(fg),
+                                top_corner_radius: 0.0,
                             });
                         }
                     }
@@ -220,18 +279,23 @@ impl Renderer {
 
         if term.modes.show_cursor && scroll_offset == 0 {
             let cursor_x = term.cursor.col as f32 * cw;
-            let cursor_y = term.cursor.row as f32 * ch;
+            let cursor_y = term.cursor.row as f32 * ch + y_offset;
             instances.push(Instance {
                 pos: [cursor_x, cursor_y],
                 size: [cw, ch],
                 uv_min: self.atlas.white_uv,
                 uv_max: self.atlas.white_uv,
                 color: [1.0, 1.0, 1.0, 0.45],
+                top_corner_radius: 0.0,
             });
         }
 
         instances
     }
+}
+
+fn rgba_to_color((r, g, b): (u8, u8, u8), a: f32) -> [f32; 4] {
+    [r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0, a]
 }
 
 fn rgb_to_color((r, g, b): (u8, u8, u8)) -> [f32; 4] {
@@ -287,12 +351,12 @@ fn build_atlas_and_pipeline(
     (atlas, pipeline)
 }
 
-fn palette_clear_color(palette: &Palette) -> wgpu::Color {
+fn palette_clear_color(palette: &Palette, opacity: f32) -> wgpu::Color {
     let (r, g, b) = palette.background;
     wgpu::Color {
         r: r as f64 / 255.0,
         g: g as f64 / 255.0,
         b: b as f64 / 255.0,
-        a: 1.0,
+        a: opacity as f64,
     }
 }

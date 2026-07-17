@@ -11,6 +11,9 @@ pub struct Instance {
     pub uv_min: [f32; 2],
     pub uv_max: [f32; 2],
     pub color: [f32; 4],
+    /// >0 rounds this quad's top two corners (see `cell.wgsl`); 0 for a
+    /// plain rectangle.
+    pub top_corner_radius: f32,
 }
 
 #[repr(C)]
@@ -148,6 +151,7 @@ impl CellPipeline {
                 3 => Float32x2,
                 4 => Float32x2,
                 5 => Float32x4,
+                6 => Float32,
             ],
         };
 
