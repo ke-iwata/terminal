@@ -1,3 +1,4 @@
 /target
 /dist
 .claude/settings.local.json
+/icon/AppIcon.icns
