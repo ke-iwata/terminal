@@ -1,5 +1,6 @@
 mod config;
 mod input;
+mod linkify;
 mod menu;
 mod pty;
 mod render;
@@ -98,6 +99,11 @@ struct App {
     ///   - `WindowEvent::Occluded(false)` requests a redraw, since a
     ///     frame skipped while occluded is otherwise never re-drawn.
     presented_once: bool,
+    /// Set while the left mouse button is held down after a press that
+    /// started a text selection in the grid (as opposed to a tab-bar
+    /// click). `CursorMoved` only extends the active tab's selection
+    /// while this is true.
+    dragging_selection: bool,
 }
 
 impl App {
@@ -117,6 +123,7 @@ impl App {
             last_status_refresh: None,
             cursor_pos: (0.0, 0.0),
             presented_once: false,
+            dragging_selection: false,
         }
     }
 
@@ -284,6 +291,201 @@ impl App {
         }
     }
 
+    /// Maps a window-pixel position to a grid cell for the active tab.
+    /// Clamped to the grid's bounds -- a drag that continues past the
+    /// window's edge still selects to the nearest real cell instead of
+    /// stopping dead. `None` only before the window/renderer exist.
+    fn grid_point_at(&self, x: f32, y: f32) -> Option<tab::GridPoint> {
+        let renderer = self.renderer.as_ref()?;
+        let (cell_w, cell_h) = renderer.cell_size();
+        let tab = self.active_tab();
+        let grid = tab.term.grid();
+        let col = ((x / cell_w).floor().max(0.0) as usize).min(grid.cols.saturating_sub(1));
+        let y_in_grid = (y - chrome::tab_bar_height(cell_h)).max(0.0);
+        let view_row = ((y_in_grid / cell_h).floor() as usize).min(grid.rows.saturating_sub(1));
+        let distance = grid.distance_from_bottom(view_row, tab.scroll_offset);
+        Some(tab::GridPoint { distance, col })
+    }
+
+    /// If the current cursor position lands on a URL (see
+    /// `linkify::find_urls`), opens it with the system's default handler
+    /// and returns `true`. Only ever called with Cmd held -- `false`
+    /// means the caller should fall back to its normal click handling.
+    fn open_url_under_cursor(&mut self) -> bool {
+        let Some(tab::GridPoint { distance, col }) = self.grid_point_at(self.cursor_pos.0, self.cursor_pos.1) else {
+            return false;
+        };
+        let tab = self.active_tab();
+        let Some(row) = tab.term.grid().absolute_line(distance) else {
+            return false;
+        };
+        let text: String = row.iter().map(|c| c.c).collect();
+        let Some((start, end)) = linkify::find_urls(&text).into_iter().find(|(s, e)| col >= *s && col <= *e) else {
+            return false;
+        };
+        let url: String = text.chars().skip(start).take(end - start + 1).collect();
+        // `open` resolves the same way as double-clicking the link in
+        // Finder would -- default browser for http(s), no shell involved
+        // (the URL is one argv entry, not interpolated into a command
+        // string), so there's no injection risk from clicking on
+        // adversarial terminal output.
+        let _ = std::process::Command::new("open").arg(&url).spawn();
+        true
+    }
+
+    /// Start a new text selection at the current cursor position,
+    /// replacing whatever was selected before. No-op outside the grid
+    /// (the tab bar and status bar aren't selectable).
+    fn begin_selection(&mut self) {
+        let (Some(window), Some(renderer)) = (&self.window, &self.renderer) else {
+            return;
+        };
+        let (_, cell_h) = renderer.cell_size();
+        let status_bar_top = window.inner_size().height as f32 - chrome::status_bar_height(cell_h);
+        if self.cursor_pos.1 < chrome::tab_bar_height(cell_h) || self.cursor_pos.1 >= status_bar_top {
+            return;
+        }
+        let Some(point) = self.grid_point_at(self.cursor_pos.0, self.cursor_pos.1) else {
+            return;
+        };
+        self.dragging_selection = true;
+        self.active_tab_mut().selection = Some(tab::Selection { anchor: point, cursor: point });
+        if let Some(window) = &self.window {
+            window.request_redraw();
+        }
+    }
+
+    /// Extend the in-progress selection to the current cursor position.
+    fn update_selection(&mut self) {
+        if !self.dragging_selection {
+            return;
+        }
+        let Some(point) = self.grid_point_at(self.cursor_pos.0, self.cursor_pos.1) else {
+            return;
+        };
+        if let Some(selection) = &mut self.active_tab_mut().selection {
+            selection.cursor = point;
+        }
+        if let Some(window) = &self.window {
+            window.request_redraw();
+        }
+    }
+
+    /// Finish a drag begun by `begin_selection`. A press-and-release with
+    /// no movement in between is a plain click, not a selection -- clear
+    /// it rather than leaving a zero-width one that would otherwise just
+    /// sit there uncopiable and unclearable by any other click.
+    fn end_selection(&mut self) {
+        if !self.dragging_selection {
+            return;
+        }
+        self.dragging_selection = false;
+        let tab = self.active_tab_mut();
+        if tab.selection.is_some_and(|s| s.anchor == s.cursor) {
+            tab.selection = None;
+            if let Some(window) = &self.window {
+                window.request_redraw();
+            }
+        }
+    }
+
+    /// Opens the active tab's search bar if it isn't already open. A
+    /// second Cmd+F while one's already open is a no-op -- keeps whatever
+    /// query was typed rather than clearing it, since there's no reason a
+    /// repeated Cmd+F should throw away progress.
+    fn open_search(&mut self) {
+        if self.active_tab().search.is_none() {
+            self.active_tab_mut().search = Some(tab::Search::new());
+        }
+        if let Some(window) = &self.window {
+            window.request_redraw();
+        }
+    }
+
+    fn close_search(&mut self) {
+        self.active_tab_mut().search = None;
+        if let Some(window) = &self.window {
+            window.request_redraw();
+        }
+    }
+
+    /// Routes one key event to the open search bar: text edits the query
+    /// (re-running the search after every change), Enter/Shift+Enter step
+    /// through results, Escape closes it. Anything else is swallowed --
+    /// while search is open nothing should reach the pty.
+    fn handle_search_key(&mut self, event: &winit::event::KeyEvent) {
+        use winit::keyboard::{Key, NamedKey};
+        match &event.logical_key {
+            Key::Named(NamedKey::Escape) => self.close_search(),
+            Key::Named(NamedKey::Enter) => {
+                if self.modifiers.shift_key() {
+                    self.step_search(false);
+                } else {
+                    self.step_search(true);
+                }
+            }
+            Key::Named(NamedKey::Backspace) => {
+                if let Some(search) = &mut self.active_tab_mut().search {
+                    search.query.pop();
+                }
+                self.recompute_search();
+            }
+            _ => {
+                if let Some(text) = event.text.as_deref() {
+                    // Filters out the control characters winit still
+                    // reports `text` for for some named keys (e.g. Tab)
+                    // -- only append genuinely printable input.
+                    if !text.is_empty() && text.chars().all(|c| !c.is_control()) {
+                        if let Some(search) = &mut self.active_tab_mut().search {
+                            search.query.push_str(text);
+                        }
+                        self.recompute_search();
+                    }
+                }
+            }
+        }
+    }
+
+    /// Re-runs the active tab's search after its query changed and jumps
+    /// the view to the (new) first match.
+    fn recompute_search(&mut self) {
+        let tab = self.active_tab_mut();
+        let grid = tab.term.grid();
+        if let Some(search) = &mut tab.search {
+            search.recompute(grid);
+        }
+        self.jump_to_search_match();
+        if let Some(window) = &self.window {
+            window.request_redraw();
+        }
+    }
+
+    fn step_search(&mut self, forward: bool) {
+        let tab = self.active_tab_mut();
+        let Some(search) = &mut tab.search else { return };
+        if forward {
+            search.go_next();
+        } else {
+            search.go_prev();
+        }
+        self.jump_to_search_match();
+        if let Some(window) = &self.window {
+            window.request_redraw();
+        }
+    }
+
+    /// Scrolls the active tab so its search's current match is roughly
+    /// centered in the viewport. No-op if there's no open search or no
+    /// current match (an empty query, or one with no hits).
+    fn jump_to_search_match(&mut self) {
+        let tab = self.active_tab_mut();
+        let Some(search) = &tab.search else { return };
+        let Some((distance, _)) = search.current_target() else { return };
+        let rows = tab.term.rows();
+        let max_offset = tab.term.grid().scrollback.len();
+        tab.scroll_offset = distance.saturating_sub(rows / 2).min(max_offset);
+    }
+
     /// Spawn the thread that blocking-reads `tab`'s pty and forwards bytes
     /// to the event loop, tagged with `tab`'s id and generation so
     /// `user_event` can route them (and can tell a since-closed tab's
@@ -368,6 +570,31 @@ fn display_path(path: &std::path::Path) -> String {
     path.display().to_string()
 }
 
+/// Write `text` to the system clipboard via `pbcopy`, macOS's own clipboard
+/// CLI -- simplest possible route to `NSPasteboard` without adding a
+/// clipboard crate as a dependency for what's otherwise a one-line job.
+fn copy_to_clipboard(text: &str) {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+    let Ok(mut child) = Command::new("pbcopy").stdin(Stdio::piped()).spawn() else {
+        return;
+    };
+    // `.take()` so the `ChildStdin` (and the pipe's write end with it) is
+    // dropped once we're done writing -- `wait()` would otherwise block
+    // forever, since `pbcopy` doesn't see EOF until that happens.
+    if let Some(mut stdin) = child.stdin.take() {
+        let _ = stdin.write_all(text.as_bytes());
+    }
+    let _ = child.wait();
+}
+
+/// The system clipboard's text contents via `pbpaste`, the read-side
+/// counterpart to `copy_to_clipboard`.
+fn paste_from_clipboard() -> Option<String> {
+    let output = std::process::Command::new("pbpaste").output().ok()?;
+    String::from_utf8(output.stdout).ok()
+}
+
 impl ApplicationHandler<UserEvent> for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if self.window.is_some() {
@@ -430,6 +657,20 @@ impl ApplicationHandler<UserEvent> for App {
                 }
                 tab.term.advance(&bytes);
                 tab.scroll_offset = 0;
+                // The content a selection pointed at may have just
+                // scrolled, changed, or stopped existing -- see the
+                // field doc on `Tab::selection`.
+                tab.selection = None;
+                // Unlike selection, a search stays open across new
+                // output -- just refreshed against it (see the field doc
+                // on `Tab::search`) rather than cleared. Doesn't jump the
+                // view to the current match here: new output already
+                // snaps the view to the live bottom via `scroll_offset =
+                // 0` above, and fighting that would be more surprising
+                // than just leaving the match list/count up to date.
+                if let Some(search) = &mut tab.search {
+                    search.recompute(tab.term.grid());
+                }
                 if let Some(window) = &self.window {
                     window.request_redraw();
                 }
@@ -501,10 +742,64 @@ impl ApplicationHandler<UserEvent> for App {
             }
             WindowEvent::ModifiersChanged(mods) => {
                 self.modifiers = mods.state();
+                // Cmd held/released toggles URL underlines in the grid --
+                // redraw right away instead of waiting for an unrelated
+                // event to happen to show/hide them.
+                if let Some(window) = &self.window {
+                    window.request_redraw();
+                }
             }
             WindowEvent::KeyboardInput { event, is_synthetic, .. } => {
-                if is_synthetic {
+                if is_synthetic || !event.state.is_pressed() {
                     return;
+                }
+                // Cmd+F always opens/keeps-open the search bar, checked
+                // before anything else so it works the same whether or
+                // not a search is already in progress.
+                if self.modifiers.super_key() {
+                    if let winit::keyboard::Key::Character(c) = &event.logical_key {
+                        if c.eq_ignore_ascii_case("f") {
+                            self.open_search();
+                            return;
+                        }
+                    }
+                }
+                // While the search bar is open it owns the keyboard --
+                // every key edits or navigates the query instead of
+                // reaching the pty, and none of it falls through past
+                // this block.
+                if self.active_tab().search.is_some() {
+                    self.handle_search_key(&event);
+                    return;
+                }
+                // Cmd+C/Cmd+V: copy/paste rather than passing the
+                // keystroke through. Ctrl+C (SIGINT) is a separate combo
+                // on macOS and isn't affected. On a plain click (no
+                // selection), Cmd+C intentionally does nothing rather
+                // than falling through to the pty -- winit doesn't
+                // report `text` for Cmd-held key events on macOS anyway,
+                // so this matches what already silently happened before
+                // selection existed.
+                if self.modifiers.super_key() {
+                    if let winit::keyboard::Key::Character(c) = &event.logical_key {
+                        if c.eq_ignore_ascii_case("c") {
+                            if let Some(text) = self.active_tab().selected_text() {
+                                copy_to_clipboard(&text);
+                            }
+                            return;
+                        }
+                        if c.eq_ignore_ascii_case("v") {
+                            if let Some(text) = paste_from_clipboard() {
+                                let tab = self.active_tab();
+                                let _ = nix::unistd::write(tab.pty_master.as_fd(), text.as_bytes());
+                                self.active_tab_mut().scroll_offset = 0;
+                                if let Some(window) = &self.window {
+                                    window.request_redraw();
+                                }
+                            }
+                            return;
+                        }
+                    }
                 }
                 let tab = self.active_tab();
                 let bytes = input::encode_key(
@@ -548,9 +843,25 @@ impl ApplicationHandler<UserEvent> for App {
             }
             WindowEvent::CursorMoved { position, .. } => {
                 self.cursor_pos = (position.x as f32, position.y as f32);
+                self.update_selection();
             }
             WindowEvent::MouseInput { state: ElementState::Pressed, button: MouseButton::Left, .. } => {
-                self.handle_tab_bar_click(event_loop);
+                let Some(cell_h) = self.renderer.as_ref().map(|r| r.cell_size().1) else {
+                    return;
+                };
+                if self.cursor_pos.1 < chrome::tab_bar_height(cell_h) {
+                    self.handle_tab_bar_click(event_loop);
+                } else if self.modifiers.super_key() && self.open_url_under_cursor() {
+                    // Cmd+click on a link opens it instead of starting a
+                    // selection -- Cmd+drag was never a gesture to begin
+                    // with, so there's nothing to preserve by falling
+                    // through when the click isn't on a link either.
+                } else {
+                    self.begin_selection();
+                }
+            }
+            WindowEvent::MouseInput { state: ElementState::Released, button: MouseButton::Left, .. } => {
+                self.end_selection();
             }
             // A frame skipped while occluded (see `RenderOutcome::Skipped`)
             // is never retried on its own -- redraw as soon as the window
@@ -564,10 +875,11 @@ impl ApplicationHandler<UserEvent> for App {
             WindowEvent::RedrawRequested => {
                 self.refresh_status();
                 let scroll_offset = self.tabs[self.active].scroll_offset;
+                let cmd_held = self.modifiers.super_key();
                 let outcome = self
                     .renderer
                     .as_mut()
-                    .map(|renderer| renderer.render(&self.tabs, self.active, scroll_offset, &self.cached_status));
+                    .map(|renderer| renderer.render(&self.tabs, self.active, scroll_offset, &self.cached_status, cmd_held));
                 match outcome {
                     Some(render::RenderOutcome::Presented) => self.presented_once = true,
                     Some(render::RenderOutcome::Retry) => {

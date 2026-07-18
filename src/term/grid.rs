@@ -104,6 +104,31 @@ impl Grid {
         }
     }
 
+    /// A viewport row's distance from the bottom of the live screen, in
+    /// lines -- 0 is the bottom-most live row, `rows - 1` the top-most
+    /// live row, `rows` the most recently scrolled-off line, and so on
+    /// back through scrollback. Selection endpoints are stored in this
+    /// form (see `crate::tab::Selection`) instead of raw `(view_row,
+    /// scroll_offset)` pairs specifically so a selection stays anchored to
+    /// the same text while the user scrolls mid-drag: `view_row` alone is
+    /// meaningless once `scroll_offset` changes, but a line's distance
+    /// from the live bottom does not.
+    pub fn distance_from_bottom(&self, view_row: usize, scroll_offset: usize) -> usize {
+        scroll_offset + (self.rows - 1 - view_row)
+    }
+
+    /// The inverse of `distance_from_bottom`: resolves a stored selection
+    /// endpoint back to the row it refers to, or `None` if that line has
+    /// since fallen out of scrollback (e.g. the scrollback cap shrank).
+    pub fn absolute_line(&self, distance_from_bottom: usize) -> Option<&Row> {
+        if distance_from_bottom < self.rows {
+            Some(&self.lines[self.rows - 1 - distance_from_bottom])
+        } else {
+            let k = distance_from_bottom - self.rows;
+            (k < self.scrollback.len()).then(|| &self.scrollback[self.scrollback.len() - 1 - k])
+        }
+    }
+
     /// Resize to a new column/row count, reflowing content instead of
     /// destroying it: rows linked by `wrapped` are treated as one logical
     /// line, re-wrapped at the new column count, so text that no longer
@@ -340,5 +365,54 @@ impl Grid {
             row.fill(Cell::default());
         }
         self.wrapped.fill(false);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn distance_from_bottom_spans_live_rows_at_zero_scroll() {
+        let grid = Grid::new(10, 4, 100);
+        // Bottom row is 0 lines away from itself; the top row is 3 (rows
+        // - 1) lines above it.
+        assert_eq!(grid.distance_from_bottom(3, 0), 0);
+        assert_eq!(grid.distance_from_bottom(0, 0), 3);
+    }
+
+    #[test]
+    fn distance_from_bottom_accounts_for_scroll_offset() {
+        let grid = Grid::new(10, 4, 100);
+        // Scrolled up by 2: the viewport's bottom row is now showing what
+        // used to be 2 lines above the true bottom.
+        assert_eq!(grid.distance_from_bottom(3, 2), 2);
+        assert_eq!(grid.distance_from_bottom(0, 2), 5);
+    }
+
+    #[test]
+    fn absolute_line_is_the_inverse_of_distance_from_bottom() {
+        let mut grid = Grid::new(3, 2, 100);
+        grid.row_mut(0)[0].c = 'A'; // top live row
+        grid.row_mut(1)[0].c = 'B'; // bottom live row
+        assert_eq!(grid.absolute_line(0).unwrap()[0].c, 'B');
+        assert_eq!(grid.absolute_line(1).unwrap()[0].c, 'A');
+    }
+
+    #[test]
+    fn absolute_line_reaches_into_scrollback() {
+        let mut grid = Grid::new(3, 2, 100);
+        let mut pushed = grid.blank_row();
+        pushed[0].c = 'S';
+        grid.scrollback.push_back(pushed);
+        // Past the two live rows (distance 0, 1), distance 2 is the most
+        // recently scrolled-off line.
+        assert_eq!(grid.absolute_line(2).unwrap()[0].c, 'S');
+    }
+
+    #[test]
+    fn absolute_line_none_past_scrollback_end() {
+        let grid = Grid::new(3, 2, 100);
+        assert!(grid.absolute_line(2).is_none());
     }
 }

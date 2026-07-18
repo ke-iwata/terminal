@@ -3,7 +3,8 @@ mod font;
 mod pipeline;
 
 use crate::config::FontConfig;
-use crate::tab::Tab;
+use crate::linkify;
+use crate::tab::{Search, Selection, Tab};
 use crate::term::color::Palette;
 use crate::term::grid::CellFlags;
 use crate::term::Term;
@@ -11,6 +12,17 @@ use font::FontAtlas;
 use pipeline::{CellPipeline, Instance};
 use std::sync::Arc;
 use winit::window::Window;
+
+/// Per-tab overlay state that affects how the grid is drawn, bundled into
+/// one struct purely to keep `render`/`build_instances_from_grid`'s
+/// argument lists from growing without bound as more of these are added.
+struct GridOverlays<'a> {
+    selection: Option<&'a Selection>,
+    search: Option<&'a Search>,
+    /// Whether Cmd is currently held -- URLs only get underlined while
+    /// it is, mirroring Terminal.app/iTerm2's "reveal links" gesture.
+    cmd_held: bool,
+}
 
 /// What happened when `Renderer::render` was asked to draw a frame.
 ///
@@ -162,7 +174,7 @@ impl Renderer {
     /// highlight; `status` is pre-resolved shell/cwd/git/tty info --
     /// process/filesystem lookups have no business happening in the
     /// renderer.
-    pub fn render(&mut self, tabs: &[Tab], active: usize, scroll_offset: usize, status: &chrome::StatusInfo) -> RenderOutcome {
+    pub fn render(&mut self, tabs: &[Tab], active: usize, scroll_offset: usize, status: &chrome::StatusInfo, cmd_held: bool) -> RenderOutcome {
         let surface_texture = match self.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(t) => t,
             wgpu::CurrentSurfaceTexture::Suboptimal(t) => {
@@ -200,12 +212,20 @@ impl Renderer {
         let window_width = self.config.width as f32;
         let window_height = self.config.height as f32;
 
-        let mut instances = self.build_instances_from_grid(active_term, effective_offset, tab_bar_h);
+        let overlays = GridOverlays {
+            selection: tabs[active].selection.as_ref(),
+            search: tabs[active].search.as_ref(),
+            cmd_held,
+        };
+        let mut instances = self.build_instances_from_grid(active_term, effective_offset, tab_bar_h, &overlays);
 
         let titles: Vec<String> = tabs.iter().map(|t| t.title.clone()).collect();
         let tab_layout = chrome::tab_bar_layout(&titles, window_width, self.atlas.cell_width);
         instances.extend(chrome::build_tab_bar_instances(&self.atlas, &tab_layout, active, window_width, tab_bar_h));
         instances.extend(chrome::build_status_bar_instances(&self.atlas, status, window_width, window_height, status_bar_h));
+        if let Some(search) = &tabs[active].search {
+            instances.extend(chrome::build_search_bar_instances(&self.atlas, search, window_width, tab_bar_h));
+        }
 
         let instance_count = self
             .pipeline
@@ -239,13 +259,25 @@ impl Renderer {
         RenderOutcome::Presented
     }
 
-    fn build_instances_from_grid(&self, term: &Term, scroll_offset: usize, y_offset: f32) -> Vec<Instance> {
+    fn build_instances_from_grid(&self, term: &Term, scroll_offset: usize, y_offset: f32, overlays: &GridOverlays) -> Vec<Instance> {
         let grid = term.grid();
         let (cw, ch) = (self.atlas.cell_width, self.atlas.cell_height);
         let mut instances = Vec::with_capacity(grid.cols * grid.rows * 2);
 
         for row in 0..grid.rows {
             let line = grid.line_at(row, scroll_offset);
+            let distance = grid.distance_from_bottom(row, scroll_offset);
+            let selected_cols = overlays.selection.and_then(|s| s.columns_on_line(distance, grid.cols));
+            let search_ranges = overlays.search.map(|s| s.ranges_on_line(distance)).unwrap_or_default();
+            // Recomputing per visible row (not once for the whole
+            // scrollback) so this costs nothing unless Cmd is actually
+            // held right now.
+            let url_ranges = if overlays.cmd_held {
+                let text: String = line.iter().map(|c| c.c).collect();
+                linkify::find_urls(&text)
+            } else {
+                Vec::new()
+            };
             for (col, cell) in line.iter().enumerate() {
                 let reverse = cell.flags.contains(CellFlags::REVERSE);
                 let (fg_default, bg_default) = if reverse {
@@ -292,6 +324,48 @@ impl Renderer {
                             });
                         }
                     }
+                }
+
+                // Tinted on top of the cell's own background/glyph (not
+                // baked into `bg` above) so it reads the same regardless
+                // of the cell's own colors, and at a fixed alpha
+                // independent of `self.opacity` -- a selection you can't
+                // see against a transparent window isn't useful.
+                if selected_cols.is_some_and(|(from, to)| col >= from && col <= to) {
+                    instances.push(Instance {
+                        pos: [cell_x, cell_y],
+                        size: [cw, ch],
+                        uv_min: self.atlas.white_uv,
+                        uv_max: self.atlas.white_uv,
+                        color: [0.35, 0.55, 0.9, 0.4],
+                        top_corner_radius: 0.0,
+                    });
+                }
+
+                // The current match gets a brighter tint than the rest so
+                // "where am I" is obvious at a glance while stepping
+                // through results.
+                if let Some(&(_, _, is_current)) = search_ranges.iter().find(|(from, to, _)| col >= *from && col <= *to) {
+                    let color = if is_current { [1.0, 0.65, 0.0, 0.55] } else { [0.85, 0.7, 0.15, 0.35] };
+                    instances.push(Instance {
+                        pos: [cell_x, cell_y],
+                        size: [cw, ch],
+                        uv_min: self.atlas.white_uv,
+                        uv_max: self.atlas.white_uv,
+                        color,
+                        top_corner_radius: 0.0,
+                    });
+                }
+
+                if url_ranges.iter().any(|(from, to)| col >= *from && col <= *to) {
+                    instances.push(Instance {
+                        pos: [cell_x, cell_y + ch - 2.0],
+                        size: [cw, 1.5],
+                        uv_min: self.atlas.white_uv,
+                        uv_max: self.atlas.white_uv,
+                        color: [0.45, 0.7, 1.0, 0.9],
+                        top_corner_radius: 0.0,
+                    });
                 }
             }
         }

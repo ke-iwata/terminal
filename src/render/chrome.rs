@@ -10,6 +10,7 @@
 
 use super::font::FontAtlas;
 use super::pipeline::Instance;
+use crate::tab::Search;
 
 // Fixed chrome colors, deliberately NOT derived from the terminal palette:
 // deriving them from the configured background made the active tab blend
@@ -29,6 +30,8 @@ const CHROME_ACCENT: (u8, u8, u8) = (0x4d, 0x9f, 0xff);
 const CHROME_STATUS_BG: (u8, u8, u8) = (0x1d, 0x1f, 0x24);
 const CHROME_STATUS_EDGE: (u8, u8, u8) = (0x3a, 0x3d, 0x44);
 const CHROME_STATUS_BRANCH: (u8, u8, u8) = (0x7e, 0xc9, 0x7a);
+const CHROME_SEARCH_BG: (u8, u8, u8) = (0x2a, 0x2c, 0x33);
+const CHROME_SEARCH_NO_MATCH: (u8, u8, u8) = (0xf3, 0x8b, 0xa8);
 
 /// Tabs shrink toward this floor as more are opened; below it they stop
 /// shrinking and the strip simply overflows the window (no scrolling in
@@ -238,6 +241,52 @@ pub fn build_status_bar_instances(atlas: &FontAtlas, status: &StatusInfo, window
         if shown_len < text.chars().count() {
             break; // out of room; nothing after this would fit anyway
         }
+    }
+
+    instances
+}
+
+/// A small floating pill anchored to the top-right of the grid (like a
+/// browser's find bar) rather than a full-width bar that would need to
+/// resize the grid every time search opens or closes.
+pub fn build_search_bar_instances(atlas: &FontAtlas, search: &Search, window_width: f32, tab_bar_bottom: f32) -> Vec<Instance> {
+    let mut instances = Vec::new();
+
+    const LABEL: &str = "Find: ";
+    let count_text = match search.current_position() {
+        Some(pos) => format!("{}/{}", pos, search.match_count()),
+        None if search.query.is_empty() => String::new(),
+        None => "0/0".to_string(),
+    };
+    // Reserve room for a reasonably long query so the bar doesn't visibly
+    // resize on every keystroke; it still grows past this if needed.
+    let query_cols = search.query.chars().count().max(16);
+    let content_cols = LABEL.len() + query_cols + 1 + 3 + count_text.chars().count();
+
+    let bar_w = content_cols as f32 * atlas.cell_width;
+    let bar_h = atlas.cell_height * 1.6;
+    let x0 = (window_width - bar_w - atlas.cell_width).max(0.0);
+    let y0 = tab_bar_bottom + atlas.cell_height * 0.3;
+    let radius = (bar_h * 0.3).clamp(4.0, 10.0);
+
+    push_rect(&mut instances, atlas, [x0, y0, bar_w, bar_h], CHROME_SEARCH_BG, radius);
+
+    let text_y = y0 + (bar_h - atlas.cell_height) / 2.0;
+    let mut x = x0 + atlas.cell_width;
+    push_text(&mut instances, atlas, LABEL, x, text_y, CHROME_FG_INACTIVE);
+    x += atlas.cell_width * LABEL.len() as f32;
+
+    push_text(&mut instances, atlas, &search.query, x, text_y, CHROME_FG_ACTIVE);
+    x += atlas.cell_width * search.query.chars().count() as f32;
+    // A plain caret, not a blinking one -- there's no per-frame ticking
+    // clock driving redraws (this app only redraws on real events), so an
+    // animated blink would freeze mid-phase as often as not.
+    push_text(&mut instances, atlas, "|", x, text_y, CHROME_FG_ACTIVE);
+
+    if !count_text.is_empty() {
+        let count_x = x0 + bar_w - atlas.cell_width * (count_text.chars().count() + 1) as f32;
+        let count_color = if search.match_count() == 0 { CHROME_SEARCH_NO_MATCH } else { CHROME_FG_INACTIVE };
+        push_text(&mut instances, atlas, &count_text, count_x, text_y, count_color);
     }
 
     instances

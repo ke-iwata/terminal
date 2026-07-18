@@ -455,8 +455,8 @@ fn draw_footer(ui: &mut egui::Ui, draft: &mut ConfigDraft, saved: &mut Option<Co
                 match config.save() {
                     Ok(()) => {
                         draft.status = Some(
-                            "Saved and applied immediately. Changing the shell restarts the \
-                             session (any running command in it is interrupted)."
+                            "Saved and applied immediately. A changed shell only affects tabs \
+                             opened from now on -- already-open tabs keep running as they were."
                                 .to_string(),
                         )
                     }
