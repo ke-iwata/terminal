@@ -25,7 +25,10 @@ pub const PREV_TAB_ID: &str = "prev_tab";
 #[must_use = "dropping the returned Menu detaches the native menu bar and leaves dangling pointers behind it"]
 pub fn install(proxy: EventLoopProxy<UserEvent>) -> Menu {
     let menu = Menu::new();
-    let app_menu = Submenu::new("Terminal", true);
+    // macOS ignores this label for the application menu (the one right of
+    // the Apple logo) and always shows the process/bundle name instead --
+    // kept in sync anyway so the source doesn't lie about what's shown.
+    let app_menu = Submenu::new("keterm", true);
 
     let preferences = MenuItem::with_id(
         PREFERENCES_ID,

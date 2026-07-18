@@ -90,6 +90,19 @@ pub fn spawn_shell(shell: &ShellConfig) -> PtyHandle {
             // Safety: single-threaded child right after fork, before
             // execvp -- same invariant the rest of this function relies on.
             unsafe { std::env::set_var("TERM", "xterm-256color") };
+            // Start in $HOME rather than whatever cwd this process
+            // inherited. Unlike a shell launching a child, there's no
+            // meaningful directory to inherit here -- a GUI app launched
+            // from Finder/Dock/Spotlight starts with cwd "/" (or
+            // occasionally the app bundle's own directory), neither of
+            // which is anywhere a user would want a fresh shell to land.
+            // Every other terminal emulator defaults new sessions to
+            // $HOME for the same reason. Best-effort: if $HOME isn't set
+            // or doesn't exist, the shell just keeps whatever cwd it
+            // already had.
+            if let Ok(home) = std::env::var("HOME") {
+                let _ = nix::unistd::chdir(home.as_str());
+            }
             let _ = execvp(&shell_c, &argv);
             // execvp only returns on failure.
             std::process::exit(1);

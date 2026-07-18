@@ -606,7 +606,7 @@ impl ApplicationHandler<UserEvent> for App {
         // pixels all happen to have alpha=1 (opacity's default) looks
         // identical to a normal opaque one. This lets opacity change live
         // from Preferences instead of requiring a restart.
-        let attrs = Window::default_attributes().with_title("terminal").with_transparent(true);
+        let attrs = Window::default_attributes().with_title("keterm").with_transparent(true);
         let window = Arc::new(
             event_loop
                 .create_window(attrs)

@@ -4,7 +4,7 @@ version = "0.0.1"
 edition = "2021"
 
 [dependencies]
-nix = { version = "0.31.3", features = ["term", "process", "ioctl", "signal"] }
+nix = { version = "0.31.3", features = ["term", "process", "ioctl", "signal", "fs"] }
 libc = "0.2"
 vte = "0.15.0"
 winit = "0.30.13"
