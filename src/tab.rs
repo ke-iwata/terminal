@@ -194,6 +194,18 @@ pub struct Pane {
     /// just clearing it, so a search stays live and useful while output
     /// keeps arriving rather than vanishing the instant something prints.
     pub search: Option<Search>,
+    /// The (cols, rows) most recently pushed to the pty via `TIOCSWINSZ`
+    /// (which signals the shell with `SIGWINCH`), as opposed to `term`'s
+    /// current size. Kept separate so a live divider drag can resize
+    /// `term` -- and thus the on-screen rendering -- every frame while
+    /// throttling how often the shell itself actually gets told: shells
+    /// with a line editor that redraws on `SIGWINCH` (zsh's zle, by
+    /// default on macOS) can spam repeated prompt redraws if signaled
+    /// faster than they can redisplay, which otherwise reads as garbled,
+    /// duplicated-looking output during a fast drag. See
+    /// `App::relayout_all_tabs`.
+    pub pty_size: (u16, u16),
+    pub last_pty_resize_sent: Option<std::time::Instant>,
 }
 
 impl Pane {
@@ -230,6 +242,8 @@ impl Pane {
             title: shell_name,
             selection: None,
             search: None,
+            pty_size: (cols as u16, rows as u16),
+            last_pty_resize_sent: None,
         }
     }
 
@@ -766,6 +780,8 @@ mod tests {
             title: "test".into(),
             selection: None,
             search: None,
+            pty_size: (10, 4),
+            last_pty_resize_sent: None,
         }
     }
 

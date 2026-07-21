@@ -36,6 +36,11 @@ use render::Renderer;
 /// cost to a few times a second regardless of typing speed.
 const STATUS_REFRESH_INTERVAL: Duration = Duration::from_millis(300);
 
+/// Minimum gap between real `TIOCSWINSZ`/`SIGWINCH` deliveries to the same
+/// pane while its size is changing continuously (a divider drag). See
+/// `App::relayout_all_tabs`.
+const PTY_RESIZE_THROTTLE: Duration = Duration::from_millis(50);
+
 enum UserEvent {
     /// Bytes read from a pane's pty, tagged with that pane's id and the
     /// generation of the shell session that produced them (see
@@ -198,7 +203,7 @@ impl App {
         if let Some(renderer) = &mut self.renderer {
             renderer.set_font(&self.config.font, scale_factor);
         }
-        self.relayout_all_tabs();
+        self.relayout_all_tabs(true);
     }
 
     /// The full grid area's cols/rows for the current window size --
@@ -215,18 +220,34 @@ impl App {
     }
 
     /// Recompute every pane's rectangle from the current window size and
-    /// split tree, and push each pane's new cols/rows to its pty (so the
-    /// shell's SIGWINCH-driven reflow, e.g. `stty size`, matches) and
-    /// Term/Grid model. Runs over every tab, not just the active one --
-    /// background tabs keep running and must have already reflowed
-    /// correctly by the time they're switched to.
-    fn relayout_all_tabs(&mut self) {
+    /// split tree, and push each pane's new cols/rows to its Term/Grid
+    /// model (so rendering is correct on every call) and, at most once
+    /// per `PTY_RESIZE_THROTTLE` unless `force` is set, to its pty (so the
+    /// shell's SIGWINCH-driven reflow, e.g. `stty size`, matches). Runs
+    /// over every tab, not just the active one -- background tabs keep
+    /// running and must have already reflowed correctly by the time
+    /// they're switched to.
+    ///
+    /// The throttle exists for divider dragging: `update_divider_drag`
+    /// calls this on every `CursorMoved`, and a real terminal size change
+    /// signals the pty's foreground process with `SIGWINCH` every time.
+    /// Shells with a line editor that redraws on `SIGWINCH` (zsh's zle,
+    /// the macOS default) redisplay the prompt each time they receive
+    /// one -- signaled faster than they can redisplay, that reads as
+    /// garbled, duplicated-looking prompt spam during a fast drag. Callers
+    /// that aren't a live drag (window resize, font change, tab/pane
+    /// creation) pass `force: true` so the pty is always in sync
+    /// immediately; the drag itself force-flushes once more when it ends
+    /// (see the `MouseInput` `Released` handler) so the shell never stays
+    /// out of sync with the final size.
+    fn relayout_all_tabs(&mut self, force: bool) {
         let (Some(window), Some(renderer)) = (&self.window, &self.renderer) else {
             return;
         };
         let (cell_w, cell_h) = renderer.cell_size();
         let size = window.inner_size();
         let grid = chrome::grid_rect(size.width as f32, size.height as f32, cell_h);
+        let now = Instant::now();
         for tab in &mut self.tabs {
             let (rects, _) = tab.layout(grid, chrome::PANE_GAP);
             for (pane_id, rect) in rects {
@@ -234,8 +255,16 @@ impl App {
                 let cols = ((rect.w / cell_w).floor() as usize).max(1);
                 let rows = ((rect.h / cell_h).floor() as usize).max(1);
                 if cols != pane.term.cols() || rows != pane.term.rows() {
-                    pty::resize(pane.pty_master.as_fd(), cols as u16, rows as u16);
                     pane.term.resize(cols, rows);
+                }
+                let target = (cols as u16, rows as u16);
+                if target != pane.pty_size {
+                    let due = force || pane.last_pty_resize_sent.is_none_or(|t| now.duration_since(t) >= PTY_RESIZE_THROTTLE);
+                    if due {
+                        pty::resize(pane.pty_master.as_fd(), target.0, target.1);
+                        pane.pty_size = target;
+                        pane.last_pty_resize_sent = Some(now);
+                    }
                 }
             }
         }
@@ -269,7 +298,7 @@ impl App {
         let pane = tab::Pane::spawn(pane_id, &self.config.shell, 80, 24, self.config.scrollback_lines);
         self.spawn_pty_reader(&pane);
         self.active_tab_mut().split_focused(direction, pane);
-        self.relayout_all_tabs();
+        self.relayout_all_tabs(true);
         self.last_status_refresh = None;
         if let Some(window) = &self.window {
             window.request_redraw();
@@ -290,7 +319,7 @@ impl App {
             let _ = kill(pane.pty_child, Signal::SIGHUP);
             let _ = nix::sys::wait::waitpid(pane.pty_child, None);
         }
-        self.relayout_all_tabs();
+        self.relayout_all_tabs(true);
         self.last_status_refresh = None;
         if let Some(window) = &self.window {
             window.request_redraw();
@@ -420,7 +449,7 @@ impl App {
         }
         let ratio = ((pos - start) / extent).clamp(min_px / extent, 1.0 - min_px / extent);
         self.active_tab_mut().set_split_ratio(&divider.path, ratio);
-        self.relayout_all_tabs();
+        self.relayout_all_tabs(false);
         if let Some(window) = &self.window {
             window.request_redraw();
         }
@@ -785,7 +814,7 @@ impl ApplicationHandler<UserEvent> for App {
         // The first pane was constructed in `main()` at a placeholder
         // size (before the window/renderer existed to know the real one)
         // -- fit it to the actual window now.
-        self.relayout_all_tabs();
+        self.relayout_all_tabs(true);
 
         self.window.as_ref().unwrap().request_redraw();
 
@@ -847,7 +876,7 @@ impl ApplicationHandler<UserEvent> for App {
                     // A shell in one pane of a split exited: collapse just
                     // that pane, exactly like Cmd+W on it.
                     let _ = tab.remove_pane(pane_id);
-                    self.relayout_all_tabs();
+                    self.relayout_all_tabs(true);
                     self.last_status_refresh = None;
                     if let Some(window) = &self.window {
                         window.request_redraw();
@@ -913,7 +942,7 @@ impl ApplicationHandler<UserEvent> for App {
                 if let Some(renderer) = &mut self.renderer {
                     renderer.resize(new_size);
                 }
-                self.relayout_all_tabs();
+                self.relayout_all_tabs(true);
                 if let Some(window) = &self.window {
                     window.request_redraw();
                 }
@@ -1050,7 +1079,11 @@ impl ApplicationHandler<UserEvent> for App {
                 }
             }
             WindowEvent::MouseInput { state: ElementState::Released, button: MouseButton::Left, .. } => {
-                self.dragging_divider = None;
+                if self.dragging_divider.take().is_some() {
+                    // Force-flush: the drag may have throttled the pty out
+                    // of sync with the final size.
+                    self.relayout_all_tabs(true);
+                }
                 self.end_selection();
             }
             // A frame skipped while occluded (see `RenderOutcome::Skipped`)
