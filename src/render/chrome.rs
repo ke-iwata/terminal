@@ -10,7 +10,7 @@
 
 use super::font::FontAtlas;
 use super::pipeline::Instance;
-use crate::tab::Search;
+use crate::tab::{PaneRect, Search};
 
 // Fixed chrome colors, deliberately NOT derived from the terminal palette:
 // deriving them from the configured background made the active tab blend
@@ -44,6 +44,9 @@ const LEFT_PAD_COLS: usize = 1;
 /// Width reserved at a tab's right edge for its close button (" x").
 const CLOSE_COLS: usize = 2;
 
+/// Width of the gap between split panes, in physical pixels.
+pub const PANE_GAP: f32 = 2.0;
+
 pub fn tab_bar_height(cell_h: f32) -> f32 {
     cell_h * 1.4
 }
@@ -52,10 +55,47 @@ pub fn status_bar_height(cell_h: f32) -> f32 {
     cell_h * 1.2
 }
 
+/// The pixel rectangle between the tab bar and the status bar -- the area
+/// panes are laid out in. The single source of truth for that math:
+/// rendering, click hit-testing, and pty resizing all start from this.
+pub fn grid_rect(window_width: f32, window_height: f32, cell_h: f32) -> PaneRect {
+    let top = tab_bar_height(cell_h);
+    let bottom = status_bar_height(cell_h);
+    PaneRect {
+        x: 0.0,
+        y: top,
+        w: window_width.max(1.0),
+        h: (window_height - top - bottom).max(cell_h),
+    }
+}
+
 /// How many terminal rows fit between the two bars at this window height.
 pub fn terminal_rows(window_height: f32, cell_h: f32) -> usize {
     let usable = (window_height - tab_bar_height(cell_h) - status_bar_height(cell_h)).max(cell_h);
     ((usable / cell_h).floor() as usize).max(1)
+}
+
+/// Thin separator strips between split panes. Opaque like the rest of the
+/// chrome -- see the note on the chrome color constants.
+pub fn build_divider_instances(atlas: &FontAtlas, dividers: &[PaneRect]) -> Vec<Instance> {
+    let mut instances = Vec::with_capacity(dividers.len());
+    for d in dividers {
+        push_rect(&mut instances, atlas, [d.x, d.y, d.w, d.h], CHROME_STATUS_EDGE, 0.0);
+    }
+    instances
+}
+
+/// A thin accent outline around the focused pane, drawn only when a tab
+/// actually has multiple panes -- with a single pane there's nothing to
+/// disambiguate and the outline would just be noise.
+pub fn build_focus_border_instances(atlas: &FontAtlas, rect: PaneRect) -> Vec<Instance> {
+    const T: f32 = 2.0;
+    let mut instances = Vec::with_capacity(4);
+    push_rect(&mut instances, atlas, [rect.x, rect.y, rect.w, T], CHROME_ACCENT, 0.0);
+    push_rect(&mut instances, atlas, [rect.x, rect.y + rect.h - T, rect.w, T], CHROME_ACCENT, 0.0);
+    push_rect(&mut instances, atlas, [rect.x, rect.y, T, rect.h], CHROME_ACCENT, 0.0);
+    push_rect(&mut instances, atlas, [rect.x + rect.w - T, rect.y, T, rect.h], CHROME_ACCENT, 0.0);
+    instances
 }
 
 pub struct TabRect {

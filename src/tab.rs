@@ -159,31 +159,32 @@ impl Search {
     }
 }
 
-/// One terminal session: its own pty, shell process, and screen/scrollback
-/// state. The window holds a `Vec<Tab>` and renders/feeds input to whichever
-/// one is active; the others keep running (and buffering output into their
-/// own `Term`) in the background exactly like a real terminal's tabs do.
-pub struct Tab {
-    /// Stable identity, independent of position in the tab strip -- closing
-    /// an earlier tab must not confuse in-flight pty reader events tagged
-    /// with a later tab's id. Never reused within one run of the app.
+/// One shell session: its own pty, shell process, and screen/scrollback
+/// state, plus the per-session interaction state (selection, search,
+/// scroll position). A `Tab` holds one or more of these arranged in a
+/// split tree; unfocused panes keep running and buffering output exactly
+/// like background tabs do.
+pub struct Pane {
+    /// Stable identity, unique across the whole app (not just one tab) --
+    /// pty reader events are tagged with it, and a closed pane's id must
+    /// never be confused with a live one's. Never reused within one run.
     pub id: u64,
     pub term: Term,
     pub pty_master: Arc<OwnedFd>,
     pub pty_child: Pid,
-    /// Bumped when this tab's shell is restarted, so stale reader-thread
+    /// Bumped when this pane's shell is restarted, so stale reader-thread
     /// events from a just-replaced shell session are told apart from the
     /// current one.
     pub pty_generation: u64,
     pub scroll_offset: usize,
     pub shell_name: String,
     pub tty_name: String,
-    /// What the tab strip shows for this tab: the foreground process's name
-    /// while one is running (e.g. "vim"), the shell's own name otherwise.
-    /// Refreshed opportunistically on redraw, not on every keystroke.
+    /// What the tab strip shows while this pane is focused: the
+    /// foreground process's name while one is running (e.g. "vim"), the
+    /// shell's own name otherwise. Refreshed opportunistically on redraw.
     pub title: String,
     /// The current click-drag text selection, if any. Cleared whenever
-    /// this tab's content changes underneath it (new pty output) since
+    /// this pane's content changes underneath it (new pty output) since
     /// there's no cheap way to know whether the selected text moved,
     /// shrank, or still exists at all.
     pub selection: Option<Selection>,
@@ -195,21 +196,20 @@ pub struct Tab {
     pub search: Option<Search>,
 }
 
-impl Tab {
-    /// Spawn a fresh shell and wrap it in a new tab. Does *not* start the
+impl Pane {
+    /// Spawn a fresh shell and wrap it in a new pane. Does *not* start the
     /// pty reader thread -- the caller does that once it can route the
     /// resulting bytes (see `App::spawn_pty_reader`).
-    pub fn spawn(id: u64, shell: &ShellConfig, cols: usize, rows: usize, scrollback_lines: usize) -> Tab {
+    pub fn spawn(id: u64, shell: &ShellConfig, cols: usize, rows: usize, scrollback_lines: usize) -> Pane {
         let handle = pty::spawn_shell(shell);
-        Tab::from_handle(id, handle, shell, cols, rows, scrollback_lines)
+        Pane::from_handle(id, handle, shell, cols, rows, scrollback_lines)
     }
 
-    /// Wrap an already-spawned `PtyHandle` in a new tab, without forking a
-    /// shell itself. Needed for the very first tab: `pty::spawn_shell` must
-    /// run before the winit event loop exists (see its doc comment), so
-    /// `main()` calls it directly and hands the result here rather than
-    /// going through `Tab::spawn`.
-    pub fn from_handle(id: u64, handle: PtyHandle, shell: &ShellConfig, cols: usize, rows: usize, scrollback_lines: usize) -> Tab {
+    /// Wrap an already-spawned `PtyHandle` in a new pane, without forking a
+    /// shell itself. Needed for the very first pane: `pty::spawn_shell`
+    /// must run before the winit event loop exists (see its doc comment),
+    /// so `main()` calls it directly and hands the result here.
+    pub fn from_handle(id: u64, handle: PtyHandle, shell: &ShellConfig, cols: usize, rows: usize, scrollback_lines: usize) -> Pane {
         let PtyHandle { master, child } = handle;
         let master = Arc::new(master);
         pty::resize(std::os::fd::AsFd::as_fd(&*master), cols as u16, rows as u16);
@@ -218,7 +218,7 @@ impl Tab {
         let shell_name = shell_path.rsplit('/').next().unwrap_or(&shell_path).to_string();
         let tty_name = pty::tty_name(std::os::fd::AsFd::as_fd(&*master)).unwrap_or_default();
 
-        Tab {
+        Pane {
             id,
             term: Term::new(cols, rows, scrollback_lines),
             pty_master: master,
@@ -240,6 +240,282 @@ impl Tab {
     }
 }
 
+/// Which way a split's divider runs. Named after the divider (matching
+/// iTerm2's menu wording), not the stacking direction -- "vertical" means
+/// a vertical divider, i.e. panes side by side.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SplitDirection {
+    /// Vertical divider: panes sit side by side (Cmd+D).
+    Vertical,
+    /// Horizontal divider: panes stack top and bottom (Cmd+Shift+D).
+    Horizontal,
+}
+
+/// A pixel-space rectangle inside the window's grid area.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PaneRect {
+    pub x: f32,
+    pub y: f32,
+    pub w: f32,
+    pub h: f32,
+}
+
+impl PaneRect {
+    pub fn contains(&self, px: f32, py: f32) -> bool {
+        px >= self.x && px < self.x + self.w && py >= self.y && py < self.y + self.h
+    }
+}
+
+/// The split tree: leaves are live panes, interior nodes are 50/50-ish
+/// splits. A plain binary tree (rather than a flat list of rects) so
+/// closing any pane always has an unambiguous answer for what reclaims
+/// its space -- the sibling subtree it was split from.
+pub enum PaneNode {
+    /// Boxed so a leaf (a full `Pane`, ~1KB) doesn't inflate every
+    /// interior `Split` node to the same size.
+    Leaf(Box<Pane>),
+    Split {
+        direction: SplitDirection,
+        /// Fraction of the axis given to `first` (0..1). Always 0.5 today
+        /// -- kept in the tree so divider-dragging can exist later without
+        /// reshaping anything.
+        ratio: f32,
+        first: Box<PaneNode>,
+        second: Box<PaneNode>,
+    },
+}
+
+impl PaneNode {
+    pub fn pane(&self, id: u64) -> Option<&Pane> {
+        match self {
+            PaneNode::Leaf(p) => (p.id == id).then_some(&**p),
+            PaneNode::Split { first, second, .. } => first.pane(id).or_else(|| second.pane(id)),
+        }
+    }
+
+    pub fn pane_mut(&mut self, id: u64) -> Option<&mut Pane> {
+        match self {
+            PaneNode::Leaf(p) => (p.id == id).then_some(&mut **p),
+            PaneNode::Split { first, second, .. } => {
+                if first.pane(id).is_some() {
+                    first.pane_mut(id)
+                } else {
+                    second.pane_mut(id)
+                }
+            }
+        }
+    }
+
+    /// All panes in tree order (which is also visual reading order:
+    /// first/top/left before second/bottom/right).
+    pub fn panes(&self) -> Vec<&Pane> {
+        match self {
+            PaneNode::Leaf(p) => vec![&**p],
+            PaneNode::Split { first, second, .. } => {
+                let mut all = first.panes();
+                all.extend(second.panes());
+                all
+            }
+        }
+    }
+
+    pub fn panes_mut(&mut self) -> Vec<&mut Pane> {
+        match self {
+            PaneNode::Leaf(p) => vec![&mut **p],
+            PaneNode::Split { first, second, .. } => {
+                let mut all = first.panes_mut();
+                all.extend(second.panes_mut());
+                all
+            }
+        }
+    }
+
+    // Splitting is implemented on owned nodes (see `split_owned`) rather
+    // than `&mut self`: replacing a leaf with a split that *contains* that
+    // leaf can't be expressed through a mutable borrow without a
+    // placeholder node, and `Pane` has no cheap placeholder to offer.
+
+    /// Compute every pane's pixel rectangle (and each divider gap's) for
+    /// this subtree laid out inside `rect`. Pure function of the tree, so
+    /// rendering and click hit-testing can both call it and always agree.
+    pub fn layout(&self, rect: PaneRect, gap: f32, panes: &mut Vec<(u64, PaneRect)>, dividers: &mut Vec<PaneRect>) {
+        match self {
+            PaneNode::Leaf(p) => panes.push((p.id, rect)),
+            PaneNode::Split { direction, ratio, first, second } => match direction {
+                SplitDirection::Vertical => {
+                    let w1 = ((rect.w - gap) * ratio).floor();
+                    let first_rect = PaneRect { x: rect.x, y: rect.y, w: w1, h: rect.h };
+                    let divider = PaneRect { x: rect.x + w1, y: rect.y, w: gap, h: rect.h };
+                    let second_rect = PaneRect { x: rect.x + w1 + gap, y: rect.y, w: rect.w - w1 - gap, h: rect.h };
+                    dividers.push(divider);
+                    first.layout(first_rect, gap, panes, dividers);
+                    second.layout(second_rect, gap, panes, dividers);
+                }
+                SplitDirection::Horizontal => {
+                    let h1 = ((rect.h - gap) * ratio).floor();
+                    let first_rect = PaneRect { x: rect.x, y: rect.y, w: rect.w, h: h1 };
+                    let divider = PaneRect { x: rect.x, y: rect.y + h1, w: rect.w, h: gap };
+                    let second_rect = PaneRect { x: rect.x, y: rect.y + h1 + gap, w: rect.w, h: rect.h - h1 - gap };
+                    dividers.push(divider);
+                    first.layout(first_rect, gap, panes, dividers);
+                    second.layout(second_rect, gap, panes, dividers);
+                }
+            },
+        }
+    }
+}
+
+/// Replaces the leaf holding `target` with a split of it and `new_pane`
+/// (the existing pane keeps the first/top/left slot). Returns the new
+/// pane back unchanged if `target` isn't in this subtree.
+fn split_owned(node: PaneNode, target: u64, direction: SplitDirection, new_pane: Pane) -> (PaneNode, Result<(), Pane>) {
+    match node {
+        PaneNode::Leaf(p) if p.id == target => (
+            PaneNode::Split {
+                direction,
+                ratio: 0.5,
+                first: Box::new(PaneNode::Leaf(p)),
+                second: Box::new(PaneNode::Leaf(Box::new(new_pane))),
+            },
+            Ok(()),
+        ),
+        leaf @ PaneNode::Leaf(_) => (leaf, Err(new_pane)),
+        PaneNode::Split { direction: dir, ratio, first, second } => {
+            let (first, outcome) = split_owned(*first, target, direction, new_pane);
+            let first = Box::new(first);
+            match outcome {
+                Ok(()) => (PaneNode::Split { direction: dir, ratio, first, second }, Ok(())),
+                Err(pane) => {
+                    let (second, outcome) = split_owned(*second, target, direction, pane);
+                    (PaneNode::Split { direction: dir, ratio, first, second: Box::new(second) }, outcome)
+                }
+            }
+        }
+    }
+}
+
+/// Removes the pane `id` from an owned subtree, collapsing its parent
+/// split into the sibling. Returns the remaining tree (`None` if the
+/// removed pane WAS the whole tree) and the removed pane.
+fn remove_owned(node: PaneNode, id: u64) -> (Option<PaneNode>, Option<Pane>) {
+    match node {
+        PaneNode::Leaf(p) if p.id == id => (None, Some(*p)),
+        leaf @ PaneNode::Leaf(_) => (Some(leaf), None),
+        PaneNode::Split { direction, ratio, first, second } => {
+            let (first_rest, removed) = remove_owned(*first, id);
+            if removed.is_some() {
+                return match first_rest {
+                    None => (Some(*second), removed),
+                    Some(f) => (Some(PaneNode::Split { direction, ratio, first: Box::new(f), second }), removed),
+                };
+            }
+            let first = Box::new(first_rest.expect("nothing was removed from `first`, so it survives intact"));
+            let (second_rest, removed) = remove_owned(*second, id);
+            match second_rest {
+                None => (Some(*first), removed),
+                Some(s) => (Some(PaneNode::Split { direction, ratio, first, second: Box::new(s) }), removed),
+            }
+        }
+    }
+}
+
+/// One tab in the tab strip: a tree of one or more panes plus which of
+/// them owns keyboard focus.
+pub struct Tab {
+    /// Stable identity, independent of position in the tab strip. Never
+    /// reused within one run of the app.
+    pub id: u64,
+    /// Always `Some` from the outside; `Option` only so `remove_pane` can
+    /// temporarily take ownership of the tree to restructure it.
+    root: Option<PaneNode>,
+    /// Which pane keyboard input goes to. Always a live pane's id.
+    pub focused: u64,
+}
+
+impl Tab {
+    pub fn new(id: u64, pane: Pane) -> Tab {
+        let focused = pane.id;
+        Tab { id, root: Some(PaneNode::Leaf(Box::new(pane))), focused }
+    }
+
+    pub fn root(&self) -> &PaneNode {
+        self.root.as_ref().expect("a tab always has a root pane")
+    }
+
+    pub fn root_mut(&mut self) -> &mut PaneNode {
+        self.root.as_mut().expect("a tab always has a root pane")
+    }
+
+    pub fn pane_count(&self) -> usize {
+        self.root().panes().len()
+    }
+
+    pub fn focused_pane(&self) -> &Pane {
+        self.root().pane(self.focused).expect("focused always points at a live pane")
+    }
+
+    pub fn focused_pane_mut(&mut self) -> &mut Pane {
+        let focused = self.focused;
+        self.root_mut().pane_mut(focused).expect("focused always points at a live pane")
+    }
+
+    /// Split the focused pane, giving the new pane the second (right or
+    /// bottom) half, and focus it -- matching what iTerm2/tmux do, since
+    /// the reason you split is almost always to use the new shell now.
+    pub fn split_focused(&mut self, direction: SplitDirection, new_pane: Pane) {
+        let new_id = new_pane.id;
+        let root = self.root.take().expect("a tab always has a root pane");
+        let (root, outcome) = split_owned(root, self.focused, direction, new_pane);
+        self.root = Some(root);
+        if outcome.is_ok() {
+            self.focused = new_id;
+        }
+    }
+
+    /// Remove pane `id`, collapsing its split into the sibling. Refuses
+    /// (returns `None`) when it's the tab's only pane -- closing the last
+    /// pane means closing the tab, which is the caller's decision to make.
+    pub fn remove_pane(&mut self, id: u64) -> Option<Pane> {
+        if self.pane_count() <= 1 {
+            return None;
+        }
+        let root = self.root.take().expect("a tab always has a root pane");
+        let (rest, removed) = remove_owned(root, id);
+        self.root = Some(rest.expect("pane_count > 1 means a sibling survives the removal"));
+        if removed.is_some() && self.focused == id {
+            self.focused = self.root().panes()[0].id;
+        }
+        removed
+    }
+
+    /// Move focus to the next/previous pane in tree (reading) order.
+    pub fn cycle_focus(&mut self, forward: bool) {
+        let ids: Vec<u64> = self.root().panes().iter().map(|p| p.id).collect();
+        let Some(pos) = ids.iter().position(|&id| id == self.focused) else {
+            return;
+        };
+        let next = if forward {
+            (pos + 1) % ids.len()
+        } else {
+            (pos + ids.len() - 1) % ids.len()
+        };
+        self.focused = ids[next];
+    }
+
+    /// Every pane's rect (and each divider's) laid out inside `rect`.
+    pub fn layout(&self, rect: PaneRect, gap: f32) -> (Vec<(u64, PaneRect)>, Vec<PaneRect>) {
+        let mut panes = Vec::new();
+        let mut dividers = Vec::new();
+        self.root().layout(rect, gap, &mut panes, &mut dividers);
+        (panes, dividers)
+    }
+
+    /// What the tab strip shows for this tab: the focused pane's title.
+    pub fn title(&self) -> &str {
+        &self.focused_pane().title
+    }
+}
+
 /// Reads `selection`'s text out of `grid`, joined with `\n` between lines
 /// and with each line's trailing padding blanks trimmed. Doesn't attempt
 /// to know whether a line was a hard newline or just a terminal-forced
@@ -247,7 +523,7 @@ impl Tab {
 /// selection spanning a wrapped line copies out with an extra newline it
 /// didn't originally have -- a reasonable simplification given how rarely
 /// a copy both spans a wrap point and cares about it. A free function
-/// (rather than a `Tab` method) so it's testable against a bare `Term`
+/// (rather than a `Pane` method) so it's testable against a bare `Term`
 /// without spawning a real shell.
 fn extract_selected_text(grid: &Grid, selection: Selection) -> Option<String> {
     let (start, end) = selection.ordered();
@@ -411,5 +687,124 @@ mod tests {
         search.recompute(term.grid());
         assert_eq!(search.match_count(), 1);
         assert_eq!(search.current_target(), Some((2, 11)));
+    }
+
+    // ---- pane-tree tests -------------------------------------------------
+
+    /// A pane with a real (harmless) fd and a fake pid, for exercising
+    /// tree operations without forking shells.
+    fn dummy_pane(id: u64) -> Pane {
+        let file = std::fs::File::open("/dev/null").expect("/dev/null always opens");
+        Pane {
+            id,
+            term: Term::new(10, 4, 100),
+            pty_master: Arc::new(OwnedFd::from(file)),
+            pty_child: Pid::from_raw(0),
+            pty_generation: 0,
+            scroll_offset: 0,
+            shell_name: "test".into(),
+            tty_name: String::new(),
+            title: "test".into(),
+            selection: None,
+            search: None,
+        }
+    }
+
+    fn rect(w: f32, h: f32) -> PaneRect {
+        PaneRect { x: 0.0, y: 0.0, w, h }
+    }
+
+    #[test]
+    fn split_focused_focuses_the_new_pane() {
+        let mut tab = Tab::new(1, dummy_pane(10));
+        tab.split_focused(SplitDirection::Vertical, dummy_pane(11));
+        assert_eq!(tab.pane_count(), 2);
+        assert_eq!(tab.focused, 11);
+    }
+
+    #[test]
+    fn layout_splits_the_rect_between_panes() {
+        let mut tab = Tab::new(1, dummy_pane(10));
+        tab.split_focused(SplitDirection::Vertical, dummy_pane(11));
+        let (panes, dividers) = tab.layout(rect(100.0, 50.0), 2.0);
+        assert_eq!(panes.len(), 2);
+        assert_eq!(dividers.len(), 1);
+        let (first_id, first) = panes[0];
+        let (second_id, second) = panes[1];
+        assert_eq!(first_id, 10, "the original pane keeps the left slot");
+        assert_eq!(second_id, 11);
+        assert_eq!(first.x, 0.0);
+        assert!(second.x > first.x + first.w, "second pane starts past the divider");
+        assert!((first.w + second.w + 2.0 - 100.0).abs() < 1.0, "panes + gap fill the rect");
+        assert_eq!(first.h, 50.0);
+        assert_eq!(second.h, 50.0);
+    }
+
+    #[test]
+    fn horizontal_split_stacks_panes() {
+        let mut tab = Tab::new(1, dummy_pane(10));
+        tab.split_focused(SplitDirection::Horizontal, dummy_pane(11));
+        let (panes, _) = tab.layout(rect(100.0, 50.0), 2.0);
+        let (_, first) = panes[0];
+        let (_, second) = panes[1];
+        assert_eq!(first.y, 0.0);
+        assert!(second.y > first.y + first.h);
+        assert_eq!(first.w, 100.0);
+    }
+
+    #[test]
+    fn remove_pane_collapses_the_split_into_the_sibling() {
+        let mut tab = Tab::new(1, dummy_pane(10));
+        tab.split_focused(SplitDirection::Vertical, dummy_pane(11));
+        let removed = tab.remove_pane(11).expect("pane 11 exists and is not the last");
+        assert_eq!(removed.id, 11);
+        assert_eq!(tab.pane_count(), 1);
+        // Focus was on the removed pane; it must land on a live one.
+        assert_eq!(tab.focused, 10);
+        // The sibling reclaims the whole rect.
+        let (panes, dividers) = tab.layout(rect(100.0, 50.0), 2.0);
+        assert_eq!(panes.len(), 1);
+        assert!(dividers.is_empty());
+        assert_eq!(panes[0].1, rect(100.0, 50.0));
+    }
+
+    #[test]
+    fn remove_refuses_the_last_pane() {
+        let mut tab = Tab::new(1, dummy_pane(10));
+        assert!(tab.remove_pane(10).is_none());
+        assert_eq!(tab.pane_count(), 1);
+    }
+
+    #[test]
+    fn nested_splits_layout_and_remove() {
+        let mut tab = Tab::new(1, dummy_pane(10));
+        tab.split_focused(SplitDirection::Vertical, dummy_pane(11)); // 10 | 11
+        tab.split_focused(SplitDirection::Horizontal, dummy_pane(12)); // 10 | (11 / 12)
+        assert_eq!(tab.pane_count(), 3);
+        let (panes, dividers) = tab.layout(rect(200.0, 100.0), 2.0);
+        assert_eq!(panes.len(), 3);
+        assert_eq!(dividers.len(), 2);
+
+        // Removing the middle pane leaves 10 | 12.
+        let removed = tab.remove_pane(11).expect("not the last pane");
+        assert_eq!(removed.id, 11);
+        let ids: Vec<u64> = tab.root().panes().iter().map(|p| p.id).collect();
+        assert_eq!(ids, vec![10, 12]);
+    }
+
+    #[test]
+    fn cycle_focus_walks_panes_in_order_and_wraps() {
+        let mut tab = Tab::new(1, dummy_pane(10));
+        tab.split_focused(SplitDirection::Vertical, dummy_pane(11));
+        tab.split_focused(SplitDirection::Horizontal, dummy_pane(12));
+        assert_eq!(tab.focused, 12);
+        tab.cycle_focus(true);
+        assert_eq!(tab.focused, 10, "forward from the last pane wraps to the first");
+        tab.cycle_focus(true);
+        assert_eq!(tab.focused, 11);
+        tab.cycle_focus(false);
+        assert_eq!(tab.focused, 10);
+        tab.cycle_focus(false);
+        assert_eq!(tab.focused, 12, "backward from the first pane wraps to the last");
     }
 }

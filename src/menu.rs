@@ -6,9 +6,13 @@ use winit::event_loop::EventLoopProxy;
 pub const PREFERENCES_ID: &str = "preferences";
 pub const RELOAD_CONFIG_ID: &str = "reload_config";
 pub const NEW_TAB_ID: &str = "new_tab";
-pub const CLOSE_TAB_ID: &str = "close_tab";
+pub const CLOSE_PANE_ID: &str = "close_pane";
 pub const NEXT_TAB_ID: &str = "next_tab";
 pub const PREV_TAB_ID: &str = "prev_tab";
+pub const SPLIT_RIGHT_ID: &str = "split_right";
+pub const SPLIT_DOWN_ID: &str = "split_down";
+pub const NEXT_PANE_ID: &str = "next_pane";
+pub const PREV_PANE_ID: &str = "prev_pane";
 
 /// Build and attach the macOS menu bar: an app menu with About, Preferences
 /// (Cmd+,), and Quit. Must be called once at startup, and pairs with
@@ -61,9 +65,12 @@ pub fn install(proxy: EventLoopProxy<UserEvent>) -> Menu {
         true,
         Some(Accelerator::new(Some(Modifiers::SUPER), Code::KeyT)),
     );
-    let close_tab = MenuItem::with_id(
-        CLOSE_TAB_ID,
-        "Close Tab",
+    // "Close", not "Close Tab": Cmd+W closes the focused pane first and
+    // only closes the tab when it's the last pane -- same wording and
+    // behavior as iTerm2.
+    let close_pane = MenuItem::with_id(
+        CLOSE_PANE_ID,
+        "Close",
         true,
         Some(Accelerator::new(Some(Modifiers::SUPER), Code::KeyW)),
     );
@@ -79,8 +86,43 @@ pub fn install(proxy: EventLoopProxy<UserEvent>) -> Menu {
         true,
         Some(Accelerator::new(Some(Modifiers::SUPER | Modifiers::SHIFT), Code::BracketLeft)),
     );
+    let split_right = MenuItem::with_id(
+        SPLIT_RIGHT_ID,
+        "Split Pane Right",
+        true,
+        Some(Accelerator::new(Some(Modifiers::SUPER), Code::KeyD)),
+    );
+    let split_down = MenuItem::with_id(
+        SPLIT_DOWN_ID,
+        "Split Pane Down",
+        true,
+        Some(Accelerator::new(Some(Modifiers::SUPER | Modifiers::SHIFT), Code::KeyD)),
+    );
+    let next_pane = MenuItem::with_id(
+        NEXT_PANE_ID,
+        "Next Pane",
+        true,
+        Some(Accelerator::new(Some(Modifiers::SUPER), Code::BracketRight)),
+    );
+    let prev_pane = MenuItem::with_id(
+        PREV_PANE_ID,
+        "Previous Pane",
+        true,
+        Some(Accelerator::new(Some(Modifiers::SUPER), Code::BracketLeft)),
+    );
     shell_menu
-        .append_items(&[&new_tab, &close_tab, &PredefinedMenuItem::separator(), &next_tab, &prev_tab])
+        .append_items(&[
+            &new_tab,
+            &close_pane,
+            &PredefinedMenuItem::separator(),
+            &split_right,
+            &split_down,
+            &next_pane,
+            &prev_pane,
+            &PredefinedMenuItem::separator(),
+            &next_tab,
+            &prev_tab,
+        ])
         .expect("failed to build shell menu");
 
     menu.append(&app_menu).expect("failed to attach app menu");
@@ -94,12 +136,20 @@ pub fn install(proxy: EventLoopProxy<UserEvent>) -> Menu {
             UserEvent::ReloadConfig
         } else if event.id() == NEW_TAB_ID {
             UserEvent::NewTab
-        } else if event.id() == CLOSE_TAB_ID {
-            UserEvent::CloseTab
+        } else if event.id() == CLOSE_PANE_ID {
+            UserEvent::ClosePane
         } else if event.id() == NEXT_TAB_ID {
             UserEvent::NextTab
         } else if event.id() == PREV_TAB_ID {
             UserEvent::PrevTab
+        } else if event.id() == SPLIT_RIGHT_ID {
+            UserEvent::SplitRight
+        } else if event.id() == SPLIT_DOWN_ID {
+            UserEvent::SplitDown
+        } else if event.id() == NEXT_PANE_ID {
+            UserEvent::NextPane
+        } else if event.id() == PREV_PANE_ID {
+            UserEvent::PrevPane
         } else {
             return;
         };

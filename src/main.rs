@@ -37,19 +37,24 @@ use render::Renderer;
 const STATUS_REFRESH_INTERVAL: Duration = Duration::from_millis(300);
 
 enum UserEvent {
-    /// Bytes read from a tab's pty, tagged with that tab's id and the
+    /// Bytes read from a pane's pty, tagged with that pane's id and the
     /// generation of the shell session that produced them (see
-    /// `Tab::pty_generation`).
+    /// `Pane::pty_generation`).
     PtyData(u64, u64, Vec<u8>),
-    /// A pty reader thread hit EOF/error, tagged with its tab id and
+    /// A pty reader thread hit EOF/error, tagged with its pane id and
     /// generation.
     PtyExited(u64, u64),
     OpenSettings,
     ReloadConfig,
     NewTab,
-    CloseTab,
+    /// Close the focused pane -- or the whole tab when it's the only pane.
+    ClosePane,
     NextTab,
     PrevTab,
+    SplitRight,
+    SplitDown,
+    NextPane,
+    PrevPane,
 }
 
 struct App {
@@ -59,6 +64,11 @@ struct App {
     tabs: Vec<Tab>,
     active: usize,
     next_tab_id: u64,
+    /// Pane ids are drawn from their own counter (not the tab counter) and
+    /// are unique across every tab -- pty reader events are tagged with
+    /// them, and events from a pane closed in one tab must never be
+    /// mistaken for a pane in another.
+    next_pane_id: u64,
     proxy: EventLoopProxy<UserEvent>,
     modifiers: ModifiersState,
     settings_window: Option<SettingsWindow>,
@@ -99,11 +109,11 @@ struct App {
     ///   - `WindowEvent::Occluded(false)` requests a redraw, since a
     ///     frame skipped while occluded is otherwise never re-drawn.
     presented_once: bool,
-    /// Set while the left mouse button is held down after a press that
-    /// started a text selection in the grid (as opposed to a tab-bar
-    /// click). `CursorMoved` only extends the active tab's selection
-    /// while this is true.
-    dragging_selection: bool,
+    /// The pane a left-button drag is currently selecting text in, from
+    /// press to release. Kept explicitly (rather than re-hit-testing on
+    /// every cursor move) so a drag that wanders across a divider keeps
+    /// extending the selection it started in, clamped to its own pane.
+    dragging_pane: Option<u64>,
 }
 
 impl App {
@@ -113,6 +123,7 @@ impl App {
             window: None,
             renderer: None,
             next_tab_id: first_tab.id + 1,
+            next_pane_id: first_tab.focused + 1,
             tabs: vec![first_tab],
             active: 0,
             proxy,
@@ -123,7 +134,7 @@ impl App {
             last_status_refresh: None,
             cursor_pos: (0.0, 0.0),
             presented_once: false,
-            dragging_selection: false,
+            dragging_pane: None,
         }
     }
 
@@ -151,7 +162,9 @@ impl App {
             renderer.set_opacity(config.opacity);
         }
         for tab in &mut self.tabs {
-            tab.term.set_scrollback_limit(config.scrollback_lines);
+            for pane in tab.root_mut().panes_mut() {
+                pane.term.set_scrollback_limit(config.scrollback_lines);
+            }
         }
 
         let font_changed = config.font != self.config.font;
@@ -172,7 +185,7 @@ impl App {
     }
 
     /// Rebuild the glyph atlas for `self.config.font` and re-fit every
-    /// tab's grid to the window at the new cell size.
+    /// tab's panes to the window at the new cell size.
     fn apply_font_change(&mut self) {
         let Some(scale_factor) = self.window.as_ref().map(|w| w.scale_factor()) else {
             return;
@@ -180,12 +193,12 @@ impl App {
         if let Some(renderer) = &mut self.renderer {
             renderer.set_font(&self.config.font, scale_factor);
         }
-        self.sync_size_to_window();
+        self.relayout_all_tabs();
     }
 
-    /// The terminal grid's cols/rows for the current window size, with the
-    /// tab bar's and status bar's pixel heights already carved out of the
-    /// row count. `None` before the window/renderer exist.
+    /// The full grid area's cols/rows for the current window size --
+    /// what a tab with a single (unsplit) pane gets. `None` before the
+    /// window/renderer exist.
     fn grid_size(&self) -> Option<(usize, usize)> {
         let window = self.window.as_ref()?;
         let renderer = self.renderer.as_ref()?;
@@ -196,18 +209,30 @@ impl App {
         Some((cols, rows))
     }
 
-    /// Recompute the terminal grid from the current window size and push
-    /// the new size to every open tab's pty (so the shell's SIGWINCH-driven
-    /// reflow, e.g. `stty size`, matches) and Term/Grid model -- not just
-    /// the active one, since background tabs keep running and must have
-    /// already reflowed correctly by the time they're switched to.
-    fn sync_size_to_window(&mut self) {
-        let Some((cols, rows)) = self.grid_size() else {
+    /// Recompute every pane's rectangle from the current window size and
+    /// split tree, and push each pane's new cols/rows to its pty (so the
+    /// shell's SIGWINCH-driven reflow, e.g. `stty size`, matches) and
+    /// Term/Grid model. Runs over every tab, not just the active one --
+    /// background tabs keep running and must have already reflowed
+    /// correctly by the time they're switched to.
+    fn relayout_all_tabs(&mut self) {
+        let (Some(window), Some(renderer)) = (&self.window, &self.renderer) else {
             return;
         };
+        let (cell_w, cell_h) = renderer.cell_size();
+        let size = window.inner_size();
+        let grid = chrome::grid_rect(size.width as f32, size.height as f32, cell_h);
         for tab in &mut self.tabs {
-            pty::resize(tab.pty_master.as_fd(), cols as u16, rows as u16);
-            tab.term.resize(cols, rows);
+            let (rects, _) = tab.layout(grid, chrome::PANE_GAP);
+            for (pane_id, rect) in rects {
+                let pane = tab.root_mut().pane_mut(pane_id).expect("layout only yields live panes");
+                let cols = ((rect.w / cell_w).floor() as usize).max(1);
+                let rows = ((rect.h / cell_h).floor() as usize).max(1);
+                if cols != pane.term.cols() || rows != pane.term.rows() {
+                    pty::resize(pane.pty_master.as_fd(), cols as u16, rows as u16);
+                    pane.term.resize(cols, rows);
+                }
+            }
         }
     }
 
@@ -215,11 +240,13 @@ impl App {
     /// start reading its pty.
     fn open_tab(&mut self) {
         let (cols, rows) = self.grid_size().unwrap_or((80, 24));
-        let id = self.next_tab_id;
+        let tab_id = self.next_tab_id;
         self.next_tab_id += 1;
-        let tab = Tab::spawn(id, &self.config.shell, cols, rows, self.config.scrollback_lines);
-        self.spawn_pty_reader(&tab);
-        self.tabs.push(tab);
+        let pane_id = self.next_pane_id;
+        self.next_pane_id += 1;
+        let pane = tab::Pane::spawn(pane_id, &self.config.shell, cols, rows, self.config.scrollback_lines);
+        self.spawn_pty_reader(&pane);
+        self.tabs.push(Tab::new(tab_id, pane));
         self.active = self.tabs.len() - 1;
         self.last_status_refresh = None;
         if let Some(window) = &self.window {
@@ -227,15 +254,54 @@ impl App {
         }
     }
 
-    /// End the tab's shell (SIGHUP, same signal a real terminal sends its
-    /// shell on close) and remove it.
+    /// Split the active tab's focused pane, putting a fresh shell in the
+    /// new half and focusing it.
+    fn split_focused_pane(&mut self, direction: tab::SplitDirection) {
+        let pane_id = self.next_pane_id;
+        self.next_pane_id += 1;
+        // Spawned at a placeholder size; `relayout_all_tabs` below sizes
+        // every pane (this one included) to its real rectangle.
+        let pane = tab::Pane::spawn(pane_id, &self.config.shell, 80, 24, self.config.scrollback_lines);
+        self.spawn_pty_reader(&pane);
+        self.active_tab_mut().split_focused(direction, pane);
+        self.relayout_all_tabs();
+        self.last_status_refresh = None;
+        if let Some(window) = &self.window {
+            window.request_redraw();
+        }
+    }
+
+    /// Close the focused pane: its split collapses into the sibling. When
+    /// it's the tab's only pane, this is just closing the tab.
+    fn close_focused_pane(&mut self, event_loop: &ActiveEventLoop) {
+        let tab = self.active_tab_mut();
+        if tab.pane_count() <= 1 {
+            let id = tab.id;
+            self.close_tab(id, event_loop);
+            return;
+        }
+        let focused = tab.focused;
+        if let Some(pane) = tab.remove_pane(focused) {
+            let _ = kill(pane.pty_child, Signal::SIGHUP);
+            let _ = nix::sys::wait::waitpid(pane.pty_child, None);
+        }
+        self.relayout_all_tabs();
+        self.last_status_refresh = None;
+        if let Some(window) = &self.window {
+            window.request_redraw();
+        }
+    }
+
+    /// End every shell in the tab (SIGHUP, same signal a real terminal
+    /// sends its shell on close) and remove it.
     fn close_tab(&mut self, id: u64, event_loop: &ActiveEventLoop) {
         let Some(index) = self.tabs.iter().position(|t| t.id == id) else {
             return;
         };
-        let child = self.tabs[index].pty_child;
-        let _ = kill(child, Signal::SIGHUP);
-        let _ = nix::sys::wait::waitpid(child, None);
+        for pane in self.tabs[index].root().panes() {
+            let _ = kill(pane.pty_child, Signal::SIGHUP);
+            let _ = nix::sys::wait::waitpid(pane.pty_child, None);
+        }
         self.remove_tab(index, event_loop);
     }
 
@@ -271,7 +337,7 @@ impl App {
             return;
         }
         let window_width = window.inner_size().width as f32;
-        let titles: Vec<String> = self.tabs.iter().map(|t| t.title.clone()).collect();
+        let titles: Vec<String> = self.tabs.iter().map(|t| t.title().to_string()).collect();
         let layout = chrome::tab_bar_layout(&titles, window_width, cell_w);
 
         match layout.hit_test(self.cursor_pos.0) {
@@ -291,19 +357,37 @@ impl App {
         }
     }
 
-    /// Maps a window-pixel position to a grid cell for the active tab.
-    /// Clamped to the grid's bounds -- a drag that continues past the
-    /// window's edge still selects to the nearest real cell instead of
-    /// stopping dead. `None` only before the window/renderer exist.
-    fn grid_point_at(&self, x: f32, y: f32) -> Option<tab::GridPoint> {
+    /// The active tab's pane rectangles at the current window size --
+    /// computed on demand from the same pure layout the renderer uses, so
+    /// clicks always land on what's visually under the cursor.
+    fn pane_rects(&self) -> Vec<(u64, tab::PaneRect)> {
+        let (Some(window), Some(renderer)) = (&self.window, &self.renderer) else {
+            return Vec::new();
+        };
+        let size = window.inner_size();
+        let grid = chrome::grid_rect(size.width as f32, size.height as f32, renderer.cell_size().1);
+        self.active_tab().layout(grid, chrome::PANE_GAP).0
+    }
+
+    /// Which of the active tab's panes is under the window-pixel position,
+    /// if any (dividers and the bars hit nothing).
+    fn pane_at(&self, x: f32, y: f32) -> Option<u64> {
+        self.pane_rects().into_iter().find(|(_, r)| r.contains(x, y)).map(|(id, _)| id)
+    }
+
+    /// Maps a window-pixel position to a grid cell of pane `pane_id`,
+    /// clamped into that pane's bounds -- a drag that wanders outside the
+    /// pane still selects to its nearest real cell instead of stopping
+    /// dead or jumping to a neighboring pane.
+    fn grid_point_in_pane(&self, pane_id: u64, x: f32, y: f32) -> Option<tab::GridPoint> {
         let renderer = self.renderer.as_ref()?;
         let (cell_w, cell_h) = renderer.cell_size();
-        let tab = self.active_tab();
-        let grid = tab.term.grid();
-        let col = ((x / cell_w).floor().max(0.0) as usize).min(grid.cols.saturating_sub(1));
-        let y_in_grid = (y - chrome::tab_bar_height(cell_h)).max(0.0);
-        let view_row = ((y_in_grid / cell_h).floor() as usize).min(grid.rows.saturating_sub(1));
-        let distance = grid.distance_from_bottom(view_row, tab.scroll_offset);
+        let (_, rect) = self.pane_rects().into_iter().find(|(id, _)| *id == pane_id)?;
+        let pane = self.active_tab().root().pane(pane_id)?;
+        let grid = pane.term.grid();
+        let col = (((x - rect.x) / cell_w).floor().max(0.0) as usize).min(grid.cols.saturating_sub(1));
+        let view_row = (((y - rect.y) / cell_h).floor().max(0.0) as usize).min(grid.rows.saturating_sub(1));
+        let distance = grid.distance_from_bottom(view_row, pane.scroll_offset);
         Some(tab::GridPoint { distance, col })
     }
 
@@ -312,11 +396,16 @@ impl App {
     /// and returns `true`. Only ever called with Cmd held -- `false`
     /// means the caller should fall back to its normal click handling.
     fn open_url_under_cursor(&mut self) -> bool {
-        let Some(tab::GridPoint { distance, col }) = self.grid_point_at(self.cursor_pos.0, self.cursor_pos.1) else {
+        let Some(pane_id) = self.pane_at(self.cursor_pos.0, self.cursor_pos.1) else {
             return false;
         };
-        let tab = self.active_tab();
-        let Some(row) = tab.term.grid().absolute_line(distance) else {
+        let Some(tab::GridPoint { distance, col }) = self.grid_point_in_pane(pane_id, self.cursor_pos.0, self.cursor_pos.1) else {
+            return false;
+        };
+        let Some(pane) = self.active_tab().root().pane(pane_id) else {
+            return false;
+        };
+        let Some(row) = pane.term.grid().absolute_line(distance) else {
             return false;
         };
         let text: String = row.iter().map(|c| c.c).collect();
@@ -333,23 +422,26 @@ impl App {
         true
     }
 
-    /// Start a new text selection at the current cursor position,
-    /// replacing whatever was selected before. No-op outside the grid
-    /// (the tab bar and status bar aren't selectable).
+    /// Start a new text selection at the current cursor position (also
+    /// focusing the pane under it), replacing whatever was selected in
+    /// that pane before. No-op outside any pane (bars, dividers).
     fn begin_selection(&mut self) {
-        let (Some(window), Some(renderer)) = (&self.window, &self.renderer) else {
+        let Some(pane_id) = self.pane_at(self.cursor_pos.0, self.cursor_pos.1) else {
             return;
         };
-        let (_, cell_h) = renderer.cell_size();
-        let status_bar_top = window.inner_size().height as f32 - chrome::status_bar_height(cell_h);
-        if self.cursor_pos.1 < chrome::tab_bar_height(cell_h) || self.cursor_pos.1 >= status_bar_top {
-            return;
+        // A click anywhere in a pane focuses it, selection or not --
+        // that's the entire mouse story for pane focus.
+        if self.active_tab().focused != pane_id {
+            self.active_tab_mut().focused = pane_id;
+            self.last_status_refresh = None;
         }
-        let Some(point) = self.grid_point_at(self.cursor_pos.0, self.cursor_pos.1) else {
+        let Some(point) = self.grid_point_in_pane(pane_id, self.cursor_pos.0, self.cursor_pos.1) else {
             return;
         };
-        self.dragging_selection = true;
-        self.active_tab_mut().selection = Some(tab::Selection { anchor: point, cursor: point });
+        self.dragging_pane = Some(pane_id);
+        if let Some(pane) = self.active_tab_mut().root_mut().pane_mut(pane_id) {
+            pane.selection = Some(tab::Selection { anchor: point, cursor: point });
+        }
         if let Some(window) = &self.window {
             window.request_redraw();
         }
@@ -357,14 +449,16 @@ impl App {
 
     /// Extend the in-progress selection to the current cursor position.
     fn update_selection(&mut self) {
-        if !self.dragging_selection {
-            return;
-        }
-        let Some(point) = self.grid_point_at(self.cursor_pos.0, self.cursor_pos.1) else {
+        let Some(pane_id) = self.dragging_pane else {
             return;
         };
-        if let Some(selection) = &mut self.active_tab_mut().selection {
-            selection.cursor = point;
+        let Some(point) = self.grid_point_in_pane(pane_id, self.cursor_pos.0, self.cursor_pos.1) else {
+            return;
+        };
+        if let Some(pane) = self.active_tab_mut().root_mut().pane_mut(pane_id) {
+            if let Some(selection) = &mut pane.selection {
+                selection.cursor = point;
+            }
         }
         if let Some(window) = &self.window {
             window.request_redraw();
@@ -376,26 +470,27 @@ impl App {
     /// it rather than leaving a zero-width one that would otherwise just
     /// sit there uncopiable and unclearable by any other click.
     fn end_selection(&mut self) {
-        if !self.dragging_selection {
+        let Some(pane_id) = self.dragging_pane.take() else {
             return;
-        }
-        self.dragging_selection = false;
-        let tab = self.active_tab_mut();
-        if tab.selection.is_some_and(|s| s.anchor == s.cursor) {
-            tab.selection = None;
-            if let Some(window) = &self.window {
-                window.request_redraw();
+        };
+        if let Some(pane) = self.active_tab_mut().root_mut().pane_mut(pane_id) {
+            if pane.selection.is_some_and(|s| s.anchor == s.cursor) {
+                pane.selection = None;
+                if let Some(window) = &self.window {
+                    window.request_redraw();
+                }
             }
         }
     }
 
-    /// Opens the active tab's search bar if it isn't already open. A
+    /// Opens the focused pane's search bar if it isn't already open. A
     /// second Cmd+F while one's already open is a no-op -- keeps whatever
     /// query was typed rather than clearing it, since there's no reason a
     /// repeated Cmd+F should throw away progress.
     fn open_search(&mut self) {
-        if self.active_tab().search.is_none() {
-            self.active_tab_mut().search = Some(tab::Search::new());
+        let pane = self.active_tab_mut().focused_pane_mut();
+        if pane.search.is_none() {
+            pane.search = Some(tab::Search::new());
         }
         if let Some(window) = &self.window {
             window.request_redraw();
@@ -403,7 +498,7 @@ impl App {
     }
 
     fn close_search(&mut self) {
-        self.active_tab_mut().search = None;
+        self.active_tab_mut().focused_pane_mut().search = None;
         if let Some(window) = &self.window {
             window.request_redraw();
         }
@@ -425,7 +520,7 @@ impl App {
                 }
             }
             Key::Named(NamedKey::Backspace) => {
-                if let Some(search) = &mut self.active_tab_mut().search {
+                if let Some(search) = &mut self.active_tab_mut().focused_pane_mut().search {
                     search.query.pop();
                 }
                 self.recompute_search();
@@ -436,7 +531,7 @@ impl App {
                     // reports `text` for for some named keys (e.g. Tab)
                     // -- only append genuinely printable input.
                     if !text.is_empty() && text.chars().all(|c| !c.is_control()) {
-                        if let Some(search) = &mut self.active_tab_mut().search {
+                        if let Some(search) = &mut self.active_tab_mut().focused_pane_mut().search {
                             search.query.push_str(text);
                         }
                         self.recompute_search();
@@ -446,12 +541,12 @@ impl App {
         }
     }
 
-    /// Re-runs the active tab's search after its query changed and jumps
+    /// Re-runs the focused pane's search after its query changed and jumps
     /// the view to the (new) first match.
     fn recompute_search(&mut self) {
-        let tab = self.active_tab_mut();
-        let grid = tab.term.grid();
-        if let Some(search) = &mut tab.search {
+        let pane = self.active_tab_mut().focused_pane_mut();
+        let grid = pane.term.grid();
+        if let Some(search) = &mut pane.search {
             search.recompute(grid);
         }
         self.jump_to_search_match();
@@ -461,8 +556,8 @@ impl App {
     }
 
     fn step_search(&mut self, forward: bool) {
-        let tab = self.active_tab_mut();
-        let Some(search) = &mut tab.search else { return };
+        let pane = self.active_tab_mut().focused_pane_mut();
+        let Some(search) = &mut pane.search else { return };
         if forward {
             search.go_next();
         } else {
@@ -474,27 +569,27 @@ impl App {
         }
     }
 
-    /// Scrolls the active tab so its search's current match is roughly
+    /// Scrolls the focused pane so its search's current match is roughly
     /// centered in the viewport. No-op if there's no open search or no
     /// current match (an empty query, or one with no hits).
     fn jump_to_search_match(&mut self) {
-        let tab = self.active_tab_mut();
-        let Some(search) = &tab.search else { return };
+        let pane = self.active_tab_mut().focused_pane_mut();
+        let Some(search) = &pane.search else { return };
         let Some((distance, _)) = search.current_target() else { return };
-        let rows = tab.term.rows();
-        let max_offset = tab.term.grid().scrollback.len();
-        tab.scroll_offset = distance.saturating_sub(rows / 2).min(max_offset);
+        let rows = pane.term.rows();
+        let max_offset = pane.term.grid().scrollback.len();
+        pane.scroll_offset = distance.saturating_sub(rows / 2).min(max_offset);
     }
 
-    /// Spawn the thread that blocking-reads `tab`'s pty and forwards bytes
-    /// to the event loop, tagged with `tab`'s id and generation so
-    /// `user_event` can route them (and can tell a since-closed tab's
+    /// Spawn the thread that blocking-reads `pane`'s pty and forwards
+    /// bytes to the event loop, tagged with `pane`'s id and generation so
+    /// `user_event` can route them (and can tell a since-closed pane's
     /// trailing events apart from a live one's).
-    fn spawn_pty_reader(&self, tab: &Tab) {
-        let reader_master = Arc::clone(&tab.pty_master);
+    fn spawn_pty_reader(&self, pane: &tab::Pane) {
+        let reader_master = Arc::clone(&pane.pty_master);
         let proxy = self.proxy.clone();
-        let tab_id = tab.id;
-        let generation = tab.pty_generation;
+        let pane_id = pane.id;
+        let generation = pane.pty_generation;
         std::thread::spawn(move || {
             let mut buf = [0u8; 4096];
             loop {
@@ -502,7 +597,7 @@ impl App {
                     Ok(0) | Err(_) => break,
                     Ok(n) => {
                         if proxy
-                            .send_event(UserEvent::PtyData(tab_id, generation, buf[..n].to_vec()))
+                            .send_event(UserEvent::PtyData(pane_id, generation, buf[..n].to_vec()))
                             .is_err()
                         {
                             break;
@@ -510,16 +605,16 @@ impl App {
                     }
                 }
             }
-            let _ = proxy.send_event(UserEvent::PtyExited(tab_id, generation));
+            let _ = proxy.send_event(UserEvent::PtyExited(pane_id, generation));
         });
     }
 
-    /// Recompute the status bar text and the active tab's title from the
+    /// Recompute the status bar text and the focused pane's title from the
     /// live shell state (foreground process, cwd, git branch), but no more
     /// often than `STATUS_REFRESH_INTERVAL` -- these calls touch `sysinfo`
     /// and the filesystem, so redoing them on every keystroke-triggered
-    /// redraw would be wasteful. Background tabs keep whatever title they
-    /// last had until they're switched to.
+    /// redraw would be wasteful. Background tabs/panes keep whatever title
+    /// they last had until they're focused again.
     fn refresh_status(&mut self) {
         let due = self.last_status_refresh.is_none_or(|t| t.elapsed() >= STATUS_REFRESH_INTERVAL);
         if !due {
@@ -527,30 +622,30 @@ impl App {
         }
         self.last_status_refresh = Some(Instant::now());
 
-        let tab = &mut self.tabs[self.active];
-        let master = tab.pty_master.as_fd();
+        let pane = self.tabs[self.active].focused_pane_mut();
+        let master = pane.pty_master.as_fd();
         let (fg_name, cwd) = match self.proc_info.foreground_process_name(master) {
             // The shell itself sitting at its prompt: use the name we
             // derived from the configured shell path at spawn time rather
             // than whatever sysinfo reports for the pid. Right after a
-            // tab opens, that pid can still be the pre-exec fork of this
+            // pane opens, that pid can still be the pre-exec fork of this
             // binary (named "terminal"), and losing that race used to
             // mistitle the tab -- the shell's own name is a fact we
             // already know, so never ask the process table for it.
-            Some((pid, _)) if pid == tab.pty_child => (tab.shell_name.clone(), self.proc_info.process_cwd(pid)),
+            Some((pid, _)) if pid == pane.pty_child => (pane.shell_name.clone(), self.proc_info.process_cwd(pid)),
             Some((pid, name)) => (name, self.proc_info.process_cwd(pid)),
-            None => (tab.shell_name.clone(), self.proc_info.process_cwd(tab.pty_child)),
+            None => (pane.shell_name.clone(), self.proc_info.process_cwd(pane.pty_child)),
         };
-        tab.title = fg_name;
+        pane.title = fg_name;
 
         let cwd_display = cwd.as_deref().map(display_path).unwrap_or_default();
         let branch = cwd.as_deref().and_then(status::git_branch);
 
         self.cached_status = chrome::StatusInfo {
-            shell: tab.shell_name.clone(),
+            shell: pane.shell_name.clone(),
             cwd: cwd_display,
             branch,
-            tty: tab.tty_name.clone(),
+            tty: pane.tty_name.clone(),
         };
     }
 }
@@ -614,24 +709,18 @@ impl ApplicationHandler<UserEvent> for App {
         );
         let palette = Palette::from(&self.config.colors);
         let renderer = Renderer::new(window.clone(), &self.config.font, palette, self.config.opacity);
-        let (cell_w, cell_h) = renderer.cell_size();
-        let size = window.inner_size();
-        let cols = ((size.width as f32 / cell_w).floor() as usize).max(1);
-        let rows = chrome::terminal_rows(size.height as f32, cell_h);
 
         self.window = Some(window);
         self.renderer = Some(renderer);
 
-        // The first tab was constructed in `main()` at a placeholder size
-        // (before the window/renderer existed to know the real one) --
-        // fit it to the actual window now.
-        let first_tab = &mut self.tabs[0];
-        first_tab.term.resize(cols, rows);
-        pty::resize(first_tab.pty_master.as_fd(), cols as u16, rows as u16);
+        // The first pane was constructed in `main()` at a placeholder
+        // size (before the window/renderer existed to know the real one)
+        // -- fit it to the actual window now.
+        self.relayout_all_tabs();
 
         self.window.as_ref().unwrap().request_redraw();
 
-        // Only start reading the pty now that the tab's Term is correctly
+        // Only start reading the pty now that the pane's Term is correctly
         // sized: the shell starts producing output the moment it's forked
         // (in `main`, before the event loop even runs), and any bytes read
         // before this point would be silently dropped by `user_event`'s
@@ -640,50 +729,63 @@ impl ApplicationHandler<UserEvent> for App {
         // the next keypress produced fresh output. The pty's kernel-side
         // buffer holds onto that early output until we're ready to read
         // it, so nothing is lost by waiting.
-        self.spawn_pty_reader(&self.tabs[0]);
+        self.spawn_pty_reader(self.tabs[0].root().panes()[0]);
     }
 
     fn user_event(&mut self, event_loop: &ActiveEventLoop, event: UserEvent) {
         match event {
-            UserEvent::PtyData(tab_id, generation, bytes) => {
-                let Some(tab) = self.tabs.iter_mut().find(|t| t.id == tab_id) else {
-                    return; // tab already closed
+            UserEvent::PtyData(pane_id, generation, bytes) => {
+                let Some(pane) = self.tabs.iter_mut().find_map(|t| t.root_mut().pane_mut(pane_id)) else {
+                    return; // pane already closed
                 };
                 // Ignore output from a shell session that's since been
                 // replaced -- its reader thread can still have bytes in
                 // flight for a moment after that.
-                if generation != tab.pty_generation {
+                if generation != pane.pty_generation {
                     return;
                 }
-                tab.term.advance(&bytes);
-                tab.scroll_offset = 0;
+                pane.term.advance(&bytes);
+                pane.scroll_offset = 0;
                 // The content a selection pointed at may have just
                 // scrolled, changed, or stopped existing -- see the
-                // field doc on `Tab::selection`.
-                tab.selection = None;
+                // field doc on `Pane::selection`.
+                pane.selection = None;
                 // Unlike selection, a search stays open across new
                 // output -- just refreshed against it (see the field doc
-                // on `Tab::search`) rather than cleared. Doesn't jump the
+                // on `Pane::search`) rather than cleared. Doesn't jump the
                 // view to the current match here: new output already
                 // snaps the view to the live bottom via `scroll_offset =
                 // 0` above, and fighting that would be more surprising
                 // than just leaving the match list/count up to date.
-                if let Some(search) = &mut tab.search {
-                    search.recompute(tab.term.grid());
+                if let Some(search) = &mut pane.search {
+                    search.recompute(pane.term.grid());
                 }
                 if let Some(window) = &self.window {
                     window.request_redraw();
                 }
             }
-            UserEvent::PtyExited(tab_id, generation) => {
-                let Some(index) = self.tabs.iter().position(|t| t.id == tab_id) else {
-                    return; // tab already closed
+            UserEvent::PtyExited(pane_id, generation) => {
+                let Some(tab_index) = self.tabs.iter().position(|t| t.root().pane(pane_id).is_some()) else {
+                    return; // pane already closed
                 };
-                if generation != self.tabs[index].pty_generation {
+                let tab = &mut self.tabs[tab_index];
+                let pane = tab.root().pane(pane_id).expect("position() just found it");
+                if generation != pane.pty_generation {
                     return;
                 }
-                let _ = nix::sys::wait::waitpid(self.tabs[index].pty_child, None);
-                self.remove_tab(index, event_loop);
+                let _ = nix::sys::wait::waitpid(pane.pty_child, None);
+                if tab.pane_count() > 1 {
+                    // A shell in one pane of a split exited: collapse just
+                    // that pane, exactly like Cmd+W on it.
+                    let _ = tab.remove_pane(pane_id);
+                    self.relayout_all_tabs();
+                    self.last_status_refresh = None;
+                    if let Some(window) = &self.window {
+                        window.request_redraw();
+                    }
+                } else {
+                    self.remove_tab(tab_index, event_loop);
+                }
             }
             UserEvent::OpenSettings => {
                 if let Some(settings) = &self.settings_window {
@@ -696,10 +798,7 @@ impl ApplicationHandler<UserEvent> for App {
                 self.apply_config(Config::load());
             }
             UserEvent::NewTab => self.open_tab(),
-            UserEvent::CloseTab => {
-                let id = self.tabs[self.active].id;
-                self.close_tab(id, event_loop);
-            }
+            UserEvent::ClosePane => self.close_focused_pane(event_loop),
             UserEvent::NextTab => {
                 self.active = (self.active + 1) % self.tabs.len();
                 self.last_status_refresh = None;
@@ -709,6 +808,16 @@ impl ApplicationHandler<UserEvent> for App {
             }
             UserEvent::PrevTab => {
                 self.active = (self.active + self.tabs.len() - 1) % self.tabs.len();
+                self.last_status_refresh = None;
+                if let Some(window) = &self.window {
+                    window.request_redraw();
+                }
+            }
+            UserEvent::SplitRight => self.split_focused_pane(tab::SplitDirection::Vertical),
+            UserEvent::SplitDown => self.split_focused_pane(tab::SplitDirection::Horizontal),
+            UserEvent::NextPane | UserEvent::PrevPane => {
+                let forward = matches!(event, UserEvent::NextPane);
+                self.active_tab_mut().cycle_focus(forward);
                 self.last_status_refresh = None;
                 if let Some(window) = &self.window {
                     window.request_redraw();
@@ -735,7 +844,7 @@ impl ApplicationHandler<UserEvent> for App {
                 if let Some(renderer) = &mut self.renderer {
                     renderer.resize(new_size);
                 }
-                self.sync_size_to_window();
+                self.relayout_all_tabs();
                 if let Some(window) = &self.window {
                     window.request_redraw();
                 }
@@ -768,7 +877,7 @@ impl ApplicationHandler<UserEvent> for App {
                 // every key edits or navigates the query instead of
                 // reaching the pty, and none of it falls through past
                 // this block.
-                if self.active_tab().search.is_some() {
+                if self.active_tab().focused_pane().search.is_some() {
                     self.handle_search_key(&event);
                     return;
                 }
@@ -783,16 +892,16 @@ impl ApplicationHandler<UserEvent> for App {
                 if self.modifiers.super_key() {
                     if let winit::keyboard::Key::Character(c) = &event.logical_key {
                         if c.eq_ignore_ascii_case("c") {
-                            if let Some(text) = self.active_tab().selected_text() {
+                            if let Some(text) = self.active_tab().focused_pane().selected_text() {
                                 copy_to_clipboard(&text);
                             }
                             return;
                         }
                         if c.eq_ignore_ascii_case("v") {
                             if let Some(text) = paste_from_clipboard() {
-                                let tab = self.active_tab();
-                                let _ = nix::unistd::write(tab.pty_master.as_fd(), text.as_bytes());
-                                self.active_tab_mut().scroll_offset = 0;
+                                let pane = self.active_tab().focused_pane();
+                                let _ = nix::unistd::write(pane.pty_master.as_fd(), text.as_bytes());
+                                self.active_tab_mut().focused_pane_mut().scroll_offset = 0;
                                 if let Some(window) = &self.window {
                                     window.request_redraw();
                                 }
@@ -801,17 +910,17 @@ impl ApplicationHandler<UserEvent> for App {
                         }
                     }
                 }
-                let tab = self.active_tab();
+                let pane = self.active_tab().focused_pane();
                 let bytes = input::encode_key(
                     &event.logical_key,
                     event.text.as_deref(),
                     event.state.is_pressed(),
                     self.modifiers,
-                    &tab.term.modes,
+                    &pane.term.modes,
                 );
                 if let Some(bytes) = bytes {
-                    let _ = nix::unistd::write(tab.pty_master.as_fd(), &bytes);
-                    self.active_tab_mut().scroll_offset = 0;
+                    let _ = nix::unistd::write(pane.pty_master.as_fd(), &bytes);
+                    self.active_tab_mut().focused_pane_mut().scroll_offset = 0;
                     if let Some(window) = &self.window {
                         window.request_redraw();
                     }
@@ -827,15 +936,22 @@ impl ApplicationHandler<UserEvent> for App {
                     MouseScrollDelta::LineDelta(_, y) => y,
                     MouseScrollDelta::PixelDelta(pos) => (pos.y as f32) / cell_h,
                 };
-                let tab = self.active_tab_mut();
-                if tab.term.using_alt_screen() {
+                // Scroll whatever pane is under the mouse (not the focused
+                // one) -- matching how iTerm2/macOS scroll views behave.
+                let pane_id = self
+                    .pane_at(self.cursor_pos.0, self.cursor_pos.1)
+                    .unwrap_or(self.active_tab().focused);
+                let Some(pane) = self.active_tab_mut().root_mut().pane_mut(pane_id) else {
+                    return;
+                };
+                if pane.term.using_alt_screen() {
                     return;
                 }
-                let max_offset = tab.term.grid().scrollback.len();
+                let max_offset = pane.term.grid().scrollback.len();
                 if lines > 0.0 {
-                    tab.scroll_offset = (tab.scroll_offset + lines.ceil() as usize).min(max_offset);
+                    pane.scroll_offset = (pane.scroll_offset + lines.ceil() as usize).min(max_offset);
                 } else if lines < 0.0 {
-                    tab.scroll_offset = tab.scroll_offset.saturating_sub((-lines).ceil() as usize);
+                    pane.scroll_offset = pane.scroll_offset.saturating_sub((-lines).ceil() as usize);
                 }
                 if let Some(window) = &self.window {
                     window.request_redraw();
@@ -874,12 +990,11 @@ impl ApplicationHandler<UserEvent> for App {
             }
             WindowEvent::RedrawRequested => {
                 self.refresh_status();
-                let scroll_offset = self.tabs[self.active].scroll_offset;
                 let cmd_held = self.modifiers.super_key();
                 let outcome = self
                     .renderer
                     .as_mut()
-                    .map(|renderer| renderer.render(&self.tabs, self.active, scroll_offset, &self.cached_status, cmd_held));
+                    .map(|renderer| renderer.render(&self.tabs, self.active, &self.cached_status, cmd_held));
                 match outcome {
                     Some(render::RenderOutcome::Presented) => self.presented_once = true,
                     Some(render::RenderOutcome::Retry) => {
@@ -926,7 +1041,8 @@ fn main() {
     let config = Config::load();
 
     let pty_handle = pty::spawn_shell(&config.shell);
-    let first_tab = Tab::from_handle(0, pty_handle, &config.shell, 80, 24, config.scrollback_lines);
+    let first_pane = tab::Pane::from_handle(0, pty_handle, &config.shell, 80, 24, config.scrollback_lines);
+    let first_tab = Tab::new(0, first_pane);
 
     // winit would otherwise install its own placeholder macOS menu bar,
     // which would fight the one built in `menu::install`.

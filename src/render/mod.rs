@@ -169,12 +169,12 @@ impl Renderer {
             .set_screen_size(&self.queue, self.config.width as f32, self.config.height as f32);
     }
 
-    /// Draw the active tab's grid framed by the tab strip (top) and status
-    /// bar (bottom). `tabs`/`active` drive the tab strip's labels and
-    /// highlight; `status` is pre-resolved shell/cwd/git/tty info --
+    /// Draw the active tab's panes framed by the tab strip (top) and
+    /// status bar (bottom). `tabs`/`active` drive the tab strip's labels
+    /// and highlight; `status` is pre-resolved shell/cwd/git/tty info --
     /// process/filesystem lookups have no business happening in the
     /// renderer.
-    pub fn render(&mut self, tabs: &[Tab], active: usize, scroll_offset: usize, status: &chrome::StatusInfo, cmd_held: bool) -> RenderOutcome {
+    pub fn render(&mut self, tabs: &[Tab], active: usize, status: &chrome::StatusInfo, cmd_held: bool) -> RenderOutcome {
         let surface_texture = match self.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(t) => t,
             wgpu::CurrentSurfaceTexture::Suboptimal(t) => {
@@ -203,27 +203,41 @@ impl Renderer {
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
 
-        let active_term = &tabs[active].term;
-        // Full-screen apps (vim, less, htop, ...) manage their own scrolling
-        // and don't expect the terminal to scroll their alternate screen.
-        let effective_offset = if active_term.using_alt_screen() { 0 } else { scroll_offset };
+        let tab = &tabs[active];
         let tab_bar_h = chrome::tab_bar_height(self.atlas.cell_height);
         let status_bar_h = chrome::status_bar_height(self.atlas.cell_height);
         let window_width = self.config.width as f32;
         let window_height = self.config.height as f32;
 
-        let overlays = GridOverlays {
-            selection: tabs[active].selection.as_ref(),
-            search: tabs[active].search.as_ref(),
-            cmd_held,
-        };
-        let mut instances = self.build_instances_from_grid(active_term, effective_offset, tab_bar_h, &overlays);
+        let grid_rect = chrome::grid_rect(window_width, window_height, self.atlas.cell_height);
+        let (pane_rects, dividers) = tab.layout(grid_rect, chrome::PANE_GAP);
 
-        let titles: Vec<String> = tabs.iter().map(|t| t.title.clone()).collect();
+        let mut instances = chrome::build_divider_instances(&self.atlas, &dividers);
+        for (pane_id, rect) in &pane_rects {
+            let pane = tab.root().pane(*pane_id).expect("layout only yields live panes");
+            // Full-screen apps (vim, less, htop, ...) manage their own
+            // scrolling and don't expect the terminal to scroll their
+            // alternate screen.
+            let effective_offset = if pane.term.using_alt_screen() { 0 } else { pane.scroll_offset };
+            let overlays = GridOverlays {
+                selection: pane.selection.as_ref(),
+                search: pane.search.as_ref(),
+                cmd_held,
+            };
+            let focused = tab.focused == *pane_id;
+            instances.extend(self.build_instances_from_pane(&pane.term, effective_offset, *rect, &overlays, focused));
+        }
+        if pane_rects.len() > 1 {
+            if let Some((_, rect)) = pane_rects.iter().find(|(id, _)| *id == tab.focused) {
+                instances.extend(chrome::build_focus_border_instances(&self.atlas, *rect));
+            }
+        }
+
+        let titles: Vec<String> = tabs.iter().map(|t| t.title().to_string()).collect();
         let tab_layout = chrome::tab_bar_layout(&titles, window_width, self.atlas.cell_width);
         instances.extend(chrome::build_tab_bar_instances(&self.atlas, &tab_layout, active, window_width, tab_bar_h));
         instances.extend(chrome::build_status_bar_instances(&self.atlas, status, window_width, window_height, status_bar_h));
-        if let Some(search) = &tabs[active].search {
+        if let Some(search) = &tab.focused_pane().search {
             instances.extend(chrome::build_search_bar_instances(&self.atlas, search, window_width, tab_bar_h));
         }
 
@@ -259,7 +273,7 @@ impl Renderer {
         RenderOutcome::Presented
     }
 
-    fn build_instances_from_grid(&self, term: &Term, scroll_offset: usize, y_offset: f32, overlays: &GridOverlays) -> Vec<Instance> {
+    fn build_instances_from_pane(&self, term: &Term, scroll_offset: usize, rect: crate::tab::PaneRect, overlays: &GridOverlays, focused: bool) -> Vec<Instance> {
         let grid = term.grid();
         let (cw, ch) = (self.atlas.cell_width, self.atlas.cell_height);
         let mut instances = Vec::with_capacity(grid.cols * grid.rows * 2);
@@ -297,8 +311,8 @@ impl Renderer {
                     )
                 };
 
-                let cell_x = col as f32 * cw;
-                let cell_y = row as f32 * ch + y_offset;
+                let cell_x = rect.x + col as f32 * cw;
+                let cell_y = rect.y + row as f32 * ch;
 
                 instances.push(Instance {
                     pos: [cell_x, cell_y],
@@ -371,14 +385,18 @@ impl Renderer {
         }
 
         if term.modes.show_cursor && scroll_offset == 0 {
-            let cursor_x = term.cursor.col as f32 * cw;
-            let cursor_y = term.cursor.row as f32 * ch + y_offset;
+            let cursor_x = rect.x + term.cursor.col as f32 * cw;
+            let cursor_y = rect.y + term.cursor.row as f32 * ch;
+            // Unfocused panes keep a faint cursor: enough to see where
+            // each shell is sitting, unmistakably different from the pane
+            // that will actually receive the next keystroke.
+            let alpha = if focused { 0.45 } else { 0.18 };
             instances.push(Instance {
                 pos: [cursor_x, cursor_y],
                 size: [cw, ch],
                 uv_min: self.atlas.white_uv,
                 uv_max: self.atlas.white_uv,
-                color: [1.0, 1.0, 1.0, 0.45],
+                color: [1.0, 1.0, 1.0, alpha],
                 top_corner_radius: 0.0,
             });
         }
