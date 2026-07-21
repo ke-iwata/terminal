@@ -114,6 +114,10 @@ struct App {
     /// every cursor move) so a drag that wanders across a divider keeps
     /// extending the selection it started in, clamped to its own pane.
     dragging_pane: Option<u64>,
+    /// The divider a left-button drag is currently resizing, from press
+    /// to release. Mutually exclusive with `dragging_pane` -- a press
+    /// starts one or the other, never both.
+    dragging_divider: Option<tab::DividerInfo>,
 }
 
 impl App {
@@ -135,6 +139,7 @@ impl App {
             cursor_pos: (0.0, 0.0),
             presented_once: false,
             dragging_pane: None,
+            dragging_divider: None,
         }
     }
 
@@ -373,6 +378,70 @@ impl App {
     /// if any (dividers and the bars hit nothing).
     fn pane_at(&self, x: f32, y: f32) -> Option<u64> {
         self.pane_rects().into_iter().find(|(_, r)| r.contains(x, y)).map(|(id, _)| id)
+    }
+
+    /// The divider under the window-pixel position, if any. The visible
+    /// gap is only `PANE_GAP` (2px) wide -- too thin a target to actually
+    /// grab -- so the hit zone is padded a few pixels to either side,
+    /// like every app with draggable splitters does. Pane content still
+    /// wins clicks beyond the padded zone.
+    fn divider_at(&self, x: f32, y: f32) -> Option<tab::DividerInfo> {
+        const GRAB: f32 = 3.0;
+        let (Some(window), Some(renderer)) = (&self.window, &self.renderer) else {
+            return None;
+        };
+        let size = window.inner_size();
+        let grid = chrome::grid_rect(size.width as f32, size.height as f32, renderer.cell_size().1);
+        let (_, dividers) = self.active_tab().layout(grid, chrome::PANE_GAP);
+        dividers.into_iter().find(|d| {
+            let r = d.rect;
+            let padded = tab::PaneRect { x: r.x - GRAB, y: r.y - GRAB, w: r.w + GRAB * 2.0, h: r.h + GRAB * 2.0 };
+            padded.contains(x, y)
+        })
+    }
+
+    /// Move the divider currently being dragged to the cursor position:
+    /// recompute its split's ratio from where the cursor sits inside the
+    /// split's region, clamped so neither side collapses below about two
+    /// cells, and re-fit every affected pane immediately (live resize).
+    fn update_divider_drag(&mut self) {
+        let Some(divider) = self.dragging_divider.clone() else {
+            return;
+        };
+        let Some((cell_w, cell_h)) = self.renderer.as_ref().map(Renderer::cell_size) else {
+            return;
+        };
+        let (pos, start, extent, min_px) = match divider.direction {
+            tab::SplitDirection::Vertical => (self.cursor_pos.0, divider.region.x, divider.region.w - chrome::PANE_GAP, cell_w * 2.0),
+            tab::SplitDirection::Horizontal => (self.cursor_pos.1, divider.region.y, divider.region.h - chrome::PANE_GAP, cell_h * 2.0),
+        };
+        if extent <= min_px * 2.0 {
+            return; // region too small to meaningfully resize
+        }
+        let ratio = ((pos - start) / extent).clamp(min_px / extent, 1.0 - min_px / extent);
+        self.active_tab_mut().set_split_ratio(&divider.path, ratio);
+        self.relayout_all_tabs();
+        if let Some(window) = &self.window {
+            window.request_redraw();
+        }
+    }
+
+    /// Show a resize cursor while hovering (or dragging) a divider, and
+    /// the plain arrow everywhere else.
+    fn update_cursor_icon(&self) {
+        use winit::window::CursorIcon;
+        let Some(window) = &self.window else { return };
+        let direction = self
+            .dragging_divider
+            .as_ref()
+            .map(|d| d.direction)
+            .or_else(|| self.divider_at(self.cursor_pos.0, self.cursor_pos.1).map(|d| d.direction));
+        let icon = match direction {
+            Some(tab::SplitDirection::Vertical) => CursorIcon::ColResize,
+            Some(tab::SplitDirection::Horizontal) => CursorIcon::RowResize,
+            None => CursorIcon::Default,
+        };
+        window.set_cursor(icon);
     }
 
     /// Maps a window-pixel position to a grid cell of pane `pane_id`,
@@ -959,7 +1028,9 @@ impl ApplicationHandler<UserEvent> for App {
             }
             WindowEvent::CursorMoved { position, .. } => {
                 self.cursor_pos = (position.x as f32, position.y as f32);
+                self.update_divider_drag();
                 self.update_selection();
+                self.update_cursor_icon();
             }
             WindowEvent::MouseInput { state: ElementState::Pressed, button: MouseButton::Left, .. } => {
                 let Some(cell_h) = self.renderer.as_ref().map(|r| r.cell_size().1) else {
@@ -967,6 +1038,8 @@ impl ApplicationHandler<UserEvent> for App {
                 };
                 if self.cursor_pos.1 < chrome::tab_bar_height(cell_h) {
                     self.handle_tab_bar_click(event_loop);
+                } else if let Some(divider) = self.divider_at(self.cursor_pos.0, self.cursor_pos.1) {
+                    self.dragging_divider = Some(divider);
                 } else if self.modifiers.super_key() && self.open_url_under_cursor() {
                     // Cmd+click on a link opens it instead of starting a
                     // selection -- Cmd+drag was never a gesture to begin
@@ -977,6 +1050,7 @@ impl ApplicationHandler<UserEvent> for App {
                 }
             }
             WindowEvent::MouseInput { state: ElementState::Released, button: MouseButton::Left, .. } => {
+                self.dragging_divider = None;
                 self.end_selection();
             }
             // A frame skipped while occluded (see `RenderOutcome::Skipped`)

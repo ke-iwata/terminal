@@ -211,8 +211,9 @@ impl Renderer {
 
         let grid_rect = chrome::grid_rect(window_width, window_height, self.atlas.cell_height);
         let (pane_rects, dividers) = tab.layout(grid_rect, chrome::PANE_GAP);
+        let divider_rects: Vec<crate::tab::PaneRect> = dividers.iter().map(|d| d.rect).collect();
 
-        let mut instances = chrome::build_divider_instances(&self.atlas, &dividers);
+        let mut instances = chrome::build_divider_instances(&self.atlas, &divider_rects);
         for (pane_id, rect) in &pane_rects {
             let pane = tab.root().pane(*pane_id).expect("layout only yields live panes");
             // Full-screen apps (vim, less, htop, ...) manage their own

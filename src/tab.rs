@@ -266,7 +266,25 @@ impl PaneRect {
     }
 }
 
-/// The split tree: leaves are live panes, interior nodes are 50/50-ish
+/// One divider produced by `PaneNode::layout`: the gap strip itself plus
+/// everything a divider drag needs to know -- which split node it belongs
+/// to (`path`) and the full region that split divides, so a new ratio can
+/// be computed directly from a cursor position inside that region.
+#[derive(Debug, Clone)]
+pub struct DividerInfo {
+    /// The split node's address in the tree, as first/second branch steps
+    /// from the root (`false` = first). Only valid until the tree next
+    /// changes shape, which is fine: layout is recomputed (and paths
+    /// refreshed) on every frame and every hit test.
+    pub path: Vec<bool>,
+    pub direction: SplitDirection,
+    /// The rect the split divides: both children plus the gap.
+    pub region: PaneRect,
+    /// The visible gap strip.
+    pub rect: PaneRect,
+}
+
+/// The split tree: leaves are live panes, interior nodes are ratio
 /// splits. A plain binary tree (rather than a flat list of rects) so
 /// closing any pane always has an unambiguous answer for what reclaims
 /// its space -- the sibling subtree it was split from.
@@ -276,9 +294,8 @@ pub enum PaneNode {
     Leaf(Box<Pane>),
     Split {
         direction: SplitDirection,
-        /// Fraction of the axis given to `first` (0..1). Always 0.5 today
-        /// -- kept in the tree so divider-dragging can exist later without
-        /// reshaping anything.
+        /// Fraction of the axis given to `first` (0..1). Starts at 0.5;
+        /// changed by dragging the divider.
         ratio: f32,
         first: Box<PaneNode>,
         second: Box<PaneNode>,
@@ -335,30 +352,65 @@ impl PaneNode {
     // leaf can't be expressed through a mutable borrow without a
     // placeholder node, and `Pane` has no cheap placeholder to offer.
 
-    /// Compute every pane's pixel rectangle (and each divider gap's) for
+    /// Compute every pane's pixel rectangle (and each divider's) for
     /// this subtree laid out inside `rect`. Pure function of the tree, so
     /// rendering and click hit-testing can both call it and always agree.
-    pub fn layout(&self, rect: PaneRect, gap: f32, panes: &mut Vec<(u64, PaneRect)>, dividers: &mut Vec<PaneRect>) {
+    /// `path` is the running tree address of this node (see
+    /// `DividerInfo::path`); callers start with an empty one.
+    pub fn layout(&self, rect: PaneRect, gap: f32, path: &mut Vec<bool>, panes: &mut Vec<(u64, PaneRect)>, dividers: &mut Vec<DividerInfo>) {
         match self {
             PaneNode::Leaf(p) => panes.push((p.id, rect)),
-            PaneNode::Split { direction, ratio, first, second } => match direction {
-                SplitDirection::Vertical => {
-                    let w1 = ((rect.w - gap) * ratio).floor();
-                    let first_rect = PaneRect { x: rect.x, y: rect.y, w: w1, h: rect.h };
-                    let divider = PaneRect { x: rect.x + w1, y: rect.y, w: gap, h: rect.h };
-                    let second_rect = PaneRect { x: rect.x + w1 + gap, y: rect.y, w: rect.w - w1 - gap, h: rect.h };
-                    dividers.push(divider);
-                    first.layout(first_rect, gap, panes, dividers);
-                    second.layout(second_rect, gap, panes, dividers);
-                }
-                SplitDirection::Horizontal => {
-                    let h1 = ((rect.h - gap) * ratio).floor();
-                    let first_rect = PaneRect { x: rect.x, y: rect.y, w: rect.w, h: h1 };
-                    let divider = PaneRect { x: rect.x, y: rect.y + h1, w: rect.w, h: gap };
-                    let second_rect = PaneRect { x: rect.x, y: rect.y + h1 + gap, w: rect.w, h: rect.h - h1 - gap };
-                    dividers.push(divider);
-                    first.layout(first_rect, gap, panes, dividers);
-                    second.layout(second_rect, gap, panes, dividers);
+            PaneNode::Split { direction, ratio, first, second } => {
+                let (first_rect, divider_rect, second_rect) = match direction {
+                    SplitDirection::Vertical => {
+                        let w1 = ((rect.w - gap) * ratio).floor();
+                        (
+                            PaneRect { x: rect.x, y: rect.y, w: w1, h: rect.h },
+                            PaneRect { x: rect.x + w1, y: rect.y, w: gap, h: rect.h },
+                            PaneRect { x: rect.x + w1 + gap, y: rect.y, w: rect.w - w1 - gap, h: rect.h },
+                        )
+                    }
+                    SplitDirection::Horizontal => {
+                        let h1 = ((rect.h - gap) * ratio).floor();
+                        (
+                            PaneRect { x: rect.x, y: rect.y, w: rect.w, h: h1 },
+                            PaneRect { x: rect.x, y: rect.y + h1, w: rect.w, h: gap },
+                            PaneRect { x: rect.x, y: rect.y + h1 + gap, w: rect.w, h: rect.h - h1 - gap },
+                        )
+                    }
+                };
+                dividers.push(DividerInfo {
+                    path: path.clone(),
+                    direction: *direction,
+                    region: rect,
+                    rect: divider_rect,
+                });
+                path.push(false);
+                first.layout(first_rect, gap, path, panes, dividers);
+                path.pop();
+                path.push(true);
+                second.layout(second_rect, gap, path, panes, dividers);
+                path.pop();
+            }
+        }
+    }
+
+    /// Set the ratio of the split node addressed by `path` (see
+    /// `DividerInfo::path`). Silently does nothing if the path no longer
+    /// leads to a split -- the tree may have changed shape since the path
+    /// was computed, and a stale drag should drop dead rather than
+    /// resize some unrelated node.
+    pub fn set_ratio(&mut self, path: &[bool], new_ratio: f32) {
+        match self {
+            PaneNode::Leaf(_) => {}
+            PaneNode::Split { ratio, first, second, .. } => match path.split_first() {
+                None => *ratio = new_ratio.clamp(0.05, 0.95),
+                Some((&step, rest)) => {
+                    if step {
+                        second.set_ratio(rest, new_ratio);
+                    } else {
+                        first.set_ratio(rest, new_ratio);
+                    }
                 }
             },
         }
@@ -503,11 +555,18 @@ impl Tab {
     }
 
     /// Every pane's rect (and each divider's) laid out inside `rect`.
-    pub fn layout(&self, rect: PaneRect, gap: f32) -> (Vec<(u64, PaneRect)>, Vec<PaneRect>) {
+    pub fn layout(&self, rect: PaneRect, gap: f32) -> (Vec<(u64, PaneRect)>, Vec<DividerInfo>) {
         let mut panes = Vec::new();
         let mut dividers = Vec::new();
-        self.root().layout(rect, gap, &mut panes, &mut dividers);
+        let mut path = Vec::new();
+        self.root().layout(rect, gap, &mut path, &mut panes, &mut dividers);
         (panes, dividers)
+    }
+
+    /// Set the ratio of the split addressed by `path` -- see
+    /// `PaneNode::set_ratio`.
+    pub fn set_split_ratio(&mut self, path: &[bool], ratio: f32) {
+        self.root_mut().set_ratio(path, ratio);
     }
 
     /// What the tab strip shows for this tab: the focused pane's title.
@@ -790,6 +849,47 @@ mod tests {
         assert_eq!(removed.id, 11);
         let ids: Vec<u64> = tab.root().panes().iter().map(|p| p.id).collect();
         assert_eq!(ids, vec![10, 12]);
+    }
+
+    #[test]
+    fn set_split_ratio_moves_the_divider() {
+        let mut tab = Tab::new(1, dummy_pane(10));
+        tab.split_focused(SplitDirection::Vertical, dummy_pane(11));
+        tab.set_split_ratio(&[], 0.25);
+        let (panes, dividers) = tab.layout(rect(202.0, 100.0), 2.0);
+        let (_, first) = panes[0];
+        // (202 - 2) * 0.25 = 50
+        assert_eq!(first.w, 50.0);
+        assert_eq!(dividers[0].rect.x, 50.0);
+        assert_eq!(dividers[0].region, rect(202.0, 100.0));
+    }
+
+    #[test]
+    fn set_split_ratio_reaches_nested_splits_by_path() {
+        let mut tab = Tab::new(1, dummy_pane(10));
+        tab.split_focused(SplitDirection::Vertical, dummy_pane(11)); // 10 | 11
+        tab.split_focused(SplitDirection::Horizontal, dummy_pane(12)); // 10 | (11 / 12)
+        let (_, dividers) = tab.layout(rect(202.0, 102.0), 2.0);
+        assert_eq!(dividers[0].path, Vec::<bool>::new(), "root split");
+        assert_eq!(dividers[1].path, vec![true], "nested split lives in the root's second branch");
+
+        tab.set_split_ratio(&[true], 0.25);
+        let (panes, _) = tab.layout(rect(202.0, 102.0), 2.0);
+        let (id, top_right) = panes[1];
+        assert_eq!(id, 11);
+        // (102 - 2) * 0.25 = 25
+        assert_eq!(top_right.h, 25.0);
+    }
+
+    #[test]
+    fn set_split_ratio_clamps_and_survives_stale_paths() {
+        let mut tab = Tab::new(1, dummy_pane(10));
+        tab.split_focused(SplitDirection::Vertical, dummy_pane(11));
+        tab.set_split_ratio(&[], 0.0);
+        let (panes, _) = tab.layout(rect(202.0, 100.0), 2.0);
+        assert!(panes[0].1.w > 0.0, "ratio clamps above zero so a pane can't vanish");
+        // A path into a branch that is a leaf, not a split: must be a no-op.
+        tab.set_split_ratio(&[false, true], 0.9);
     }
 
     #[test]
