@@ -538,6 +538,32 @@ mod tests {
     }
 
     #[test]
+    fn growing_after_output_in_between_does_not_resurrect_a_stale_row() {
+        // The bug this guards against: a pane-resize drag shrinks a pane
+        // by one row (hiding "11111"), the shell then prints a new line
+        // ("33333") before the drag grows back out. The naive fix (a bare
+        // pending-rows counter) still pops whatever is now at the back of
+        // scrollback -- "33333", already visible one row up -- duplicating
+        // it at the top instead of leaving the real "11111" retired to
+        // scrollback where it belongs.
+        let mut term = Term::new(5, 2, 10_000);
+        term.advance(b"11111\r\n22222");
+        term.resize(5, 1); // hides "11111" into scrollback
+        assert_eq!(term.grid().cell(0, 0).c, '2');
+
+        term.advance(b"\r\n33333"); // organic scroll: "22222" -> scrollback, cursor row now "33333"
+        assert_eq!(term.grid().cell(0, 0).c, '3');
+        assert_eq!(term.grid().scrollback.len(), 2);
+
+        term.resize(5, 2); // grow back out: must pad blank at the bottom, not resurrect "22222"/"33333"
+        assert_eq!(term.grid().cell(0, 0).c, '3');
+        assert_eq!(term.grid().cell(1, 0).c, ' ');
+        assert_eq!(term.grid().scrollback.len(), 2);
+        assert_eq!(term.grid().scrollback[0][0].c, '1');
+        assert_eq!(term.grid().scrollback[1][0].c, '2');
+    }
+
+    #[test]
     fn scrollback_line_at_walks_history_then_live_grid() {
         let mut term = Term::new(5, 2, 10_000);
         // Push five lines through a 2-row screen so scrollback accumulates

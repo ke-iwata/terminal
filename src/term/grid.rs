@@ -50,6 +50,21 @@ pub struct Grid {
     wrapped: Vec<bool>,
     pub scrollback: VecDeque<Row>,
     pub scrollback_limit: usize,
+    /// How many rows at the back of `scrollback` were hidden by a resize
+    /// shrink a moment ago and are still safe for a subsequent grow to
+    /// pull back undisturbed. Paired with `scrollback_len_when_pending`,
+    /// which pins down the exact `scrollback.len()` those rows were
+    /// pushed at: if anything else has touched `scrollback` since (real
+    /// output scrolling off via `scroll_up`, or the cap evicting from the
+    /// front), the length no longer matches and the pending rows are
+    /// treated as gone rather than popped. Without this a grow following
+    /// a shrink would otherwise blindly pop whatever is currently at the
+    /// back of `scrollback` -- which, if the shell printed anything in
+    /// between, is real output that already scrolled off for good, not
+    /// this resize's own hidden row -- resurrecting already-displayed
+    /// text at the top of the pane.
+    rows_pending_restore: usize,
+    scrollback_len_when_pending: usize,
 }
 
 impl Grid {
@@ -61,6 +76,8 @@ impl Grid {
             wrapped: vec![false; rows],
             scrollback: VecDeque::new(),
             scrollback_limit,
+            rows_pending_restore: 0,
+            scrollback_len_when_pending: 0,
         }
     }
 
@@ -289,6 +306,8 @@ impl Grid {
             if self.scrollback.len() > self.scrollback_limit {
                 self.scrollback.pop_front();
             }
+            self.rows_pending_restore += 1;
+            self.scrollback_len_when_pending = self.scrollback.len();
             cursor_row = cursor_row.saturating_sub(1);
         }
         while self.lines.len() < rows {
@@ -296,16 +315,22 @@ impl Grid {
             // a row stored at an old width can't just be spliced back in
             // here -- that would leave `lines` with rows of mismatched
             // length, corrupting every column-indexed access after it.
-            // Only pull from scrollback when it's still at the current
-            // width (the common case: a plain row-count-only resize);
-            // otherwise pad with a blank row like normal.
             let matches_width = self.scrollback.back().is_some_and(|r| r.len() == self.cols);
-            if matches_width {
+            // `scrollback.len()` must still be exactly what it was right
+            // after the pending rows were pushed -- if it's higher (real
+            // output scrolled off in between) or lower (the cap evicted
+            // from the front), something else has touched `scrollback`
+            // since, and the tail is no longer guaranteed to be ours.
+            let pending_intact = self.rows_pending_restore > 0 && self.scrollback.len() == self.scrollback_len_when_pending;
+            if pending_intact && matches_width {
                 let row = self.scrollback.pop_back().expect("checked Some above");
                 self.lines.insert(0, row);
                 self.wrapped.insert(0, false);
+                self.rows_pending_restore -= 1;
+                self.scrollback_len_when_pending -= 1;
                 cursor_row += 1;
             } else {
+                self.rows_pending_restore = 0;
                 // Padding with a blank row at the bottom doesn't shift any
                 // existing row's index.
                 self.lines.push(self.blank_row());
