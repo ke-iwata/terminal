@@ -123,6 +123,11 @@ struct App {
     /// to release. Mutually exclusive with `dragging_pane` -- a press
     /// starts one or the other, never both.
     dragging_divider: Option<tab::DividerInfo>,
+    /// A mouse button currently held down inside a pane whose application
+    /// asked for mouse reporting: (pane id, xterm button code, SGR
+    /// encoding flag, last cell reported) -- the last cell lets motion be
+    /// reported only when the pointer actually crosses into a new cell.
+    mouse_report_drag: Option<(u64, u8, bool, (u16, u16))>,
 }
 
 impl App {
@@ -145,6 +150,7 @@ impl App {
             presented_once: false,
             dragging_pane: None,
             dragging_divider: None,
+            mouse_report_drag: None,
         }
     }
 
@@ -487,6 +493,43 @@ impl App {
         let view_row = (((y - rect.y) / cell_h).floor().max(0.0) as usize).min(grid.rows.saturating_sub(1));
         let distance = grid.distance_from_bottom(view_row, pane.scroll_offset);
         Some(tab::GridPoint { distance, col })
+    }
+
+    /// The 1-based cell coordinates of a window position inside pane
+    /// `pane_id`'s viewport, clamped to its bounds.
+    fn pane_cell_coords(&self, pane_id: u64, x: f32, y: f32) -> Option<(u16, u16)> {
+        let renderer = self.renderer.as_ref()?;
+        let (cell_w, cell_h) = renderer.cell_size();
+        let (_, rect) = self.pane_rects().into_iter().find(|(id, _)| *id == pane_id)?;
+        let pane = self.active_tab().root().pane(pane_id)?;
+        let col = (((x - rect.x) / cell_w).floor().max(0.0) as usize).min(pane.term.cols() - 1) as u16 + 1;
+        let row = (((y - rect.y) / cell_h).floor().max(0.0) as usize).min(pane.term.rows() - 1) as u16 + 1;
+        Some((col, row))
+    }
+
+    /// If the pane under the window position has mouse reporting enabled
+    /// (and the user isn't holding Option, the "I want a local selection
+    /// anyway" bypass -- same convention as iTerm2), returns everything
+    /// needed to report an event there: (pane id, col, row, mode, SGR).
+    fn mouse_report_target(&self, x: f32, y: f32) -> Option<(u64, u16, u16, term::MouseMode, bool)> {
+        if self.modifiers.alt_key() {
+            return None;
+        }
+        let pane_id = self.pane_at(x, y)?;
+        let pane = self.active_tab().root().pane(pane_id)?;
+        let mode = pane.term.modes.mouse_mode;
+        if mode == term::MouseMode::Off {
+            return None;
+        }
+        let (col, row) = self.pane_cell_coords(pane_id, x, y)?;
+        Some((pane_id, col, row, mode, pane.term.modes.mouse_sgr))
+    }
+
+    /// Write an encoded mouse event (if any) to `pane_id`'s pty.
+    fn send_mouse_event(&self, pane_id: u64, bytes: Option<Vec<u8>>) {
+        let Some(bytes) = bytes else { return };
+        let Some(pane) = self.active_tab().root().pane(pane_id) else { return };
+        write_all_to_pty(pane.pty_master.as_fd(), &bytes);
     }
 
     /// If the current cursor position lands on a URL (see
@@ -1069,6 +1112,19 @@ impl ApplicationHandler<UserEvent> for App {
                     MouseScrollDelta::LineDelta(_, y) => y,
                     MouseScrollDelta::PixelDelta(pos) => (pos.y as f32) / cell_h,
                 };
+                if lines == 0.0 {
+                    return;
+                }
+                let n = (lines.abs().ceil() as usize).min(30);
+                // An app that asked for mouse reporting gets the wheel as
+                // button 64/65 events and handles scrolling itself.
+                if let Some((pane_id, col, row, _, sgr)) = self.mouse_report_target(self.cursor_pos.0, self.cursor_pos.1) {
+                    let button = if lines > 0.0 { 64 } else { 65 };
+                    for _ in 0..n {
+                        self.send_mouse_event(pane_id, input::encode_mouse(button, input::MouseEventKind::Press, col, row, sgr));
+                    }
+                    return;
+                }
                 // Scroll whatever pane is under the mouse (not the focused
                 // one) -- matching how iTerm2/macOS scroll views behave.
                 let pane_id = self
@@ -1078,13 +1134,25 @@ impl ApplicationHandler<UserEvent> for App {
                     return;
                 };
                 if pane.term.using_alt_screen() {
+                    // Full-screen apps that never asked for the mouse
+                    // (plain `less`, `man`) still expect the wheel to do
+                    // something -- translate each tick into an arrow key,
+                    // the same fallback every other terminal ships.
+                    let seq: &[u8] = match (lines > 0.0, pane.term.modes.app_cursor_keys) {
+                        (true, false) => b"\x1b[A",
+                        (true, true) => b"\x1bOA",
+                        (false, false) => b"\x1b[B",
+                        (false, true) => b"\x1bOB",
+                    };
+                    let bytes: Vec<u8> = seq.iter().copied().cycle().take(seq.len() * n).collect();
+                    write_all_to_pty(pane.pty_master.as_fd(), &bytes);
                     return;
                 }
                 let max_offset = pane.term.grid().scrollback.len();
                 if lines > 0.0 {
-                    pane.scroll_offset = (pane.scroll_offset + lines.ceil() as usize).min(max_offset);
-                } else if lines < 0.0 {
-                    pane.scroll_offset = pane.scroll_offset.saturating_sub((-lines).ceil() as usize);
+                    pane.scroll_offset = (pane.scroll_offset + n).min(max_offset);
+                } else {
+                    pane.scroll_offset = pane.scroll_offset.saturating_sub(n);
                 }
                 if let Some(window) = &self.window {
                     window.request_redraw();
@@ -1094,6 +1162,23 @@ impl ApplicationHandler<UserEvent> for App {
                 self.cursor_pos = (position.x as f32, position.y as f32);
                 self.update_divider_drag();
                 self.update_selection();
+                // Motion with a button held, for apps in drag-reporting
+                // mode -- reported once per cell crossed, not per pixel.
+                if let Some((pane_id, code, sgr, last_cell)) = self.mouse_report_drag {
+                    let wants_motion = self
+                        .active_tab()
+                        .root()
+                        .pane(pane_id)
+                        .is_some_and(|p| p.term.modes.mouse_mode >= term::MouseMode::Drag);
+                    if wants_motion {
+                        if let Some(cell) = self.pane_cell_coords(pane_id, self.cursor_pos.0, self.cursor_pos.1) {
+                            if cell != last_cell {
+                                self.mouse_report_drag = Some((pane_id, code, sgr, cell));
+                                self.send_mouse_event(pane_id, input::encode_mouse(code, input::MouseEventKind::Drag, cell.0, cell.1, sgr));
+                            }
+                        }
+                    }
+                }
                 self.update_cursor_icon();
             }
             WindowEvent::MouseInput { state: ElementState::Pressed, button: MouseButton::Left, .. } => {
@@ -1109,6 +1194,17 @@ impl ApplicationHandler<UserEvent> for App {
                     // selection -- Cmd+drag was never a gesture to begin
                     // with, so there's nothing to preserve by falling
                     // through when the click isn't on a link either.
+                } else if let Some((pane_id, col, row, _, sgr)) = self.mouse_report_target(self.cursor_pos.0, self.cursor_pos.1) {
+                    // The app wants the mouse (vim, htop, ...): forward
+                    // the click instead of selecting locally. A click
+                    // still focuses the pane -- Option+click bypasses
+                    // reporting entirely for a local selection.
+                    if self.active_tab().focused != pane_id {
+                        self.active_tab_mut().focused = pane_id;
+                        self.last_status_refresh = None;
+                    }
+                    self.mouse_report_drag = Some((pane_id, 0, sgr, (col, row)));
+                    self.send_mouse_event(pane_id, input::encode_mouse(0, input::MouseEventKind::Press, col, row, sgr));
                 } else {
                     self.begin_selection();
                 }
@@ -1119,7 +1215,34 @@ impl ApplicationHandler<UserEvent> for App {
                     // of sync with the final size.
                     self.relayout_all_tabs(true);
                 }
+                if let Some((pane_id, code, sgr, last_cell)) = self.mouse_report_drag.take() {
+                    let (col, row) = self.pane_cell_coords(pane_id, self.cursor_pos.0, self.cursor_pos.1).unwrap_or(last_cell);
+                    self.send_mouse_event(pane_id, input::encode_mouse(code, input::MouseEventKind::Release, col, row, sgr));
+                }
                 self.end_selection();
+            }
+            WindowEvent::MouseInput { state, button: button @ (MouseButton::Right | MouseButton::Middle), .. } => {
+                // Right/middle buttons exist only for mouse-reporting apps;
+                // the terminal itself assigns them no local behavior.
+                let code = if button == MouseButton::Right { 2 } else { 1 };
+                match state {
+                    ElementState::Pressed => {
+                        if let Some((pane_id, col, row, _, sgr)) = self.mouse_report_target(self.cursor_pos.0, self.cursor_pos.1) {
+                            self.mouse_report_drag = Some((pane_id, code, sgr, (col, row)));
+                            self.send_mouse_event(pane_id, input::encode_mouse(code, input::MouseEventKind::Press, col, row, sgr));
+                        }
+                    }
+                    ElementState::Released => {
+                        if let Some((pane_id, held_code, sgr, last_cell)) = self.mouse_report_drag.take() {
+                            if held_code == code {
+                                let (col, row) = self.pane_cell_coords(pane_id, self.cursor_pos.0, self.cursor_pos.1).unwrap_or(last_cell);
+                                self.send_mouse_event(pane_id, input::encode_mouse(code, input::MouseEventKind::Release, col, row, sgr));
+                            } else {
+                                self.mouse_report_drag = Some((pane_id, held_code, sgr, last_cell));
+                            }
+                        }
+                    }
+                }
             }
             // A frame skipped while occluded (see `RenderOutcome::Skipped`)
             // is never retried on its own -- redraw as soon as the window

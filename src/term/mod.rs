@@ -15,6 +15,21 @@ pub struct Cursor {
     pub flags: CellFlags,
 }
 
+/// Which classes of mouse events the application asked to receive
+/// (xterm's nested tiers -- each level includes everything below it).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum MouseMode {
+    Off,
+    /// CSI ?1000 - button presses and releases.
+    Clicks,
+    /// CSI ?1002 - clicks plus motion while a button is held.
+    Drag,
+    /// CSI ?1003 - clicks, drags, and all motion. (Motion without a
+    /// button held isn't forwarded by this terminal yet; apps requesting
+    /// 1003 still get everything 1002 would give them.)
+    Motion,
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct TermModes {
     /// DECCKM (CSI ?1) - arrow keys send SS3 sequences instead of CSI.
@@ -26,6 +41,10 @@ pub struct TermModes {
     /// typed input (zsh highlights it and, crucially, doesn't execute
     /// embedded newlines until Enter is actually pressed).
     pub bracketed_paste: bool,
+    pub mouse_mode: MouseMode,
+    /// CSI ?1006 - SGR mouse encoding (coordinates as decimal text, no
+    /// 223-column limit) instead of the legacy byte-offset encoding.
+    pub mouse_sgr: bool,
 }
 
 impl Default for TermModes {
@@ -34,6 +53,8 @@ impl Default for TermModes {
             app_cursor_keys: false,
             show_cursor: true,
             bracketed_paste: false,
+            mouse_mode: MouseMode::Off,
+            mouse_sgr: false,
         }
     }
 }
@@ -635,6 +656,20 @@ mod tests {
         assert!(term.modes.bracketed_paste);
         term.advance(b"\x1b[?2004l");
         assert!(!term.modes.bracketed_paste);
+    }
+
+    #[test]
+    fn mouse_reporting_modes_toggle() {
+        let mut term = Term::new(10, 5, 10_000);
+        assert_eq!(term.modes.mouse_mode, MouseMode::Off);
+        term.advance(b"\x1b[?1000h");
+        assert_eq!(term.modes.mouse_mode, MouseMode::Clicks);
+        term.advance(b"\x1b[?1002h\x1b[?1006h");
+        assert_eq!(term.modes.mouse_mode, MouseMode::Drag);
+        assert!(term.modes.mouse_sgr);
+        term.advance(b"\x1b[?1002l\x1b[?1006l");
+        assert_eq!(term.modes.mouse_mode, MouseMode::Off);
+        assert!(!term.modes.mouse_sgr);
     }
 
     #[test]

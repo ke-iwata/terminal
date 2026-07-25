@@ -1,6 +1,6 @@
 use super::color::Color;
 use super::grid::CellFlags;
-use super::Term;
+use super::{MouseMode, Term};
 use vte::{Params, ParamsIter, Perform};
 
 impl Perform for Term {
@@ -204,8 +204,13 @@ impl Term {
                 47 => self.set_alt_screen(set, false),
                 1049 => self.set_alt_screen(set, true),
                 2004 => self.modes.bracketed_paste = set,
-                // Focus events, sync updates, mouse reporting, etc: not
-                // implemented, but must not panic on receipt.
+                1000 => self.modes.mouse_mode = if set { MouseMode::Clicks } else { MouseMode::Off },
+                1002 => self.modes.mouse_mode = if set { MouseMode::Drag } else { MouseMode::Off },
+                1003 => self.modes.mouse_mode = if set { MouseMode::Motion } else { MouseMode::Off },
+                1006 => self.modes.mouse_sgr = set,
+                // 1005/1015 (UTF-8/urxvt mouse encodings), focus events,
+                // sync updates, etc: not implemented, but must not panic
+                // on receipt.
                 _ => {}
             }
         }

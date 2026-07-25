@@ -124,6 +124,41 @@ fn cursor_key_seq(final_byte: u8, app_cursor_keys: bool) -> Vec<u8> {
     }
 }
 
+/// What a reported mouse event is: a button going down, coming back up,
+/// or the pointer moving while one is held. Wheel ticks are always
+/// `Press` (they have no release).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MouseEventKind {
+    Press,
+    Release,
+    Drag,
+}
+
+/// Encode one mouse event for the application, in whichever of the two
+/// xterm encodings it selected. `button` is the xterm button code (0
+/// left, 1 middle, 2 right, 64 wheel-up, 65 wheel-down); `col`/`row` are
+/// 1-based cell coordinates within the pane's viewport.
+///
+/// SGR (CSI ?1006): `ESC[<b;col;rowM` (press/drag) or `...m` (release) --
+/// coordinates as decimal text, so any pane size works.
+/// Legacy: `ESC[M` + three bytes offset by 32 -- coordinates past 223
+/// can't be represented, so those events are dropped (`None`) rather
+/// than sent corrupted.
+pub fn encode_mouse(button: u8, kind: MouseEventKind, col: u16, row: u16, sgr: bool) -> Option<Vec<u8>> {
+    let b = button + if kind == MouseEventKind::Drag { 32 } else { 0 };
+    if sgr {
+        let suffix = if kind == MouseEventKind::Release { 'm' } else { 'M' };
+        return Some(format!("\x1b[<{b};{col};{row}{suffix}").into_bytes());
+    }
+    if col > 223 || row > 223 {
+        return None;
+    }
+    // Legacy encoding can't say *which* button was released -- code 3
+    // means "a button came up".
+    let b = if kind == MouseEventKind::Release { 3 } else { b };
+    Some(vec![0x1b, b'[', b'M', 32 + b, 32 + col as u8, 32 + row as u8])
+}
+
 fn encode_control_char(s: &str) -> Option<u8> {
     let ch = s.chars().next()?;
     if ch.is_ascii_alphabetic() {
@@ -282,6 +317,45 @@ mod tests {
         let key = Key::Character("a".into());
         let bytes = encode_key(&key, Some("a"), true, ModifiersState::empty(), &modes(false));
         assert_eq!(bytes, Some(b"a".to_vec()));
+    }
+
+    #[test]
+    fn sgr_mouse_encoding() {
+        assert_eq!(
+            encode_mouse(0, MouseEventKind::Press, 3, 7, true),
+            Some(b"\x1b[<0;3;7M".to_vec())
+        );
+        assert_eq!(
+            encode_mouse(0, MouseEventKind::Release, 3, 7, true),
+            Some(b"\x1b[<0;3;7m".to_vec())
+        );
+        assert_eq!(
+            encode_mouse(0, MouseEventKind::Drag, 4, 7, true),
+            Some(b"\x1b[<32;4;7M".to_vec())
+        );
+        assert_eq!(
+            encode_mouse(64, MouseEventKind::Press, 500, 100, true),
+            Some(b"\x1b[<64;500;100M".to_vec()),
+            "SGR has no coordinate cap"
+        );
+    }
+
+    #[test]
+    fn legacy_mouse_encoding() {
+        assert_eq!(
+            encode_mouse(0, MouseEventKind::Press, 1, 1, false),
+            Some(vec![0x1b, b'[', b'M', 32, 33, 33])
+        );
+        // Legacy releases can't name the button: code 3.
+        assert_eq!(
+            encode_mouse(2, MouseEventKind::Release, 1, 1, false),
+            Some(vec![0x1b, b'[', b'M', 35, 33, 33])
+        );
+        assert_eq!(
+            encode_mouse(0, MouseEventKind::Press, 300, 1, false),
+            None,
+            "legacy encoding drops out-of-range coordinates"
+        );
     }
 
     #[test]
