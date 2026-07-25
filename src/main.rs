@@ -901,6 +901,8 @@ impl ApplicationHandler<UserEvent> for App {
                 if generation != pane.pty_generation {
                     return;
                 }
+                let was_alt = pane.term.using_alt_screen();
+                let scrollback_before = pane.term.grid().scrollback.len();
                 pane.term.advance(&bytes);
                 // Answer any queries the output contained (DSR cursor
                 // reports, DA) -- the querying application is blocked
@@ -909,11 +911,38 @@ impl ApplicationHandler<UserEvent> for App {
                 if !responses.is_empty() {
                     write_all_to_pty(pane.pty_master.as_fd(), &responses);
                 }
-                pane.scroll_offset = 0;
-                // The content a selection pointed at may have just
-                // scrolled, changed, or stopped existing -- see the
-                // field doc on `Pane::selection`.
-                pane.selection = None;
+                if was_alt || pane.term.using_alt_screen() {
+                    // Full-screen apps redraw arbitrarily; there's no
+                    // stable content for a scroll position or selection
+                    // to stay anchored to.
+                    pane.scroll_offset = 0;
+                    pane.selection = None;
+                } else {
+                    // New output pushes lines into scrollback, moving all
+                    // existing content further from the live bottom. Both
+                    // the scroll position (when scrolled back at all) and
+                    // any selection are distance-from-bottom values, so
+                    // shifting them by the same amount keeps them pinned
+                    // to the text the user was looking at -- reading old
+                    // logs during a `tail -f` no longer gets yanked to
+                    // the bottom, and a selection survives new output.
+                    // At the bottom (offset 0), keep following the tail.
+                    let scrollback = pane.term.grid().scrollback.len();
+                    let delta = scrollback.saturating_sub(scrollback_before);
+                    if pane.scroll_offset > 0 {
+                        pane.scroll_offset = (pane.scroll_offset + delta).min(scrollback);
+                    }
+                    if let Some(selection) = &mut pane.selection {
+                        selection.anchor.distance += delta;
+                        selection.cursor.distance += delta;
+                        // Drop it once the text it covered has fallen out
+                        // of scrollback entirely.
+                        let reachable = scrollback + pane.term.rows();
+                        if selection.anchor.distance >= reachable || selection.cursor.distance >= reachable {
+                            pane.selection = None;
+                        }
+                    }
+                }
                 // Unlike selection, a search stays open across new
                 // output -- just refreshed against it (see the field doc
                 // on `Pane::search`) rather than cleared. Doesn't jump the

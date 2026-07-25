@@ -183,10 +183,13 @@ pub struct Pane {
     /// foreground process's name while one is running (e.g. "vim"), the
     /// shell's own name otherwise. Refreshed opportunistically on redraw.
     pub title: String,
-    /// The current click-drag text selection, if any. Cleared whenever
-    /// this pane's content changes underneath it (new pty output) since
-    /// there's no cheap way to know whether the selected text moved,
-    /// shrank, or still exists at all.
+    /// The current click-drag text selection, if any. Endpoints are
+    /// distance-from-bottom values, so when new output pushes lines into
+    /// scrollback the event loop shifts them by the same amount to keep
+    /// the selection pinned to its text (see `main.rs`'s `PtyData`
+    /// handler); it's dropped when that text falls out of scrollback, or
+    /// on any alternate-screen output (full-screen apps redraw
+    /// arbitrarily -- nothing stable to stay anchored to).
     pub selection: Option<Selection>,
     /// The scrollback search bar, open (and owning keyboard focus) when
     /// `Some`. Unlike `selection`, left open across new pty output --
