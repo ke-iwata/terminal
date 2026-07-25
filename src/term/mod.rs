@@ -6,6 +6,16 @@ use color::Color;
 use grid::{Cell, CellFlags, Grid};
 use unicode_width::UnicodeWidthChar;
 
+/// DECSCUSR (CSI Ps SP q) cursor shape. Blink variants map to their
+/// steady shape -- this terminal doesn't blink.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CursorShape {
+    #[default]
+    Block,
+    Underline,
+    Bar,
+}
+
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Cursor {
     pub row: usize,
@@ -81,6 +91,9 @@ pub struct Term {
     scroll_bottom: usize,
     scrollback_limit: usize,
     pub title: String,
+    /// DECSCUSR shape -- vim sets a bar in insert mode, underline for
+    /// replace, block otherwise.
+    pub cursor_shape: CursorShape,
     /// Bytes the terminal owes the application in response to a query
     /// (DSR cursor-position reports, DA identification). The parser can't
     /// write to the pty itself, so responses queue here and the event
@@ -113,6 +126,7 @@ impl Term {
             scroll_bottom: rows - 1,
             scrollback_limit,
             title: String::new(),
+            cursor_shape: CursorShape::default(),
             responses: Vec::new(),
         }
     }
@@ -484,6 +498,7 @@ impl Term {
         self.scroll_top = 0;
         self.scroll_bottom = rows - 1;
         self.title.clear();
+        self.cursor_shape = CursorShape::default();
     }
 }
 
@@ -656,6 +671,22 @@ mod tests {
         assert!(term.modes.bracketed_paste);
         term.advance(b"\x1b[?2004l");
         assert!(!term.modes.bracketed_paste);
+    }
+
+    #[test]
+    fn decscusr_sets_cursor_shape() {
+        let mut term = Term::new(10, 5, 10_000);
+        assert_eq!(term.cursor_shape, CursorShape::Block);
+        term.advance(b"\x1b[5 q"); // blinking bar
+        assert_eq!(term.cursor_shape, CursorShape::Bar);
+        term.advance(b"\x1b[4 q"); // steady underline
+        assert_eq!(term.cursor_shape, CursorShape::Underline);
+        term.advance(b"\x1b[0 q"); // default
+        assert_eq!(term.cursor_shape, CursorShape::Block);
+        // The intermediate byte must not leak into plain CSI dispatch: a
+        // bare CSI q is not DECSCUSR.
+        term.advance(b"\x1b[5 q\x1b[q");
+        assert_eq!(term.cursor_shape, CursorShape::Bar);
     }
 
     #[test]

@@ -1,6 +1,6 @@
 use super::color::Color;
 use super::grid::CellFlags;
-use super::{MouseMode, Term};
+use super::{CursorShape, MouseMode, Term};
 use vte::{Params, ParamsIter, Perform};
 
 impl Perform for Term {
@@ -36,6 +36,21 @@ impl Perform for Term {
     fn csi_dispatch(&mut self, params: &Params, intermediates: &[u8], _ignore: bool, action: char) {
         if intermediates.first() == Some(&b'?') {
             self.csi_private_mode(params, action);
+            return;
+        }
+        // DECSCUSR: CSI Ps SP q -- cursor shape. Blink variants (odd
+        // codes) map to their steady shape; 0 means "default".
+        if intermediates == b" " && action == 'q' {
+            let ps = params.iter().next().and_then(|s| s.first().copied()).unwrap_or(0);
+            self.cursor_shape = match ps {
+                0..=2 => CursorShape::Block,
+                3 | 4 => CursorShape::Underline,
+                5 | 6 => CursorShape::Bar,
+                _ => return,
+            };
+            return;
+        }
+        if !intermediates.is_empty() {
             return;
         }
 

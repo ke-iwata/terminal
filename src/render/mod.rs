@@ -390,11 +390,17 @@ impl Renderer {
             let cursor_y = rect.y + term.cursor.row as f32 * ch;
             // Unfocused panes keep a faint cursor: enough to see where
             // each shell is sitting, unmistakably different from the pane
-            // that will actually receive the next keystroke.
-            let alpha = if focused { 0.45 } else { 0.18 };
+            // that will actually receive the next keystroke. Thin shapes
+            // (bar/underline) get a stronger alpha -- at block's 0.45
+            // a 2px sliver would be nearly invisible.
+            let (pos, size, alpha) = match term.cursor_shape {
+                crate::term::CursorShape::Block => ([cursor_x, cursor_y], [cw, ch], if focused { 0.45 } else { 0.18 }),
+                crate::term::CursorShape::Underline => ([cursor_x, cursor_y + ch - 2.0], [cw, 2.0], if focused { 0.9 } else { 0.35 }),
+                crate::term::CursorShape::Bar => ([cursor_x, cursor_y], [2.0, ch], if focused { 0.9 } else { 0.35 }),
+            };
             instances.push(Instance {
-                pos: [cursor_x, cursor_y],
-                size: [cw, ch],
+                pos,
+                size,
                 uv_min: self.atlas.white_uv,
                 uv_max: self.atlas.white_uv,
                 color: [1.0, 1.0, 1.0, alpha],
