@@ -20,6 +20,9 @@ pub fn encode_key(
     }
 
     if let Key::Named(named) = logical_key {
+        if let Some(seq) = encode_modified_named_key(*named, mods) {
+            return Some(seq);
+        }
         if let Some(seq) = encode_named_key(*named, modes.app_cursor_keys) {
             return Some(seq);
         }
@@ -42,6 +45,37 @@ pub fn encode_key(
         }
     }
 
+    None
+}
+
+/// macOS-style line navigation, translated to the readline/zle bindings
+/// every shell understands out of the box (emacs keymap, the default in
+/// zsh and bash) -- the same translations iTerm2's default profile ships:
+///
+///   Cmd+Left/Right      -> Ctrl+A / Ctrl+E   (line start / line end)
+///   Cmd+Backspace       -> Ctrl+U            (kill to line start)
+///   Option+Left/Right   -> ESC b / ESC f     (word back / word forward)
+///   Option+Backspace    -> ESC DEL           (kill word backward)
+///
+/// Emitting the emacs bindings rather than private CSI sequences means no
+/// shell configuration is needed for these to work.
+fn encode_modified_named_key(named: NamedKey, mods: ModifiersState) -> Option<Vec<u8>> {
+    if mods.super_key() {
+        return match named {
+            NamedKey::ArrowLeft => Some(vec![0x01]),
+            NamedKey::ArrowRight => Some(vec![0x05]),
+            NamedKey::Backspace => Some(vec![0x15]),
+            _ => None,
+        };
+    }
+    if mods.alt_key() {
+        return match named {
+            NamedKey::ArrowLeft => Some(b"\x1bb".to_vec()),
+            NamedKey::ArrowRight => Some(b"\x1bf".to_vec()),
+            NamedKey::Backspace => Some(vec![0x1b, 0x7f]),
+            _ => None,
+        };
+    }
     None
 }
 
@@ -182,6 +216,51 @@ mod tests {
         assert_eq!(
             encode_key(&Key::Named(NamedKey::F12), None, true, ModifiersState::empty(), &m),
             Some(b"\x1b[24~".to_vec())
+        );
+    }
+
+    #[test]
+    fn cmd_arrows_jump_to_line_start_and_end() {
+        let m = modes(false);
+        assert_eq!(
+            encode_key(&Key::Named(NamedKey::ArrowLeft), None, true, ModifiersState::SUPER, &m),
+            Some(vec![0x01]) // Ctrl+A
+        );
+        assert_eq!(
+            encode_key(&Key::Named(NamedKey::ArrowRight), None, true, ModifiersState::SUPER, &m),
+            Some(vec![0x05]) // Ctrl+E
+        );
+        assert_eq!(
+            encode_key(&Key::Named(NamedKey::Backspace), None, true, ModifiersState::SUPER, &m),
+            Some(vec![0x15]) // Ctrl+U
+        );
+    }
+
+    #[test]
+    fn option_arrows_jump_by_word() {
+        let m = modes(false);
+        assert_eq!(
+            encode_key(&Key::Named(NamedKey::ArrowLeft), None, true, ModifiersState::ALT, &m),
+            Some(b"\x1bb".to_vec())
+        );
+        assert_eq!(
+            encode_key(&Key::Named(NamedKey::ArrowRight), None, true, ModifiersState::ALT, &m),
+            Some(b"\x1bf".to_vec())
+        );
+        assert_eq!(
+            encode_key(&Key::Named(NamedKey::Backspace), None, true, ModifiersState::ALT, &m),
+            Some(vec![0x1b, 0x7f])
+        );
+    }
+
+    #[test]
+    fn plain_arrows_are_unaffected_by_the_modifier_arms() {
+        // A bare arrow must still produce its CSI sequence, not fall into
+        // the Cmd/Option translations.
+        let m = modes(false);
+        assert_eq!(
+            encode_key(&Key::Named(NamedKey::ArrowLeft), None, true, ModifiersState::empty(), &m),
+            Some(vec![0x1b, b'[', b'D'])
         );
     }
 
