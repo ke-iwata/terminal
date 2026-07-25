@@ -151,6 +151,22 @@ impl Perform for Term {
             }
             's' => self.save_cursor(),
             'u' => self.restore_cursor(),
+            'n' => match p(&mut iter, 0) {
+                // DSR 5: device status -- report "operating normally".
+                5 => self.push_response(b"\x1b[0n"),
+                // DSR 6 (CPR): report the cursor position, 1-based. Shell
+                // integration snippets and TUI libraries block on this.
+                6 => {
+                    let (row, col) = (self.cursor.row + 1, self.cursor.col + 1);
+                    self.push_response(format!("\x1b[{row};{col}R").as_bytes());
+                }
+                _ => {}
+            },
+            'c' => {
+                // DA1: identify as a VT102-class terminal, the same
+                // minimal answer other emulators give when asked.
+                self.push_response(b"\x1b[?6c");
+            }
             _ => {}
         }
     }
@@ -174,6 +190,10 @@ impl Perform for Term {
 }
 
 impl Term {
+    fn push_response(&mut self, bytes: &[u8]) {
+        self.responses.extend_from_slice(bytes);
+    }
+
     fn csi_private_mode(&mut self, params: &Params, action: char) {
         let set = action == 'h';
         for param in params.iter() {
@@ -183,8 +203,9 @@ impl Term {
                 25 => self.modes.show_cursor = set,
                 47 => self.set_alt_screen(set, false),
                 1049 => self.set_alt_screen(set, true),
-                // Bracketed paste, focus events, sync updates, etc: not
-                // implemented in this MVP, but must not panic on receipt.
+                2004 => self.modes.bracketed_paste = set,
+                // Focus events, sync updates, mouse reporting, etc: not
+                // implemented, but must not panic on receipt.
                 _ => {}
             }
         }

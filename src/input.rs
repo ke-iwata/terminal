@@ -55,11 +55,26 @@ fn encode_named_key(named: NamedKey, app_cursor_keys: bool) -> Option<Vec<u8>> {
         NamedKey::ArrowDown => cursor_key_seq(b'B', app_cursor_keys),
         NamedKey::ArrowRight => cursor_key_seq(b'C', app_cursor_keys),
         NamedKey::ArrowLeft => cursor_key_seq(b'D', app_cursor_keys),
-        NamedKey::Home => b"\x1b[H".to_vec(),
-        NamedKey::End => b"\x1b[F".to_vec(),
+        // Home/End follow DECCKM like the arrows do (terminfo khome/kend
+        // are SS3 H / SS3 F for xterm-256color's application mode).
+        NamedKey::Home => cursor_key_seq(b'H', app_cursor_keys),
+        NamedKey::End => cursor_key_seq(b'F', app_cursor_keys),
         NamedKey::PageUp => b"\x1b[5~".to_vec(),
         NamedKey::PageDown => b"\x1b[6~".to_vec(),
         NamedKey::Delete => b"\x1b[3~".to_vec(),
+        NamedKey::Insert => b"\x1b[2~".to_vec(),
+        NamedKey::F1 => b"\x1bOP".to_vec(),
+        NamedKey::F2 => b"\x1bOQ".to_vec(),
+        NamedKey::F3 => b"\x1bOR".to_vec(),
+        NamedKey::F4 => b"\x1bOS".to_vec(),
+        NamedKey::F5 => b"\x1b[15~".to_vec(),
+        NamedKey::F6 => b"\x1b[17~".to_vec(),
+        NamedKey::F7 => b"\x1b[18~".to_vec(),
+        NamedKey::F8 => b"\x1b[19~".to_vec(),
+        NamedKey::F9 => b"\x1b[20~".to_vec(),
+        NamedKey::F10 => b"\x1b[21~".to_vec(),
+        NamedKey::F11 => b"\x1b[23~".to_vec(),
+        NamedKey::F12 => b"\x1b[24~".to_vec(),
         _ => return None,
     })
 }
@@ -81,6 +96,9 @@ fn encode_control_char(s: &str) -> Option<u8> {
         return Some((ch.to_ascii_uppercase() as u8) & 0x1f);
     }
     match ch {
+        // Ctrl+Space / Ctrl+@ -> NUL: emacs set-mark, a common tmux
+        // prefix -- without this the fallback sent a plain space.
+        ' ' | '@' => Some(0x00),
         '[' => Some(0x1b),
         '\\' => Some(0x1c),
         ']' => Some(0x1d),
@@ -97,7 +115,7 @@ mod tests {
     fn modes(app_cursor_keys: bool) -> TermModes {
         TermModes {
             app_cursor_keys,
-            show_cursor: true,
+            ..TermModes::default()
         }
     }
 
@@ -141,6 +159,43 @@ mod tests {
         let key = Key::Character("c".into());
         let bytes = encode_key(&key, None, true, ModifiersState::CONTROL, &modes(false));
         assert_eq!(bytes, Some(vec![0x03])); // Ctrl+C
+    }
+
+    #[test]
+    fn ctrl_space_sends_nul() {
+        let key = Key::Character(" ".into());
+        let bytes = encode_key(&key, Some(" "), true, ModifiersState::CONTROL, &modes(false));
+        assert_eq!(bytes, Some(vec![0x00]));
+    }
+
+    #[test]
+    fn function_keys_send_xterm_sequences() {
+        let m = modes(false);
+        assert_eq!(
+            encode_key(&Key::Named(NamedKey::F1), None, true, ModifiersState::empty(), &m),
+            Some(b"\x1bOP".to_vec())
+        );
+        assert_eq!(
+            encode_key(&Key::Named(NamedKey::F5), None, true, ModifiersState::empty(), &m),
+            Some(b"\x1b[15~".to_vec())
+        );
+        assert_eq!(
+            encode_key(&Key::Named(NamedKey::F12), None, true, ModifiersState::empty(), &m),
+            Some(b"\x1b[24~".to_vec())
+        );
+    }
+
+    #[test]
+    fn home_end_respect_decckm() {
+        let key = Key::Named(NamedKey::Home);
+        assert_eq!(
+            encode_key(&key, None, true, ModifiersState::empty(), &modes(false)),
+            Some(b"\x1b[H".to_vec())
+        );
+        assert_eq!(
+            encode_key(&key, None, true, ModifiersState::empty(), &modes(true)),
+            Some(b"\x1bOH".to_vec())
+        );
     }
 
     #[test]

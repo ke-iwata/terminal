@@ -763,6 +763,22 @@ fn display_path(path: &std::path::Path) -> String {
     path.display().to_string()
 }
 
+/// Write every byte of `bytes` to the pty, looping over short writes. A
+/// single `write(2)` may transfer less than requested (the pty's kernel
+/// buffer is only a few KB, and a signal can interrupt mid-write) --
+/// noticeable exactly when it matters most, pasting something large.
+fn write_all_to_pty(fd: std::os::fd::BorrowedFd, bytes: &[u8]) {
+    let mut written = 0;
+    while written < bytes.len() {
+        match nix::unistd::write(fd, &bytes[written..]) {
+            Ok(0) => break,
+            Ok(n) => written += n,
+            Err(nix::errno::Errno::EINTR) => continue,
+            Err(_) => break,
+        }
+    }
+}
+
 /// Write `text` to the system clipboard via `pbcopy`, macOS's own clipboard
 /// CLI -- simplest possible route to `NSPasteboard` without adding a
 /// clipboard crate as a dependency for what's otherwise a one-line job.
@@ -843,6 +859,13 @@ impl ApplicationHandler<UserEvent> for App {
                     return;
                 }
                 pane.term.advance(&bytes);
+                // Answer any queries the output contained (DSR cursor
+                // reports, DA) -- the querying application is blocked
+                // waiting on these.
+                let responses = pane.term.take_responses();
+                if !responses.is_empty() {
+                    write_all_to_pty(pane.pty_master.as_fd(), &responses);
+                }
                 pane.scroll_offset = 0;
                 // The content a selection pointed at may have just
                 // scrolled, changed, or stopped existing -- see the
@@ -998,7 +1021,19 @@ impl ApplicationHandler<UserEvent> for App {
                         if c.eq_ignore_ascii_case("v") {
                             if let Some(text) = paste_from_clipboard() {
                                 let pane = self.active_tab().focused_pane();
-                                let _ = nix::unistd::write(pane.pty_master.as_fd(), text.as_bytes());
+                                if pane.term.modes.bracketed_paste {
+                                    // Strip any end-guard sequence lurking
+                                    // inside the pasted text itself so
+                                    // adversarial clipboard content can't
+                                    // break out of the paste bracket and
+                                    // inject keystrokes.
+                                    let sanitized = text.replace("\x1b[201~", "");
+                                    write_all_to_pty(pane.pty_master.as_fd(), b"\x1b[200~");
+                                    write_all_to_pty(pane.pty_master.as_fd(), sanitized.as_bytes());
+                                    write_all_to_pty(pane.pty_master.as_fd(), b"\x1b[201~");
+                                } else {
+                                    write_all_to_pty(pane.pty_master.as_fd(), text.as_bytes());
+                                }
                                 self.active_tab_mut().focused_pane_mut().scroll_offset = 0;
                                 if let Some(window) = &self.window {
                                     window.request_redraw();
@@ -1017,7 +1052,7 @@ impl ApplicationHandler<UserEvent> for App {
                     &pane.term.modes,
                 );
                 if let Some(bytes) = bytes {
-                    let _ = nix::unistd::write(pane.pty_master.as_fd(), &bytes);
+                    write_all_to_pty(pane.pty_master.as_fd(), &bytes);
                     self.active_tab_mut().focused_pane_mut().scroll_offset = 0;
                     if let Some(window) = &self.window {
                         window.request_redraw();

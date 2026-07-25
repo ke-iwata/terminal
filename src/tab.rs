@@ -611,7 +611,16 @@ fn extract_selected_text(grid: &Grid, selection: Selection) -> Option<String> {
         // `end.col` is the last *included* column, so the slice's
         // exclusive upper bound is one past it.
         let to = if distance == end.distance { end.col + 1 } else { row.len() };
-        let text: String = row.get(from..to.min(row.len())).unwrap_or(&[]).iter().map(|cell| cell.c).collect();
+        let text: String = row
+            .get(from..to.min(row.len()))
+            .unwrap_or(&[])
+            .iter()
+            // A double-width character occupies two cells; the trailing
+            // spacer cell holds a placeholder ' ' that isn't real text --
+            // copying "日本語" must not come out as "日 本 語 ".
+            .filter(|cell| !cell.flags.contains(crate::term::grid::CellFlags::WIDE_SPACER))
+            .map(|cell| cell.c)
+            .collect();
         lines.push(text.trim_end().to_string());
         if distance == end.distance {
             break;
@@ -642,6 +651,14 @@ mod tests {
         // 5-row grid), which is 4 lines above the true bottom -> distance 4.
         let text = extract_selected_text(term.grid(), selection((4, 0), (4, 4)));
         assert_eq!(text.as_deref(), Some("hello"));
+    }
+
+    #[test]
+    fn wide_characters_copy_without_spacer_padding() {
+        let mut term = Term::new(20, 5, 100);
+        term.advance("日本語".as_bytes()); // 3 wide chars = 6 cells
+        let text = extract_selected_text(term.grid(), selection((4, 0), (4, 5)));
+        assert_eq!(text.as_deref(), Some("日本語"));
     }
 
     #[test]
