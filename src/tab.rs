@@ -4,7 +4,7 @@ use std::os::fd::OwnedFd;
 use std::sync::Arc;
 
 use crate::config::ShellConfig;
-use crate::term::grid::Grid;
+use crate::term::grid::{Cell, CellFlags, Grid};
 use crate::term::Term;
 
 /// A cell in the grid, in the same `(distance_from_bottom, col)` terms
@@ -592,6 +592,46 @@ impl Tab {
     }
 }
 
+/// Whether a cell belongs to a "word" for double-click selection.
+/// Alphanumerics plus the path-ish punctuation iTerm2 defaults to, so a
+/// double-click grabs a whole filename, URL path segment, or flag. A
+/// wide character's trailing spacer cell counts as part of its word --
+/// otherwise every CJK character would be its own one-cell "word".
+fn is_word_cell(cell: &Cell) -> bool {
+    cell.flags.contains(CellFlags::WIDE_SPACER) || cell.c.is_alphanumeric() || "_./-~+@".contains(cell.c)
+}
+
+/// The selection covering the word around `point` (double-click), or
+/// `None` when the clicked cell isn't part of a word.
+pub fn word_selection(grid: &Grid, point: GridPoint) -> Option<Selection> {
+    let row = grid.absolute_line(point.distance)?;
+    let col = point.col.min(row.len().saturating_sub(1));
+    if !is_word_cell(&row[col]) {
+        return None;
+    }
+    let mut start = col;
+    while start > 0 && is_word_cell(&row[start - 1]) {
+        start -= 1;
+    }
+    let mut end = col;
+    while end + 1 < row.len() && is_word_cell(&row[end + 1]) {
+        end += 1;
+    }
+    Some(Selection {
+        anchor: GridPoint { distance: point.distance, col: start },
+        cursor: GridPoint { distance: point.distance, col: end },
+    })
+}
+
+/// The selection covering the whole row under `point` (triple-click).
+pub fn line_selection(grid: &Grid, point: GridPoint) -> Option<Selection> {
+    let row = grid.absolute_line(point.distance)?;
+    Some(Selection {
+        anchor: GridPoint { distance: point.distance, col: 0 },
+        cursor: GridPoint { distance: point.distance, col: row.len().saturating_sub(1) },
+    })
+}
+
 /// Reads `selection`'s text out of `grid`, joined with `\n` between lines
 /// and with each line's trailing padding blanks trimmed. Doesn't attempt
 /// to know whether a line was a hard newline or just a terminal-forced
@@ -621,7 +661,7 @@ fn extract_selected_text(grid: &Grid, selection: Selection) -> Option<String> {
             // A double-width character occupies two cells; the trailing
             // spacer cell holds a placeholder ' ' that isn't real text --
             // copying "日本語" must not come out as "日 本 語 ".
-            .filter(|cell| !cell.flags.contains(crate::term::grid::CellFlags::WIDE_SPACER))
+            .filter(|cell| !cell.flags.contains(CellFlags::WIDE_SPACER))
             .map(|cell| cell.c)
             .collect();
         lines.push(text.trim_end().to_string());
@@ -662,6 +702,38 @@ mod tests {
         term.advance("日本語".as_bytes()); // 3 wide chars = 6 cells
         let text = extract_selected_text(term.grid(), selection((4, 0), (4, 5)));
         assert_eq!(text.as_deref(), Some("日本語"));
+    }
+
+    #[test]
+    fn word_selection_grabs_the_word_under_the_point() {
+        let mut term = Term::new(30, 5, 100);
+        term.advance(b"run ./scripts/build.sh now");
+        // Click on the 'b' of "build" (col 10). Path chars join the word.
+        let sel = word_selection(term.grid(), GridPoint { distance: 4, col: 10 }).unwrap();
+        assert_eq!((sel.anchor.col, sel.cursor.col), (4, 21));
+        let text = extract_selected_text(term.grid(), sel);
+        assert_eq!(text.as_deref(), Some("./scripts/build.sh"));
+        // Clicking the space between words selects nothing.
+        assert!(word_selection(term.grid(), GridPoint { distance: 4, col: 3 }).is_none());
+    }
+
+    #[test]
+    fn word_selection_spans_wide_characters() {
+        let mut term = Term::new(20, 5, 100);
+        term.advance("ab 日本語 cd".as_bytes());
+        let sel = word_selection(term.grid(), GridPoint { distance: 4, col: 5 }).unwrap();
+        let text = extract_selected_text(term.grid(), sel);
+        assert_eq!(text.as_deref(), Some("日本語"));
+    }
+
+    #[test]
+    fn line_selection_covers_the_whole_row() {
+        let mut term = Term::new(10, 3, 100);
+        term.advance(b"hello");
+        let sel = line_selection(term.grid(), GridPoint { distance: 2, col: 3 }).unwrap();
+        assert_eq!((sel.anchor.col, sel.cursor.col), (0, 9));
+        let text = extract_selected_text(term.grid(), sel);
+        assert_eq!(text.as_deref(), Some("hello"));
     }
 
     #[test]

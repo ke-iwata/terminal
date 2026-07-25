@@ -132,6 +132,11 @@ struct App {
     /// encoding flag, last cell reported) -- the last cell lets motion be
     /// reported only when the pointer actually crosses into a new cell.
     mouse_report_drag: Option<(u64, u8, bool, (u16, u16))>,
+    /// The previous left press, for multi-click detection: (when, pane,
+    /// cell, running count). A press on the same cell of the same pane
+    /// within the double-click window bumps the count (wrapping after a
+    /// triple), anything else resets to a single click.
+    last_click: Option<(Instant, u64, tab::GridPoint, u8)>,
 }
 
 impl App {
@@ -155,6 +160,7 @@ impl App {
             dragging_pane: None,
             dragging_divider: None,
             mouse_report_drag: None,
+            last_click: None,
         }
     }
 
@@ -569,8 +575,11 @@ impl App {
 
     /// Start a new text selection at the current cursor position (also
     /// focusing the pane under it), replacing whatever was selected in
-    /// that pane before. No-op outside any pane (bars, dividers).
+    /// that pane before. A second click on the same cell within the
+    /// double-click window selects the word there, a third the whole
+    /// line. No-op outside any pane (bars, dividers).
     fn begin_selection(&mut self) {
+        const MULTI_CLICK_WINDOW: Duration = Duration::from_millis(500);
         let Some(pane_id) = self.pane_at(self.cursor_pos.0, self.cursor_pos.1) else {
             return;
         };
@@ -583,9 +592,29 @@ impl App {
         let Some(point) = self.grid_point_in_pane(pane_id, self.cursor_pos.0, self.cursor_pos.1) else {
             return;
         };
-        self.dragging_pane = Some(pane_id);
+        let now = Instant::now();
+        let count = match self.last_click {
+            Some((at, pid, p, c)) if pid == pane_id && p == point && now.duration_since(at) < MULTI_CLICK_WINDOW => c % 3 + 1,
+            _ => 1,
+        };
+        self.last_click = Some((now, pane_id, point, count));
+
+        // Multi-click selections are complete as-is: no `dragging_pane`,
+        // so a stray pixel of motion before release doesn't collapse the
+        // word back to one cell.
+        if count == 1 {
+            self.dragging_pane = Some(pane_id);
+        }
         if let Some(pane) = self.active_tab_mut().root_mut().pane_mut(pane_id) {
-            pane.selection = Some(tab::Selection { anchor: point, cursor: point });
+            match count {
+                2 => {
+                    if let Some(selection) = tab::word_selection(pane.term.grid(), point) {
+                        pane.selection = Some(selection);
+                    }
+                }
+                3 => pane.selection = tab::line_selection(pane.term.grid(), point),
+                _ => pane.selection = Some(tab::Selection { anchor: point, cursor: point }),
+            }
         }
         if let Some(window) = &self.window {
             window.request_redraw();
