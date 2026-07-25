@@ -5,6 +5,7 @@ mod menu;
 mod pty;
 mod render;
 mod settings_ui;
+mod state;
 mod status;
 mod tab;
 mod term;
@@ -137,6 +138,10 @@ struct App {
     /// within the double-click window bumps the count (wrapping after a
     /// triple), anything else resets to a single click.
     last_click: Option<(Instant, u64, tab::GridPoint, u8)>,
+    /// The window's last known frame, tracked from Moved/Resized events
+    /// and written to the state file on exit so the next launch opens
+    /// where this one left off.
+    window_frame: Option<state::WindowFrame>,
 }
 
 impl App {
@@ -161,6 +166,7 @@ impl App {
             dragging_divider: None,
             mouse_report_drag: None,
             last_click: None,
+            window_frame: state::load().window,
         }
     }
 
@@ -755,6 +761,22 @@ impl App {
         pane.scroll_offset = distance.saturating_sub(rows / 2).min(max_offset);
     }
 
+    /// Record the window's current outer position and inner size, for
+    /// the state file written at exit.
+    fn track_window_frame(&mut self) {
+        let Some(window) = &self.window else { return };
+        let Ok(position) = window.outer_position() else { return };
+        let size = window.inner_size();
+        if size.width > 0 && size.height > 0 {
+            self.window_frame = Some(state::WindowFrame {
+                x: position.x,
+                y: position.y,
+                width: size.width,
+                height: size.height,
+            });
+        }
+    }
+
     /// Spawn the thread that blocking-reads `pane`'s pty and forwards
     /// bytes to the event loop, tagged with `pane`'s id and generation so
     /// `user_event` can route them (and can tell a since-closed pane's
@@ -891,7 +913,18 @@ impl ApplicationHandler<UserEvent> for App {
         // pixels all happen to have alpha=1 (opacity's default) looks
         // identical to a normal opaque one. This lets opacity change live
         // from Preferences instead of requiring a restart.
-        let attrs = Window::default_attributes().with_title("keterm").with_transparent(true);
+        let mut attrs = Window::default_attributes().with_title("keterm").with_transparent(true);
+        // Reopen where the last run's window was. A frame saved on a
+        // display that's since been unplugged may land offscreen; macOS
+        // pulls fully-offscreen windows back onto a visible display on
+        // its own, so no clamping is attempted here.
+        if let Some(frame) = self.window_frame {
+            if frame.width > 0 && frame.height > 0 {
+                attrs = attrs
+                    .with_position(winit::dpi::PhysicalPosition::new(frame.x, frame.y))
+                    .with_inner_size(winit::dpi::PhysicalSize::new(frame.width, frame.height));
+            }
+        }
         let window = Arc::new(
             event_loop
                 .create_window(attrs)
@@ -1089,10 +1122,12 @@ impl ApplicationHandler<UserEvent> for App {
                     renderer.resize(new_size);
                 }
                 self.relayout_all_tabs(true);
+                self.track_window_frame();
                 if let Some(window) = &self.window {
                     window.request_redraw();
                 }
             }
+            WindowEvent::Moved(_) => self.track_window_frame(),
             WindowEvent::ModifiersChanged(mods) => {
                 self.modifiers = mods.state();
                 // Cmd held/released toggles URL underlines in the grid --
@@ -1364,6 +1399,12 @@ impl ApplicationHandler<UserEvent> for App {
     /// or mistimed during the window's first moments). Once something is
     /// on screen, revert to pure `Wait` so an idle terminal costs zero
     /// wakeups.
+    /// Runs once when the event loop is about to exit, whichever path
+    /// triggered it (window close, last pane's shell exiting, Cmd+Q).
+    fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
+        state::save(&state::State { window: self.window_frame });
+    }
+
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         if self.presented_once {
             event_loop.set_control_flow(ControlFlow::Wait);
