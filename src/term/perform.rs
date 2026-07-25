@@ -95,6 +95,46 @@ impl Perform for Term {
             }
             'J' => self.erase_in_display(p(&mut iter, 0)),
             'K' => self.erase_in_line(p(&mut iter, 0)),
+            '@' => {
+                let n = p(&mut iter, 1) as usize;
+                self.insert_chars(n);
+            }
+            'P' => {
+                let n = p(&mut iter, 1) as usize;
+                self.delete_chars(n);
+            }
+            'X' => {
+                let n = p(&mut iter, 1) as usize;
+                self.erase_chars(n);
+            }
+            'L' => {
+                let n = p(&mut iter, 1) as usize;
+                self.insert_lines(n);
+            }
+            'M' => {
+                let n = p(&mut iter, 1) as usize;
+                self.delete_lines(n);
+            }
+            'b' => {
+                // REP: re-print the most recent graphic character n times.
+                let n = p(&mut iter, 1) as usize;
+                if let Some(c) = self.last_printed {
+                    for _ in 0..n.min(self.cols() * self.rows()) {
+                        self.print_char(c);
+                    }
+                }
+            }
+            'Z' => {
+                // CBT: cursor back to the previous tab stop, n times.
+                let n = p(&mut iter, 1) as usize;
+                self.wrap_pending = false;
+                for _ in 0..n {
+                    if self.cursor.col == 0 {
+                        break;
+                    }
+                    self.cursor.col = (self.cursor.col - 1) / 8 * 8;
+                }
+            }
             'S' => {
                 let n = p(&mut iter, 1) as usize;
                 self.scroll_region_up(n);

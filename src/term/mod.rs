@@ -47,6 +47,8 @@ pub struct Term {
     /// The wrap only actually happens if another character is printed
     /// before any cursor-repositioning control sequence arrives.
     wrap_pending: bool,
+    /// The most recent character `print_char` placed, for REP (CSI b).
+    last_printed: Option<char>,
     pub modes: TermModes,
     scroll_top: usize,
     scroll_bottom: usize,
@@ -69,6 +71,7 @@ impl Term {
             saved_cursor: Cursor::default(),
             alt_saved_cursor: Cursor::default(),
             wrap_pending: false,
+            last_printed: None,
             modes: TermModes::default(),
             scroll_top: 0,
             scroll_bottom: rows - 1,
@@ -310,6 +313,62 @@ impl Term {
         }
     }
 
+    /// ICH: insert `n` blank cells at the cursor, shifting the rest of
+    /// the row right (cells pushed past the last column are lost). What
+    /// zsh/readline's terminfo `ich` capability emits when a character is
+    /// typed into the middle of a line -- without it the edited line's
+    /// display diverges from the shell's own idea of its content.
+    fn insert_chars(&mut self, n: usize) {
+        let (row, col, cols) = (self.cursor.row, self.cursor.col, self.cols);
+        let n = n.min(cols - col);
+        let line = self.active_grid_mut().row_mut(row);
+        line[col..].rotate_right(n);
+        line[col..col + n].fill(Cell::default());
+    }
+
+    /// DCH: delete `n` cells at the cursor, shifting the rest of the row
+    /// left and back-filling with blanks. The terminfo `dch`/`dch1`
+    /// counterpart of `insert_chars` (used for mid-line deletes).
+    fn delete_chars(&mut self, n: usize) {
+        let (row, col, cols) = (self.cursor.row, self.cursor.col, self.cols);
+        let n = n.min(cols - col);
+        let line = self.active_grid_mut().row_mut(row);
+        line[col..].rotate_left(n);
+        line[cols - n..].fill(Cell::default());
+    }
+
+    /// ECH: blank `n` cells starting at the cursor, without shifting.
+    fn erase_chars(&mut self, n: usize) {
+        let (row, col, cols) = (self.cursor.row, self.cursor.col, self.cols);
+        let end = (col + n).min(cols);
+        let line = self.active_grid_mut().row_mut(row);
+        line[col..end].fill(Cell::default());
+    }
+
+    /// IL: insert `n` blank lines at the cursor row, pushing the lines
+    /// below it down and off the bottom of the scroll region. Ignored
+    /// (per DEC) when the cursor is outside the region.
+    fn insert_lines(&mut self, n: usize) {
+        if self.cursor.row < self.scroll_top || self.cursor.row > self.scroll_bottom {
+            return;
+        }
+        let (row, bottom) = (self.cursor.row, self.scroll_bottom);
+        self.active_grid_mut().scroll_down(row, bottom, n);
+        self.carriage_return();
+    }
+
+    /// DL: delete `n` lines at the cursor row, pulling the lines below it
+    /// up and blank-filling the bottom of the scroll region. Ignored when
+    /// the cursor is outside the region.
+    fn delete_lines(&mut self, n: usize) {
+        if self.cursor.row < self.scroll_top || self.cursor.row > self.scroll_bottom {
+            return;
+        }
+        let (row, bottom) = (self.cursor.row, self.scroll_bottom);
+        self.active_grid_mut().delete_lines(row, bottom, n);
+        self.carriage_return();
+    }
+
     fn print_char(&mut self, c: char) {
         let width = c.width().unwrap_or(1);
         if width == 0 {
@@ -356,6 +415,7 @@ impl Term {
         } else {
             self.cursor.col += width;
         }
+        self.last_printed = Some(c);
     }
 
     fn reset(&mut self) {
@@ -367,6 +427,7 @@ impl Term {
         self.saved_cursor = Cursor::default();
         self.alt_saved_cursor = Cursor::default();
         self.wrap_pending = false;
+        self.last_printed = None;
         self.modes = TermModes::default();
         self.scroll_top = 0;
         self.scroll_bottom = rows - 1;
@@ -443,6 +504,81 @@ mod tests {
         assert_eq!(term.grid().cell(1, 0).c, '3');
         assert_eq!(term.grid().scrollback.len(), 1);
         assert_eq!(term.grid().scrollback[0][0].c, '1');
+    }
+
+    /// The visible text of a live row, for edit-sequence assertions.
+    fn row_text(term: &Term, row: usize) -> String {
+        (0..term.cols()).map(|c| term.grid().cell(row, c).c).collect()
+    }
+
+    #[test]
+    fn ich_inserts_blanks_and_shifts_right() {
+        // The mid-line-editing bug: readline/zle insert a typed character
+        // into the middle of a line via ICH; dropping it left the display
+        // diverged from the shell's real buffer.
+        let mut term = Term::new(10, 3, 10_000);
+        term.advance(b"ABCDEF");
+        term.advance(b"\x1b[4G"); // cursor onto the 'D' (col 3)
+        term.advance(b"\x1b[2@"); // insert two blanks
+        assert_eq!(row_text(&term, 0), "ABC  DEF  ");
+        // Then the shell prints the typed characters into the gap.
+        term.advance(b"xy");
+        assert_eq!(row_text(&term, 0), "ABCxyDEF  ");
+    }
+
+    #[test]
+    fn dch_deletes_and_shifts_left() {
+        let mut term = Term::new(10, 3, 10_000);
+        term.advance(b"ABCDEF");
+        term.advance(b"\x1b[3G"); // cursor onto the 'C' (col 2)
+        term.advance(b"\x1b[2P"); // delete "CD"
+        assert_eq!(row_text(&term, 0), "ABEF      ");
+    }
+
+    #[test]
+    fn ech_blanks_without_shifting() {
+        let mut term = Term::new(10, 3, 10_000);
+        term.advance(b"ABCDEF");
+        term.advance(b"\x1b[2G");
+        term.advance(b"\x1b[3X"); // blank "BCD" in place
+        assert_eq!(row_text(&term, 0), "A   EF    ");
+    }
+
+    #[test]
+    fn ich_dch_clamp_at_the_right_edge() {
+        let mut term = Term::new(5, 2, 10_000);
+        term.advance(b"ABCDE");
+        term.advance(b"\x1b[4G");
+        term.advance(b"\x1b[99@"); // way more than fits: clamps, no panic
+        assert_eq!(row_text(&term, 0), "ABC  ");
+        term.advance(b"\x1b[99P");
+        assert_eq!(row_text(&term, 0), "ABC  ");
+    }
+
+    #[test]
+    fn il_dl_shift_lines_within_the_scroll_region() {
+        let mut term = Term::new(3, 4, 10_000);
+        term.advance(b"AA\r\nBB\r\nCC\r\nDD");
+        term.advance(b"\x1b[2;1H"); // cursor to row 1 ("BB")
+        term.advance(b"\x1b[1L"); // insert a blank line above BB
+        assert_eq!(row_text(&term, 0), "AA ");
+        assert_eq!(row_text(&term, 1), "   ");
+        assert_eq!(row_text(&term, 2), "BB ");
+        assert_eq!(row_text(&term, 3), "CC "); // DD pushed off the bottom
+
+        term.advance(b"\x1b[2;1H");
+        term.advance(b"\x1b[1M"); // delete that blank line again
+        assert_eq!(row_text(&term, 1), "BB ");
+        assert_eq!(row_text(&term, 2), "CC ");
+        assert_eq!(row_text(&term, 3), "   ");
+        assert_eq!(term.grid().scrollback.len(), 0, "DL discards, never feeds scrollback");
+    }
+
+    #[test]
+    fn rep_repeats_the_last_printed_character() {
+        let mut term = Term::new(10, 2, 10_000);
+        term.advance(b"A\x1b[3b");
+        assert_eq!(row_text(&term, 0), "AAAA      ");
     }
 
     #[test]

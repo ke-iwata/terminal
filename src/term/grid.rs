@@ -355,9 +355,21 @@ impl Grid {
     /// scroll-region-limited scroll, e.g. inside vim, must not pollute
     /// scrollback with lines that never really left the visible screen).
     pub fn scroll_up(&mut self, top: usize, bottom: usize, n: usize) {
+        let push_scrollback = top == 0 && bottom == self.rows - 1;
+        self.rotate_up(top, bottom, n, push_scrollback);
+    }
+
+    /// DL (delete lines): same row rotation as `scroll_up`, but the
+    /// removed lines are discarded outright -- an app deleting lines
+    /// out of the middle of the screen isn't "scrolling them off", and
+    /// they must not reappear in scrollback.
+    pub fn delete_lines(&mut self, top: usize, bottom: usize, n: usize) {
+        self.rotate_up(top, bottom, n, false);
+    }
+
+    fn rotate_up(&mut self, top: usize, bottom: usize, n: usize, push_scrollback: bool) {
         let region_len = bottom + 1 - top;
         let n = n.min(region_len);
-        let push_scrollback = top == 0 && bottom == self.rows - 1;
         for _ in 0..n {
             let removed = self.lines.remove(top);
             self.wrapped.remove(top);
