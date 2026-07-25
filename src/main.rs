@@ -60,6 +60,10 @@ enum UserEvent {
     SplitDown,
     NextPane,
     PrevPane,
+    ZoomIn,
+    ZoomOut,
+    /// Back to the size in the config file on disk.
+    ZoomReset,
 }
 
 struct App {
@@ -1008,6 +1012,24 @@ impl ApplicationHandler<UserEvent> for App {
             }
             UserEvent::SplitRight => self.split_focused_pane(tab::SplitDirection::Vertical),
             UserEvent::SplitDown => self.split_focused_pane(tab::SplitDirection::Horizontal),
+            UserEvent::ZoomIn | UserEvent::ZoomOut | UserEvent::ZoomReset => {
+                // A session-only override: the config file on disk keeps
+                // its size (Cmd+0 re-reads it), so a quick zoom for a
+                // presentation doesn't silently rewrite settings.
+                let new_size = match event {
+                    UserEvent::ZoomIn => self.config.font.size + 1.0,
+                    UserEvent::ZoomOut => self.config.font.size - 1.0,
+                    _ => Config::load().font.size,
+                }
+                .clamp(6.0, 72.0);
+                if new_size != self.config.font.size {
+                    self.config.font.size = new_size;
+                    self.apply_font_change();
+                    if let Some(window) = &self.window {
+                        window.request_redraw();
+                    }
+                }
+            }
             UserEvent::NextPane | UserEvent::PrevPane => {
                 let forward = matches!(event, UserEvent::NextPane);
                 self.active_tab_mut().cycle_focus(forward);

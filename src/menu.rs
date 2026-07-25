@@ -13,6 +13,9 @@ pub const SPLIT_RIGHT_ID: &str = "split_right";
 pub const SPLIT_DOWN_ID: &str = "split_down";
 pub const NEXT_PANE_ID: &str = "next_pane";
 pub const PREV_PANE_ID: &str = "prev_pane";
+pub const ZOOM_IN_ID: &str = "zoom_in";
+pub const ZOOM_OUT_ID: &str = "zoom_out";
+pub const ZOOM_RESET_ID: &str = "zoom_reset";
 
 /// Build and attach the macOS menu bar: an app menu with About, Preferences
 /// (Cmd+,), and Quit. Must be called once at startup, and pairs with
@@ -125,8 +128,35 @@ pub fn install(proxy: EventLoopProxy<UserEvent>) -> Menu {
         ])
         .expect("failed to build shell menu");
 
+    let view_menu = Submenu::new("View", true);
+    // Cmd+Plus is physically Cmd+Shift+Equal on most layouts, but macOS
+    // menu accelerators match the unshifted key -- Cmd+= and Cmd+- both
+    // work bare, matching how other apps register zoom.
+    let zoom_in = MenuItem::with_id(
+        ZOOM_IN_ID,
+        "Make Text Bigger",
+        true,
+        Some(Accelerator::new(Some(Modifiers::SUPER), Code::Equal)),
+    );
+    let zoom_out = MenuItem::with_id(
+        ZOOM_OUT_ID,
+        "Make Text Smaller",
+        true,
+        Some(Accelerator::new(Some(Modifiers::SUPER), Code::Minus)),
+    );
+    let zoom_reset = MenuItem::with_id(
+        ZOOM_RESET_ID,
+        "Reset Text Size",
+        true,
+        Some(Accelerator::new(Some(Modifiers::SUPER), Code::Digit0)),
+    );
+    view_menu
+        .append_items(&[&zoom_in, &zoom_out, &zoom_reset])
+        .expect("failed to build view menu");
+
     menu.append(&app_menu).expect("failed to attach app menu");
     menu.append(&shell_menu).expect("failed to attach shell menu");
+    menu.append(&view_menu).expect("failed to attach view menu");
     menu.init_for_nsapp();
 
     MenuEvent::set_event_handler(Some(move |event: MenuEvent| {
@@ -150,6 +180,12 @@ pub fn install(proxy: EventLoopProxy<UserEvent>) -> Menu {
             UserEvent::NextPane
         } else if event.id() == PREV_PANE_ID {
             UserEvent::PrevPane
+        } else if event.id() == ZOOM_IN_ID {
+            UserEvent::ZoomIn
+        } else if event.id() == ZOOM_OUT_ID {
+            UserEvent::ZoomOut
+        } else if event.id() == ZOOM_RESET_ID {
+            UserEvent::ZoomReset
         } else {
             return;
         };
