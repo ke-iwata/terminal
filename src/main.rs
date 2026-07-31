@@ -1,4 +1,5 @@
 mod config;
+mod filetree;
 mod input;
 mod linkify;
 mod menu;
@@ -65,6 +66,8 @@ enum UserEvent {
     ZoomOut,
     /// Back to the size in the config file on disk.
     ZoomReset,
+    ToggleFileTree,
+    ToggleHiddenFiles,
 }
 
 struct App {
@@ -84,6 +87,11 @@ struct App {
     settings_window: Option<SettingsWindow>,
     proc_info: status::ProcInfo,
     cached_status: chrome::StatusInfo,
+    /// The focused pane's cwd as a real path, resolved by the same
+    /// (throttled) lookup that feeds the status bar. The file tree reads
+    /// it instead of querying `sysinfo` again -- those calls rebuild a
+    /// process table, far too expensive to repeat on every redraw.
+    cached_cwd: Option<std::path::PathBuf>,
     last_status_refresh: Option<Instant>,
     cursor_pos: (f32, f32),
     /// Whether at least one frame has actually reached the screen.
@@ -142,10 +150,23 @@ struct App {
     /// and written to the state file on exit so the next launch opens
     /// where this one left off.
     window_frame: Option<state::WindowFrame>,
+    /// The file-tree sidebar's model. Always present; `file_tree_visible`
+    /// decides whether it's drawn and whether it takes window width away
+    /// from the panes.
+    file_tree: filetree::FileTree,
+    file_tree_visible: bool,
+    /// When the tree last re-read the filesystem, so a visible sidebar
+    /// picks up files created by commands without re-reading directories
+    /// on every redraw.
+    last_tree_refresh: Option<Instant>,
+    /// The previous sidebar click (when, which path), for double-click
+    /// detection on directories.
+    last_tree_click: Option<(Instant, std::path::PathBuf)>,
 }
 
 impl App {
     fn new(config: Config, first_tab: Tab, proxy: EventLoopProxy<UserEvent>) -> Self {
+        let persisted = state::load();
         App {
             config,
             window: None,
@@ -159,6 +180,7 @@ impl App {
             settings_window: None,
             proc_info: status::ProcInfo::new(),
             cached_status: chrome::StatusInfo { shell: String::new(), cwd: String::new(), branch: None, tty: String::new() },
+            cached_cwd: None,
             last_status_refresh: None,
             cursor_pos: (0.0, 0.0),
             presented_once: false,
@@ -166,7 +188,11 @@ impl App {
             dragging_divider: None,
             mouse_report_drag: None,
             last_click: None,
-            window_frame: state::load().window,
+            window_frame: persisted.window,
+            file_tree: filetree::FileTree::new(),
+            file_tree_visible: persisted.file_tree_visible,
+            last_tree_refresh: None,
+            last_tree_click: None,
         }
     }
 
@@ -268,7 +294,8 @@ impl App {
         };
         let (cell_w, cell_h) = renderer.cell_size();
         let size = window.inner_size();
-        let grid = chrome::grid_rect(size.width as f32, size.height as f32, cell_h);
+        let sidebar = chrome::file_tree_width(self.file_tree_visible, cell_w, size.width as f32);
+        let grid = chrome::grid_rect(size.width as f32, size.height as f32, cell_h, sidebar);
         let now = Instant::now();
         for tab in &mut self.tabs {
             let (rects, _) = tab.layout(grid, chrome::PANE_GAP);
@@ -421,7 +448,9 @@ impl App {
             return Vec::new();
         };
         let size = window.inner_size();
-        let grid = chrome::grid_rect(size.width as f32, size.height as f32, renderer.cell_size().1);
+        let (cell_w, cell_h) = renderer.cell_size();
+        let sidebar = chrome::file_tree_width(self.file_tree_visible, cell_w, size.width as f32);
+        let grid = chrome::grid_rect(size.width as f32, size.height as f32, cell_h, sidebar);
         self.active_tab().layout(grid, chrome::PANE_GAP).0
     }
 
@@ -442,7 +471,9 @@ impl App {
             return None;
         };
         let size = window.inner_size();
-        let grid = chrome::grid_rect(size.width as f32, size.height as f32, renderer.cell_size().1);
+        let (cell_w, cell_h) = renderer.cell_size();
+        let sidebar = chrome::file_tree_width(self.file_tree_visible, cell_w, size.width as f32);
+        let grid = chrome::grid_rect(size.width as f32, size.height as f32, cell_h, sidebar);
         let (_, dividers) = self.active_tab().layout(grid, chrome::PANE_GAP);
         dividers.into_iter().find(|d| {
             let r = d.rect;
@@ -761,6 +792,156 @@ impl App {
         pane.scroll_offset = distance.saturating_sub(rows / 2).min(max_offset);
     }
 
+    /// The sidebar's rectangle, or `None` when it's hidden.
+    fn file_tree_rect(&self) -> Option<tab::PaneRect> {
+        let (window, renderer) = (self.window.as_ref()?, self.renderer.as_ref()?);
+        let (cell_w, cell_h) = renderer.cell_size();
+        let size = window.inner_size();
+        chrome::file_tree_rect(size.width as f32, size.height as f32, cell_w, cell_h, self.file_tree_visible)
+    }
+
+    /// Show or hide the sidebar. Panes give up (or reclaim) the width, so
+    /// every pty is resized to match.
+    fn toggle_file_tree(&mut self) {
+        self.file_tree_visible = !self.file_tree_visible;
+        if self.file_tree_visible {
+            // Root it at the focused shell's cwd right away rather than
+            // waiting for the next throttled status refresh -- opening
+            // onto an empty sidebar for a beat reads as broken.
+            self.last_status_refresh = None;
+            self.refresh_status();
+            self.sync_file_tree_root();
+            self.file_tree.rebuild();
+            self.last_tree_refresh = Some(Instant::now());
+        }
+        self.relayout_all_tabs(true);
+        if let Some(window) = &self.window {
+            window.request_redraw();
+        }
+    }
+
+    /// Point the tree at the focused pane's current directory. Reads the
+    /// cwd `refresh_status` already resolved rather than querying for it
+    /// again, so this is cheap enough to call on every redraw;
+    /// `set_root` itself is a no-op when the directory hasn't changed.
+    fn sync_file_tree_root(&mut self) {
+        if let Some(cwd) = self.cached_cwd.clone() {
+            self.file_tree.set_root(&cwd);
+        }
+    }
+
+    /// Re-read the filesystem for a visible sidebar, at most once a
+    /// second -- commands create and delete files constantly, but
+    /// `read_dir`-ing every expanded directory on each redraw would be
+    /// wasteful during heavy output.
+    fn refresh_file_tree(&mut self) {
+        const TREE_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
+        if !self.file_tree_visible {
+            return;
+        }
+        self.sync_file_tree_root();
+        if self.last_tree_refresh.is_none_or(|t| t.elapsed() >= TREE_REFRESH_INTERVAL) {
+            self.file_tree.rebuild();
+            self.last_tree_refresh = Some(Instant::now());
+        }
+    }
+
+    /// Route a click inside the sidebar. Directories expand in place (and
+    /// a double-click `cd`s into them); files open in whatever app the
+    /// system associates with them, exactly like double-clicking in
+    /// Finder. Option+click inserts the path at the shell prompt instead,
+    /// for when the point is to type a command about the file rather than
+    /// to open it.
+    fn handle_file_tree_click(&mut self, x: f32, y: f32) {
+        const DOUBLE_CLICK_WINDOW: Duration = Duration::from_millis(500);
+        let Some(rect) = self.file_tree_rect() else { return };
+        let Some((_, cell_h)) = self.renderer.as_ref().map(Renderer::cell_size) else { return };
+        let hit = chrome::file_tree_hit_test(rect, cell_h, self.file_tree.scroll, self.file_tree.rows().len(), x, y);
+
+        match hit {
+            Some(chrome::FileTreeHit::Parent) => {
+                if let Some(parent) = self.file_tree.parent().map(std::path::Path::to_path_buf) {
+                    self.cd_shell_to(&parent);
+                }
+            }
+            Some(chrome::FileTreeHit::Row(index)) => {
+                let Some(row) = self.file_tree.rows().get(index) else { return };
+                let (path, is_dir) = (row.path.clone(), row.is_dir);
+
+                let now = Instant::now();
+                let double = self
+                    .last_tree_click
+                    .as_ref()
+                    .is_some_and(|(at, p)| *p == path && now.duration_since(*at) < DOUBLE_CLICK_WINDOW);
+                self.last_tree_click = Some((now, path.clone()));
+
+                if self.modifiers.alt_key() {
+                    self.insert_path_at_prompt(&path);
+                } else if is_dir {
+                    if double {
+                        self.cd_shell_to(&path);
+                    } else {
+                        self.file_tree.toggle(&path);
+                    }
+                } else {
+                    open_with_default_app(&path);
+                }
+            }
+            None => {}
+        }
+        if let Some(window) = &self.window {
+            window.request_redraw();
+        }
+    }
+
+    /// Type a `cd` into the focused shell. Goes through the shell (rather
+    /// than just re-rooting the sidebar) deliberately: the tree follows
+    /// the shell's cwd, so moving the shell keeps the two in step and
+    /// leaves the user where the sidebar says they are.
+    fn cd_shell_to(&mut self, dir: &std::path::Path) {
+        let command = format!("cd {}\n", filetree::shell_quote(&dir.to_string_lossy()));
+        let pane = self.active_tab().focused_pane();
+        write_all_to_pty(pane.pty_master.as_fd(), command.as_bytes());
+        self.active_tab_mut().focused_pane_mut().scroll_offset = 0;
+        // Don't wait for the throttle: the cwd is about to change, and a
+        // stale tree for up to a second reads as the click not working.
+        self.last_tree_refresh = None;
+        self.last_status_refresh = None;
+    }
+
+    /// Insert a path at the shell prompt without executing anything --
+    /// relative to the tree's root when possible, since that's what the
+    /// user would have typed themselves.
+    fn insert_path_at_prompt(&mut self, path: &std::path::Path) {
+        let relative = path.strip_prefix(self.file_tree.root()).unwrap_or(path);
+        let text = format!("{} ", filetree::shell_quote(&relative.to_string_lossy()));
+        let pane = self.active_tab().focused_pane();
+        write_all_to_pty(pane.pty_master.as_fd(), text.as_bytes());
+        self.active_tab_mut().focused_pane_mut().scroll_offset = 0;
+    }
+
+    /// Scroll the sidebar under the mouse. Returns whether it handled the
+    /// wheel event (i.e. the pointer was over the sidebar at all).
+    fn scroll_file_tree(&mut self, lines: f32) -> bool {
+        let Some(rect) = self.file_tree_rect() else { return false };
+        if !rect.contains(self.cursor_pos.0, self.cursor_pos.1) {
+            return false;
+        }
+        let Some((_, cell_h)) = self.renderer.as_ref().map(Renderer::cell_size) else { return false };
+        let visible = chrome::file_tree_visible_rows(rect, cell_h);
+        let max_scroll = self.file_tree.rows().len().saturating_sub(visible);
+        let n = (lines.abs().ceil() as usize).min(30);
+        self.file_tree.scroll = if lines > 0.0 {
+            self.file_tree.scroll.saturating_sub(n)
+        } else {
+            (self.file_tree.scroll + n).min(max_scroll)
+        };
+        if let Some(window) = &self.window {
+            window.request_redraw();
+        }
+        true
+    }
+
     /// Record the window's current outer position and inner size, for
     /// the state file written at exit.
     fn track_window_frame(&mut self) {
@@ -836,6 +1017,7 @@ impl App {
 
         let cwd_display = cwd.as_deref().map(display_path).unwrap_or_default();
         let branch = cwd.as_deref().and_then(status::git_branch);
+        self.cached_cwd = cwd.clone();
 
         self.cached_status = chrome::StatusInfo {
             shell: pane.shell_name.clone(),
@@ -859,6 +1041,15 @@ fn display_path(path: &std::path::Path) -> String {
         }
     }
     path.display().to_string()
+}
+
+/// Hand a path to macOS's `open`, which resolves it through the same
+/// LaunchServices association Finder uses -- clicking a `.png` in the
+/// sidebar opens Preview, a `.rs` opens the editor bound to it. The path
+/// is one argv entry, never interpolated into a shell string, so a file
+/// named with shell metacharacters can't turn into a command.
+fn open_with_default_app(path: &std::path::Path) {
+    let _ = std::process::Command::new("open").arg(path).spawn();
 }
 
 /// Write every byte of `bytes` to the pty, looping over short writes. A
@@ -1074,6 +1265,13 @@ impl ApplicationHandler<UserEvent> for App {
             }
             UserEvent::SplitRight => self.split_focused_pane(tab::SplitDirection::Vertical),
             UserEvent::SplitDown => self.split_focused_pane(tab::SplitDirection::Horizontal),
+            UserEvent::ToggleFileTree => self.toggle_file_tree(),
+            UserEvent::ToggleHiddenFiles => {
+                self.file_tree.toggle_hidden();
+                if let Some(window) = &self.window {
+                    window.request_redraw();
+                }
+            }
             UserEvent::ZoomIn | UserEvent::ZoomOut | UserEvent::ZoomReset => {
                 // A session-only override: the config file on disk keeps
                 // its size (Cmd+0 re-reads it), so a quick zoom for a
@@ -1230,6 +1428,9 @@ impl ApplicationHandler<UserEvent> for App {
                 if lines == 0.0 {
                     return;
                 }
+                if self.scroll_file_tree(lines) {
+                    return;
+                }
                 let n = (lines.abs().ceil() as usize).min(30);
                 // An app that asked for mouse reporting gets the wheel as
                 // button 64/65 events and handles scrolling itself.
@@ -1302,6 +1503,8 @@ impl ApplicationHandler<UserEvent> for App {
                 };
                 if self.cursor_pos.1 < chrome::tab_bar_height(cell_h) {
                     self.handle_tab_bar_click(event_loop);
+                } else if self.file_tree_rect().is_some_and(|r| r.contains(self.cursor_pos.0, self.cursor_pos.1)) {
+                    self.handle_file_tree_click(self.cursor_pos.0, self.cursor_pos.1);
                 } else if let Some(divider) = self.divider_at(self.cursor_pos.0, self.cursor_pos.1) {
                     self.dragging_divider = Some(divider);
                 } else if self.modifiers.super_key() && self.open_url_under_cursor() {
@@ -1370,11 +1573,19 @@ impl ApplicationHandler<UserEvent> for App {
             }
             WindowEvent::RedrawRequested => {
                 self.refresh_status();
+                self.refresh_file_tree();
                 let cmd_held = self.modifiers.super_key();
+                let root_label = display_path(self.file_tree.root());
+                let file_tree_view = self.file_tree_visible.then(|| render::FileTreeView {
+                    root_label: &root_label,
+                    rows: self.file_tree.rows(),
+                    scroll: self.file_tree.scroll,
+                    show_hidden: self.file_tree.show_hidden(),
+                });
                 let outcome = self
                     .renderer
                     .as_mut()
-                    .map(|renderer| renderer.render(&self.tabs, self.active, &self.cached_status, cmd_held));
+                    .map(|renderer| renderer.render(&self.tabs, self.active, &self.cached_status, cmd_held, file_tree_view));
                 match outcome {
                     Some(render::RenderOutcome::Presented) => self.presented_once = true,
                     Some(render::RenderOutcome::Retry) => {
@@ -1402,7 +1613,10 @@ impl ApplicationHandler<UserEvent> for App {
     /// Runs once when the event loop is about to exit, whichever path
     /// triggered it (window close, last pane's shell exiting, Cmd+Q).
     fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
-        state::save(&state::State { window: self.window_frame });
+        state::save(&state::State {
+            window: self.window_frame,
+            file_tree_visible: self.file_tree_visible,
+        });
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {

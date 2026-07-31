@@ -10,6 +10,7 @@
 
 use super::font::FontAtlas;
 use super::pipeline::Instance;
+use crate::filetree;
 use crate::tab::{PaneRect, Search};
 
 // Fixed chrome colors, deliberately NOT derived from the terminal palette:
@@ -55,18 +56,154 @@ pub fn status_bar_height(cell_h: f32) -> f32 {
     cell_h * 1.2
 }
 
-/// The pixel rectangle between the tab bar and the status bar -- the area
-/// panes are laid out in. The single source of truth for that math:
-/// rendering, click hit-testing, and pty resizing all start from this.
-pub fn grid_rect(window_width: f32, window_height: f32, cell_h: f32) -> PaneRect {
+/// The pixel rectangle between the tab bar and the status bar, minus the
+/// file-tree sidebar when it's open -- the area panes are laid out in.
+/// The single source of truth for that math: rendering, click
+/// hit-testing, and pty resizing all start from this.
+pub fn grid_rect(window_width: f32, window_height: f32, cell_h: f32, sidebar_width: f32) -> PaneRect {
     let top = tab_bar_height(cell_h);
     let bottom = status_bar_height(cell_h);
     PaneRect {
         x: 0.0,
         y: top,
-        w: window_width.max(1.0),
+        w: (window_width - sidebar_width).max(1.0),
         h: (window_height - top - bottom).max(cell_h),
     }
+}
+
+/// Sidebar width in character columns. Wide enough for a couple of
+/// indent levels plus a typical file name.
+const FILE_TREE_COLS: usize = 26;
+
+/// How wide the sidebar is right now -- zero when hidden, which makes it
+/// safe to feed straight into `grid_rect` unconditionally.
+pub fn file_tree_width(visible: bool, cell_w: f32, window_width: f32) -> f32 {
+    if !visible {
+        return 0.0;
+    }
+    // Never take more than half the window: on a narrow window a fixed
+    // 26 columns could leave the terminal itself unusably thin.
+    (FILE_TREE_COLS as f32 * cell_w).min(window_width * 0.5)
+}
+
+/// Where the sidebar sits: the full height between the two bars, flush
+/// against the window's right edge.
+pub fn file_tree_rect(window_width: f32, window_height: f32, cell_w: f32, cell_h: f32, visible: bool) -> Option<PaneRect> {
+    let w = file_tree_width(visible, cell_w, window_width);
+    if w <= 0.0 {
+        return None;
+    }
+    let top = tab_bar_height(cell_h);
+    let bottom = status_bar_height(cell_h);
+    Some(PaneRect {
+        x: window_width - w,
+        y: top,
+        w,
+        h: (window_height - top - bottom).max(cell_h),
+    })
+}
+
+/// The header strip inside the sidebar, showing the current directory and
+/// a `..` affordance.
+fn file_tree_header_height(cell_h: f32) -> f32 {
+    cell_h * 2.4
+}
+
+/// What a click inside the sidebar landed on.
+pub enum FileTreeHit {
+    /// The `..` row: go to the parent directory.
+    Parent,
+    /// A row of the tree, by index into `FileTree::rows`.
+    Row(usize),
+}
+
+/// Hit-test a window-pixel position against the sidebar. Shares its
+/// geometry with `build_file_tree_instances` so the two can't disagree.
+pub fn file_tree_hit_test(rect: PaneRect, cell_h: f32, scroll: usize, row_count: usize, x: f32, y: f32) -> Option<FileTreeHit> {
+    if !rect.contains(x, y) {
+        return None;
+    }
+    let header_h = file_tree_header_height(cell_h);
+    if y < rect.y + header_h {
+        // Only the lower half of the header (the `..` line) is clickable;
+        // the path label above it isn't a button.
+        return (y >= rect.y + header_h - cell_h * 1.2).then_some(FileTreeHit::Parent);
+    }
+    let index = ((y - rect.y - header_h) / cell_h).floor() as usize + scroll;
+    (index < row_count).then_some(FileTreeHit::Row(index))
+}
+
+/// How many tree rows fit below the header.
+pub fn file_tree_visible_rows(rect: PaneRect, cell_h: f32) -> usize {
+    (((rect.h - file_tree_header_height(cell_h)) / cell_h).floor() as usize).max(1)
+}
+
+/// Draw the sidebar: a header with the current directory, then one line
+/// per visible tree row (indented by depth, directories first with an
+/// expand marker).
+pub fn build_file_tree_instances(atlas: &FontAtlas, rect: PaneRect, root_label: &str, rows: &[filetree::Row], scroll: usize, show_hidden: bool) -> Vec<Instance> {
+    let mut instances = Vec::new();
+    let (cw, ch) = (atlas.cell_width, atlas.cell_height);
+
+    push_rect(&mut instances, atlas, [rect.x, rect.y, rect.w, rect.h], CHROME_STATUS_BG, 0.0);
+    // Left edge, matching the status bar's top edge -- separates the
+    // sidebar from live terminal content.
+    push_rect(&mut instances, atlas, [rect.x, rect.y, 1.0, rect.h], CHROME_STATUS_EDGE, 0.0);
+
+    let header_h = file_tree_header_height(ch);
+    let text_cols = ((rect.w / cw).floor() as usize).saturating_sub(2);
+    let pad_x = rect.x + cw;
+
+    // The path label is right-truncated (keeping the tail): the deepest
+    // directories are what identify where you are, not the leading /Users.
+    let label = truncate_start(root_label, text_cols);
+    push_text(&mut instances, atlas, &label, pad_x, rect.y + ch * 0.35, CHROME_FG_ACTIVE);
+
+    let parent_y = rect.y + header_h - ch * 1.1;
+    let hidden_marker = if show_hidden { " (all)" } else { "" };
+    push_text(&mut instances, atlas, &format!("..{hidden_marker}"), pad_x, parent_y, CHROME_FG_DIM);
+    push_rect(&mut instances, atlas, [rect.x, rect.y + header_h - 1.0, rect.w, 1.0], CHROME_STATUS_EDGE, 0.0);
+
+    let visible = file_tree_visible_rows(rect, ch);
+    for (i, row) in rows.iter().skip(scroll).take(visible).enumerate() {
+        let y = rect.y + header_h + i as f32 * ch;
+        let indent = row.depth as f32 * 2.0 * cw;
+        let marker_x = pad_x + indent;
+
+        if row.is_dir {
+            // ASCII markers, since the glyph atlas only covers ASCII.
+            push_text(&mut instances, atlas, if row.expanded { "v" } else { ">" }, marker_x, y, CHROME_FG_DIM);
+        }
+        let name_x = marker_x + cw * 2.0;
+        let name_cols = text_cols.saturating_sub(row.depth * 2 + 2);
+        let color = if row.is_dir { CHROME_ACCENT } else { CHROME_FG_INACTIVE };
+        push_text(&mut instances, atlas, &truncate(&row.name, name_cols), name_x, y, color);
+    }
+
+    // A minimal scroll thumb, drawn only when there's more than fits --
+    // otherwise there's no scroll position worth communicating.
+    if rows.len() > visible {
+        let track_y = rect.y + header_h;
+        let track_h = rect.h - header_h;
+        let thumb_h = (track_h * visible as f32 / rows.len() as f32).max(12.0);
+        let max_scroll = (rows.len() - visible) as f32;
+        let progress = if max_scroll > 0.0 { scroll as f32 / max_scroll } else { 0.0 };
+        let thumb_y = track_y + progress * (track_h - thumb_h);
+        push_rect(&mut instances, atlas, [rect.x + rect.w - 3.0, thumb_y, 3.0, thumb_h], CHROME_STATUS_EDGE, 0.0);
+    }
+
+    instances
+}
+
+/// Like `truncate`, but drops characters from the *front* -- for paths,
+/// where the tail is the identifying part.
+fn truncate_start(text: &str, max_chars: usize) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    if chars.len() <= max_chars || max_chars <= 3 {
+        return chars.into_iter().rev().take(max_chars).rev().collect();
+    }
+    let tail: String = chars[chars.len() - (max_chars - 3)..].iter().collect();
+    format!("...{tail}")
 }
 
 /// How many terminal rows fit between the two bars at this window height.

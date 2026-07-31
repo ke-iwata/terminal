@@ -16,6 +16,8 @@ pub const PREV_PANE_ID: &str = "prev_pane";
 pub const ZOOM_IN_ID: &str = "zoom_in";
 pub const ZOOM_OUT_ID: &str = "zoom_out";
 pub const ZOOM_RESET_ID: &str = "zoom_reset";
+pub const TOGGLE_FILE_TREE_ID: &str = "toggle_file_tree";
+pub const TOGGLE_HIDDEN_FILES_ID: &str = "toggle_hidden_files";
 
 /// Build and attach the macOS menu bar: an app menu with About, Preferences
 /// (Cmd+,), and Quit. Must be called once at startup, and pairs with
@@ -150,8 +152,29 @@ pub fn install(proxy: EventLoopProxy<UserEvent>) -> Menu {
         true,
         Some(Accelerator::new(Some(Modifiers::SUPER), Code::Digit0)),
     );
+    // Cmd+B for the sidebar and Cmd+Shift+. for hidden files, matching
+    // VS Code and Finder respectively -- both are muscle memory already.
+    let toggle_file_tree = MenuItem::with_id(
+        TOGGLE_FILE_TREE_ID,
+        "Show/Hide File Tree",
+        true,
+        Some(Accelerator::new(Some(Modifiers::SUPER), Code::KeyB)),
+    );
+    let toggle_hidden_files = MenuItem::with_id(
+        TOGGLE_HIDDEN_FILES_ID,
+        "Show/Hide Hidden Files",
+        true,
+        Some(Accelerator::new(Some(Modifiers::SUPER | Modifiers::SHIFT), Code::Period)),
+    );
     view_menu
-        .append_items(&[&zoom_in, &zoom_out, &zoom_reset])
+        .append_items(&[
+            &zoom_in,
+            &zoom_out,
+            &zoom_reset,
+            &PredefinedMenuItem::separator(),
+            &toggle_file_tree,
+            &toggle_hidden_files,
+        ])
         .expect("failed to build view menu");
 
     menu.append(&app_menu).expect("failed to attach app menu");
@@ -186,6 +209,10 @@ pub fn install(proxy: EventLoopProxy<UserEvent>) -> Menu {
             UserEvent::ZoomOut
         } else if event.id() == ZOOM_RESET_ID {
             UserEvent::ZoomReset
+        } else if event.id() == TOGGLE_FILE_TREE_ID {
+            UserEvent::ToggleFileTree
+        } else if event.id() == TOGGLE_HIDDEN_FILES_ID {
+            UserEvent::ToggleHiddenFiles
         } else {
             return;
         };

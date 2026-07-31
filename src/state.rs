@@ -21,6 +21,9 @@ pub struct WindowFrame {
 #[serde(default)]
 pub struct State {
     pub window: Option<WindowFrame>,
+    /// Whether the file-tree sidebar was open. Someone using it instead
+    /// of Finder shouldn't have to reopen it every launch.
+    pub file_tree_visible: bool,
 }
 
 fn state_path() -> Option<PathBuf> {
@@ -58,17 +61,20 @@ mod tests {
     fn window_frame_round_trips_through_toml() {
         let state = State {
             window: Some(WindowFrame { x: -12, y: 40, width: 1280, height: 800 }),
+            file_tree_visible: true,
         };
         let serialized = toml::to_string(&state).unwrap();
         let parsed: State = toml::from_str(&serialized).unwrap();
         let frame = parsed.window.unwrap();
         assert_eq!((frame.x, frame.y, frame.width, frame.height), (-12, 40, 1280, 800));
+        assert!(parsed.file_tree_visible);
     }
 
     #[test]
     fn missing_or_garbage_state_parses_to_default() {
         let parsed: State = toml::from_str("").unwrap();
         assert!(parsed.window.is_none());
+        assert!(!parsed.file_tree_visible, "the sidebar starts hidden");
         assert!(toml::from_str::<State>("not toml at all [").is_err());
     }
 }

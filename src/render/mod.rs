@@ -24,6 +24,17 @@ struct GridOverlays<'a> {
     cmd_held: bool,
 }
 
+/// Everything the sidebar needs to draw itself, borrowed from `App`'s
+/// `FileTree` for the duration of one frame. `Some` means visible -- the
+/// renderer never decides that on its own.
+pub struct FileTreeView<'a> {
+    /// The rooted directory, already abbreviated for display.
+    pub root_label: &'a str,
+    pub rows: &'a [crate::filetree::Row],
+    pub scroll: usize,
+    pub show_hidden: bool,
+}
+
 /// What happened when `Renderer::render` was asked to draw a frame.
 ///
 /// This exists because silently skipping a failed frame caused the
@@ -174,7 +185,7 @@ impl Renderer {
     /// and highlight; `status` is pre-resolved shell/cwd/git/tty info --
     /// process/filesystem lookups have no business happening in the
     /// renderer.
-    pub fn render(&mut self, tabs: &[Tab], active: usize, status: &chrome::StatusInfo, cmd_held: bool) -> RenderOutcome {
+    pub fn render(&mut self, tabs: &[Tab], active: usize, status: &chrome::StatusInfo, cmd_held: bool, file_tree: Option<FileTreeView>) -> RenderOutcome {
         let surface_texture = match self.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(t) => t,
             wgpu::CurrentSurfaceTexture::Suboptimal(t) => {
@@ -209,7 +220,8 @@ impl Renderer {
         let window_width = self.config.width as f32;
         let window_height = self.config.height as f32;
 
-        let grid_rect = chrome::grid_rect(window_width, window_height, self.atlas.cell_height);
+        let sidebar_width = chrome::file_tree_width(file_tree.is_some(), self.atlas.cell_width, window_width);
+        let grid_rect = chrome::grid_rect(window_width, window_height, self.atlas.cell_height, sidebar_width);
         let (pane_rects, dividers) = tab.layout(grid_rect, chrome::PANE_GAP);
         let divider_rects: Vec<crate::tab::PaneRect> = dividers.iter().map(|d| d.rect).collect();
 
@@ -231,6 +243,12 @@ impl Renderer {
         if pane_rects.len() > 1 {
             if let Some((_, rect)) = pane_rects.iter().find(|(id, _)| *id == tab.focused) {
                 instances.extend(chrome::build_focus_border_instances(&self.atlas, *rect));
+            }
+        }
+
+        if let Some(view) = file_tree {
+            if let Some(rect) = chrome::file_tree_rect(window_width, window_height, self.atlas.cell_width, self.atlas.cell_height, true) {
+                instances.extend(chrome::build_file_tree_instances(&self.atlas, rect, view.root_label, view.rows, view.scroll, view.show_hidden));
             }
         }
 
