@@ -556,25 +556,28 @@ impl App {
     /// Hit-test a left click against the tab strip using the exact same
     /// `chrome::tab_bar_layout` the renderer draws it with, so a click
     /// always lands on whatever's visually under the cursor.
-    fn handle_tab_bar_click(&mut self, event_loop: &ActiveEventLoop) {
-        let (Some(window), Some(renderer)) = (&self.window, &self.renderer) else {
-            return;
+    /// Returns whether the click landed on a tab strip at all -- the
+    /// caller uses that to decide whether to keep looking for something
+    /// else under the cursor.
+    fn handle_tab_bar_click(&mut self, event_loop: &ActiveEventLoop) -> bool {
+        let Some((cell_w, cell_h)) = self.renderer.as_ref().map(Renderer::cell_size) else {
+            return false;
         };
-        let (cell_w, cell_h) = renderer.cell_size();
-        let _ = window;
         let tab_bar_h = chrome::tab_bar_height(cell_h);
-        // Every group has its own strip, so find the one whose strip the
-        // click is in rather than assuming a single bar across the top.
+        // Every group has its own strip, and a group below a horizontal
+        // split has its strip partway down the window -- so find the
+        // group whose strip contains the click rather than testing
+        // against a single band across the top.
         let (x, y) = self.cursor_pos;
         let Some((group_id, rect)) = self
             .group_rects()
             .into_iter()
             .find(|(_, r)| r.contains(x, y) && y < r.y + tab_bar_h)
         else {
-            return;
+            return false;
         };
         let strip = tab::PaneRect { x: rect.x, y: rect.y, w: rect.w, h: tab_bar_h };
-        let Some(group) = self.root().group(group_id) else { return };
+        let Some(group) = self.root().group(group_id) else { return false };
         let titles: Vec<String> = group.tabs().iter().map(|t| t.title().to_string()).collect();
         let layout = chrome::tab_bar_layout(&titles, strip, cell_w);
 
@@ -598,8 +601,10 @@ impl App {
                 }
             }
             Some(chrome::TabBarHit::NewTab) => self.open_tab(),
+            // Empty space in the strip: focusing the group is enough.
             None => self.after_layout_change(),
         }
+        true
     }
 
     /// Every visible shell's content rectangle, keyed by pane id --
@@ -1846,11 +1851,8 @@ impl ApplicationHandler<UserEvent> for App {
                 self.update_cursor_icon();
             }
             WindowEvent::MouseInput { state: ElementState::Pressed, button: MouseButton::Left, .. } => {
-                let Some(cell_h) = self.renderer.as_ref().map(|r| r.cell_size().1) else {
-                    return;
-                };
-                if self.cursor_pos.1 < chrome::tab_bar_height(cell_h) {
-                    self.handle_tab_bar_click(event_loop);
+                if self.handle_tab_bar_click(event_loop) {
+                    // Handled: the click was on some group's tab strip.
                 } else if self.on_file_tree_edge(self.cursor_pos.0, self.cursor_pos.1) {
                     // Checked before the sidebar body: the grab strip
                     // overlaps its first few pixels.

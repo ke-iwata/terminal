@@ -55,18 +55,21 @@ pub fn status_bar_height(cell_h: f32) -> f32 {
     cell_h * 1.2
 }
 
-/// The pixel rectangle between the tab bar and the status bar, minus the
-/// file-tree sidebar when it's open -- the area panes are laid out in.
-/// The single source of truth for that math: rendering, click
-/// hit-testing, and pty resizing all start from this.
+/// The pixel rectangle above the status bar, minus the file-tree
+/// sidebar when it's open -- the area groups are laid out in. The single
+/// source of truth for that math: rendering, click hit-testing, and pty
+/// resizing all start from this.
+///
+/// Nothing is reserved at the top: tab strips belong to the groups now,
+/// each drawn inside its own rect, so a window-wide band up there would
+/// just be an empty gap.
 pub fn grid_rect(window_width: f32, window_height: f32, cell_h: f32, sidebar_width: f32) -> PaneRect {
-    let top = tab_bar_height(cell_h);
     let bottom = status_bar_height(cell_h);
     PaneRect {
         x: 0.0,
-        y: top,
+        y: 0.0,
         w: (window_width - sidebar_width).max(1.0),
-        h: (window_height - top - bottom).max(cell_h),
+        h: (window_height - bottom).max(cell_h),
     }
 }
 
@@ -104,13 +107,12 @@ pub fn file_tree_rect(window_width: f32, window_height: f32, cell_w: f32, cell_h
     if w <= 0.0 {
         return None;
     }
-    let top = tab_bar_height(cell_h);
     let bottom = status_bar_height(cell_h);
     Some(PaneRect {
         x: window_width - w,
-        y: top,
+        y: 0.0,
         w,
-        h: (window_height - top - bottom).max(cell_h),
+        h: (window_height - bottom).max(cell_h),
     })
 }
 
@@ -840,5 +842,40 @@ mod tests {
         let rect = file_tree_rect(WINDOW_W, 600.0, CELL_W, CELL_H, true, 300.0).unwrap();
         assert_eq!(grid.w + rect.w, WINDOW_W, "no overlap and no gap between them");
         assert_eq!(grid.x + grid.w, rect.x);
+    }
+
+    #[test]
+    fn nothing_is_reserved_above_the_groups() {
+        // Regression: the window-wide tab bar moved into the groups, but
+        // the layout kept reserving its height at the top, leaving an
+        // empty band there -- and pushing every strip below the band the
+        // click handler was testing against.
+        let grid = grid_rect(WINDOW_W, 600.0, CELL_H, 0.0);
+        assert_eq!(grid.y, 0.0);
+        assert_eq!(grid.h, 600.0 - status_bar_height(CELL_H));
+        let sidebar = file_tree_rect(WINDOW_W, 600.0, CELL_W, CELL_H, true, 0.0).unwrap();
+        assert_eq!(sidebar.y, 0.0, "the sidebar starts at the top too");
+    }
+
+    #[test]
+    fn a_tab_strip_lays_out_and_hit_tests_where_its_group_is() {
+        // A group below a horizontal split has its strip partway down the
+        // window and offset from x=0; the layout has to follow it there,
+        // or clicks land on the wrong tab (or on nothing).
+        let titles = vec!["one".to_string(), "two".to_string()];
+        let strip = PaneRect { x: 500.0, y: 583.0, w: 400.0, h: tab_bar_height(CELL_H) };
+        let layout = tab_bar_layout(&titles, strip, CELL_W);
+
+        assert!(layout.tabs[0].x0 >= strip.x, "the first tab starts inside the strip");
+        assert!(layout.new_tab_x1 <= strip.x + strip.w, "the + button stays inside it");
+
+        let first = &layout.tabs[0];
+        let second = &layout.tabs[1];
+        assert!(matches!(layout.hit_test((first.x0 + first.close_x0) / 2.0), Some(TabBarHit::Switch(0))));
+        assert!(matches!(layout.hit_test((second.x0 + second.close_x0) / 2.0), Some(TabBarHit::Switch(1))));
+        assert!(matches!(layout.hit_test(second.close_x0 + 1.0), Some(TabBarHit::Close(1))));
+        assert!(matches!(layout.hit_test(layout.new_tab_x0 + 1.0), Some(TabBarHit::NewTab)));
+        // Left of the strip entirely: not this group's business.
+        assert!(layout.hit_test(strip.x - 50.0).is_none());
     }
 }
