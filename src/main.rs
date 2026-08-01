@@ -75,21 +75,24 @@ enum UserEvent {
     /// A worker thread finished loading a preview, tagged with the path
     /// it was asked for so a result the user has already moved on from
     /// can be dropped.
-    PreviewLoaded(std::path::PathBuf, Result<preview::Content, String>),
+    PreviewLoaded(std::path::PathBuf, Result<preview::Loaded, String>),
 }
 
 struct App {
     config: Config,
     window: Option<Arc<Window>>,
     renderer: Option<Renderer>,
-    tabs: Vec<Tab>,
-    active: usize,
+    /// The window's split layout: a tree of tab groups. `Option` only so
+    /// group removal can take ownership of the tree to restructure it;
+    /// it is never `None` between operations.
+    root: Option<tab::GroupNode>,
+    /// Which group keyboard input and new tabs go to.
+    focused_group: u64,
+    /// Tab ids are unique across every group. A shell tab's pane takes
+    /// the same id, so a pty reader event -- which carries only the pane
+    /// id -- identifies exactly one tab anywhere in the tree.
     next_tab_id: u64,
-    /// Pane ids are drawn from their own counter (not the tab counter) and
-    /// are unique across every tab -- pty reader events are tagged with
-    /// them, and events from a pane closed in one tab must never be
-    /// mistaken for a pane in another.
-    next_pane_id: u64,
+    next_group_id: u64,
     proxy: EventLoopProxy<UserEvent>,
     modifiers: ModifiersState,
     settings_window: Option<SettingsWindow>,
@@ -191,9 +194,9 @@ impl App {
             window: None,
             renderer: None,
             next_tab_id: first_tab.id + 1,
-            next_pane_id: first_tab.focused().map_or(0, |id| id + 1),
-            tabs: vec![first_tab],
-            active: 0,
+            next_group_id: 1,
+            focused_group: 0,
+            root: Some(tab::GroupNode::Leaf(Box::new(tab::Group::new(0, first_tab)))),
             proxy,
             modifiers: ModifiersState::empty(),
             settings_window: None,
@@ -218,12 +221,80 @@ impl App {
         }
     }
 
+    fn root(&self) -> &tab::GroupNode {
+        self.root.as_ref().expect("the tree always has at least one group")
+    }
+
+    fn root_mut(&mut self) -> &mut tab::GroupNode {
+        self.root.as_mut().expect("the tree always has at least one group")
+    }
+
+    /// The group keyboard input goes to. Falls back to the first group
+    /// if `focused_group` ever names one that's gone, so input is never
+    /// stranded.
+    fn focused_group(&self) -> &tab::Group {
+        let focused = self.focused_group;
+        self.root()
+            .group(focused)
+            .unwrap_or_else(|| self.root().groups().into_iter().next().expect("never empty"))
+    }
+
+    fn focused_group_mut(&mut self) -> &mut tab::Group {
+        let focused = self.focused_group;
+        if self.root().group(focused).is_none() {
+            self.focused_group = self.root().groups()[0].id;
+        }
+        let focused = self.focused_group;
+        self.root_mut().group_mut(focused).expect("just ensured it exists")
+    }
+
+    /// The tab that has keyboard focus: the focused group's active one.
     fn active_tab(&self) -> &Tab {
-        &self.tabs[self.active]
+        self.focused_group().active_tab()
     }
 
     fn active_tab_mut(&mut self) -> &mut Tab {
-        &mut self.tabs[self.active]
+        self.focused_group_mut().active_tab_mut()
+    }
+
+    /// The shell that keystrokes reach, or `None` when the focused tab
+    /// is a preview.
+    fn focused_pane(&self) -> Option<&tab::Pane> {
+        self.active_tab().pane()
+    }
+
+    fn focused_pane_mut(&mut self) -> Option<&mut tab::Pane> {
+        self.active_tab_mut().pane_mut()
+    }
+
+    /// Find a pane anywhere in the tree by id -- pty reader events carry
+    /// only the pane id, and the pane may be in a background tab of a
+    /// group that isn't focused.
+    fn pane_by_id_mut(&mut self, pane_id: u64) -> Option<&mut tab::Pane> {
+        self.root_mut()
+            .groups_mut()
+            .into_iter()
+            .flat_map(|g| g.tabs_mut())
+            .find_map(|t| t.pane_mut().filter(|p| p.id == pane_id))
+    }
+
+    /// A tab anywhere in the tree, by id.
+    fn tab_mut_by_id(&mut self, tab_id: u64) -> Option<&mut Tab> {
+        self.root_mut()
+            .groups_mut()
+            .into_iter()
+            .flat_map(|g| g.tabs_mut())
+            .find(|t| t.id == tab_id)
+    }
+
+    /// Every live pane, for config changes and shutdown.
+    fn all_panes_mut(&mut self) -> Vec<&mut tab::Pane> {
+        self.root_mut()
+            .groups_mut()
+            .into_iter()
+            .flat_map(|g| g.tabs_mut())
+            .filter_map(tab::Tab::pane_mut)
+            .collect()
     }
 
     /// Apply a config (just saved from the settings window, or reloaded
@@ -241,10 +312,9 @@ impl App {
             renderer.set_palette(palette);
             renderer.set_opacity(config.opacity);
         }
-        for tab in &mut self.tabs {
-            for pane in tab.panes_mut() {
-                pane.term.set_scrollback_limit(config.scrollback_lines);
-            }
+        let scrollback = config.scrollback_lines;
+        for pane in self.all_panes_mut() {
+            pane.term.set_scrollback_limit(scrollback);
         }
 
         let font_changed = config.font != self.config.font;
@@ -273,30 +343,66 @@ impl App {
         if let Some(renderer) = &mut self.renderer {
             renderer.set_font(&self.config.font, scale_factor);
         }
-        self.relayout_all_tabs(true);
+        self.relayout(true);
     }
 
     /// The full grid area's cols/rows for the current window size --
     /// what a tab with a single (unsplit) pane gets. `None` before the
     /// window/renderer exist.
-    fn grid_size(&self) -> Option<(usize, usize)> {
-        let window = self.window.as_ref()?;
-        let renderer = self.renderer.as_ref()?;
+    /// Every group's rectangle at the current window size -- the single
+    /// source of truth shared by layout, rendering, and hit-testing.
+    fn group_rects(&self) -> Vec<(u64, tab::PaneRect)> {
+        let (Some(window), Some(renderer)) = (&self.window, &self.renderer) else {
+            return Vec::new();
+        };
         let (cell_w, cell_h) = renderer.cell_size();
         let size = window.inner_size();
-        let cols = ((size.width as f32 / cell_w).floor() as usize).max(1);
-        let rows = chrome::terminal_rows(size.height as f32, cell_h);
-        Some((cols, rows))
+        let sidebar = chrome::file_tree_width(self.file_tree_visible, self.file_tree_width, cell_w, size.width as f32);
+        let grid = chrome::grid_rect(size.width as f32, size.height as f32, cell_h, sidebar);
+        let mut path = Vec::new();
+        let mut groups = Vec::new();
+        let mut dividers = Vec::new();
+        self.root().layout(grid, chrome::PANE_GAP, &mut path, &mut groups, &mut dividers);
+        groups
     }
 
-    /// Recompute every pane's rectangle from the current window size and
-    /// split tree, and push each pane's new cols/rows to its Term/Grid
-    /// model (so rendering is correct on every call) and, at most once
-    /// per `PTY_RESIZE_THROTTLE` unless `force` is set, to its pty (so the
-    /// shell's SIGWINCH-driven reflow, e.g. `stty size`, matches). Runs
-    /// over every tab, not just the active one -- background tabs keep
+    /// The cols/rows a tab gets in the focused group, for sizing a shell
+    /// at spawn time. `None` before the window/renderer exist.
+    fn group_content_size(&self) -> Option<(usize, usize)> {
+        let (cell_w, cell_h) = self.renderer.as_ref().map(Renderer::cell_size)?;
+        let focused = self.focused_group;
+        let (_, rect) = self.group_rects().into_iter().find(|(id, _)| *id == focused)?;
+        let content_h = (rect.h - chrome::tab_bar_height(cell_h)).max(cell_h);
+        Some((
+            ((rect.w / cell_w).floor() as usize).max(1),
+            ((content_h / cell_h).floor() as usize).max(1),
+        ))
+    }
+
+    /// The content rect (below the tab strip) of the group under a
+    /// window position, with its id.
+    fn group_at(&self, x: f32, y: f32) -> Option<(u64, tab::PaneRect)> {
+        let (_, cell_h) = self.renderer.as_ref().map(Renderer::cell_size)?;
+        let tab_bar_h = chrome::tab_bar_height(cell_h);
+        self.group_rects().into_iter().find(|(_, r)| r.contains(x, y)).map(|(id, r)| {
+            (
+                id,
+                tab::PaneRect { x: r.x, y: r.y + tab_bar_h, w: r.w, h: (r.h - tab_bar_h).max(1.0) },
+            )
+        })
+    }
+
+    /// Recompute every group's rectangle from the current window size and
+    /// split tree, and push each visible shell's new cols/rows to its
+    /// Term/Grid model (so rendering is correct on every call) and, at
+    /// most once per `PTY_RESIZE_THROTTLE` unless `force` is set, to its
+    /// pty (so the shell's SIGWINCH-driven reflow, e.g. `stty size`,
+    /// matches).
+    ///
+    /// Every tab is sized, not just the visible one: background tabs keep
     /// running and must have already reflowed correctly by the time
-    /// they're switched to.
+    /// they're switched to. They all share their group's content rect,
+    /// since that is the size they will have when shown.
     ///
     /// The throttle exists for divider dragging: `update_divider_drag`
     /// calls this on every `CursorMoved`, and a real terminal size change
@@ -305,26 +411,24 @@ impl App {
     /// the macOS default) redisplay the prompt each time they receive
     /// one -- signaled faster than they can redisplay, that reads as
     /// garbled, duplicated-looking prompt spam during a fast drag. Callers
-    /// that aren't a live drag (window resize, font change, tab/pane
+    /// that aren't a live drag (window resize, font change, tab/group
     /// creation) pass `force: true` so the pty is always in sync
     /// immediately; the drag itself force-flushes once more when it ends
     /// (see the `MouseInput` `Released` handler) so the shell never stays
     /// out of sync with the final size.
-    fn relayout_all_tabs(&mut self, force: bool) {
-        let (Some(window), Some(renderer)) = (&self.window, &self.renderer) else {
+    fn relayout(&mut self, force: bool) {
+        let Some((cell_w, cell_h)) = self.renderer.as_ref().map(Renderer::cell_size) else {
             return;
         };
-        let (cell_w, cell_h) = renderer.cell_size();
-        let size = window.inner_size();
-        let sidebar = chrome::file_tree_width(self.file_tree_visible, self.file_tree_width, cell_w, size.width as f32);
-        let grid = chrome::grid_rect(size.width as f32, size.height as f32, cell_h, sidebar);
+        let rects = self.group_rects();
+        let tab_bar_h = chrome::tab_bar_height(cell_h);
         let now = Instant::now();
-        for tab in &mut self.tabs {
-            let (rects, _) = tab.layout(grid, chrome::PANE_GAP);
-            for (pane_id, rect) in rects {
-                let pane = tab.pane_mut(pane_id).expect("layout only yields live panes");
-                let cols = ((rect.w / cell_w).floor() as usize).max(1);
-                let rows = ((rect.h / cell_h).floor() as usize).max(1);
+        for (group_id, rect) in rects {
+            let content_h = (rect.h - tab_bar_h).max(cell_h);
+            let cols = ((rect.w / cell_w).floor() as usize).max(1);
+            let rows = ((content_h / cell_h).floor() as usize).max(1);
+            let Some(group) = self.root_mut().group_mut(group_id) else { continue };
+            for pane in group.tabs_mut().iter_mut().filter_map(tab::Tab::pane_mut) {
                 if cols != pane.term.cols() || rows != pane.term.rows() {
                     pane.term.resize(cols, rows);
                 }
@@ -341,98 +445,112 @@ impl App {
         }
     }
 
-    /// Spawn a fresh tab running `self.config.shell`, make it active, and
-    /// start reading its pty.
-    fn open_tab(&mut self) {
-        let (cols, rows) = self.grid_size().unwrap_or((80, 24));
-        let tab_id = self.next_tab_id;
+    /// Build a shell tab, its pty reader already running.
+    fn new_shell_tab(&mut self, cols: usize, rows: usize) -> Tab {
+        let id = self.next_tab_id;
         self.next_tab_id += 1;
-        let pane_id = self.next_pane_id;
-        self.next_pane_id += 1;
-        let pane = tab::Pane::spawn(pane_id, &self.config.shell, cols, rows, self.config.scrollback_lines);
+        // The pane takes the tab's id, so a pty event -- which carries
+        // only a pane id -- names exactly one tab anywhere in the tree.
+        let pane = tab::Pane::spawn(id, &self.config.shell, cols, rows, self.config.scrollback_lines);
         self.spawn_pty_reader(&pane);
-        self.tabs.push(Tab::new(tab_id, pane));
-        self.activate_tab(self.tabs.len() - 1);
+        Tab::shell(id, pane)
     }
 
-    /// Split the active tab's focused pane, putting a fresh shell in the
-    /// new half and focusing it. Does nothing on a preview tab, which
-    /// has no panes to split.
-    fn split_focused_pane(&mut self, direction: tab::SplitDirection) {
-        if self.active_tab().preview_content().is_some() {
-            return;
-        }
-        let pane_id = self.next_pane_id;
-        self.next_pane_id += 1;
-        // Spawned at a placeholder size; `relayout_all_tabs` below sizes
-        // every pane (this one included) to its real rectangle.
-        let pane = tab::Pane::spawn(pane_id, &self.config.shell, 80, 24, self.config.scrollback_lines);
-        self.spawn_pty_reader(&pane);
-        if let Err(orphan) = self.active_tab_mut().split_focused(direction, pane) {
-            // The tree refused it, so nothing owns this shell -- end it
-            // rather than leaking a process with no pane to show it.
-            let _ = kill(orphan.pty_child, Signal::SIGHUP);
-            let _ = nix::sys::wait::waitpid(orphan.pty_child, None);
-            return;
-        }
-        self.relayout_all_tabs(true);
-        self.last_status_refresh = None;
-        if let Some(window) = &self.window {
-            window.request_redraw();
-        }
+    /// Open a fresh shell as a new tab in the focused group.
+    fn open_tab(&mut self) {
+        let (cols, rows) = self.group_content_size().unwrap_or((80, 24));
+        let tab = self.new_shell_tab(cols, rows);
+        self.focused_group_mut().add_tab(tab);
+        self.after_layout_change();
     }
 
-    /// Close the focused pane: its split collapses into the sibling. When
-    /// it's the tab's only pane, this is just closing the tab.
-    fn close_focused_pane(&mut self, event_loop: &ActiveEventLoop) {
-        let tab = self.active_tab_mut();
-        // A preview tab has no panes, so Cmd+W closes the whole tab --
-        // which is what closing "the thing in front of you" means there.
-        if tab.pane_count() <= 1 {
-            let id = tab.id;
-            self.close_tab(id, event_loop);
-            return;
+    /// Split the focused group in two, putting a fresh shell in the new
+    /// half and focusing it. This is what makes "preview on one side,
+    /// shell on the other" possible: each half is a full tab strip.
+    fn split_focused_group(&mut self, direction: tab::SplitDirection) {
+        // Sized by `relayout` below; a placeholder until then.
+        let tab = self.new_shell_tab(80, 24);
+        let group_id = self.next_group_id;
+        self.next_group_id += 1;
+        let new_group = tab::Group::new(group_id, tab);
+
+        let target = self.focused_group().id;
+        let root = self.root.take().expect("the tree always has at least one group");
+        let (root, outcome) = tab::split_group(root, target, direction, new_group);
+        self.root = Some(root);
+        match outcome {
+            Ok(()) => self.focused_group = group_id,
+            Err(orphan) => {
+                // Nothing owns the shell we just spawned -- end it rather
+                // than leaking a process with no group to show it.
+                for pane in orphan.drain_tabs().iter().filter_map(tab::Tab::pane) {
+                    let _ = kill(pane.pty_child, Signal::SIGHUP);
+                    let _ = nix::sys::wait::waitpid(pane.pty_child, None);
+                }
+            }
         }
-        let Some(focused) = tab.focused() else { return };
-        if let Some(pane) = tab.remove_pane(focused) {
-            let _ = kill(pane.pty_child, Signal::SIGHUP);
-            let _ = nix::sys::wait::waitpid(pane.pty_child, None);
-        }
-        self.relayout_all_tabs(true);
-        self.last_status_refresh = None;
-        if let Some(window) = &self.window {
-            window.request_redraw();
-        }
+        self.after_layout_change();
     }
 
-    /// End every shell in the tab (SIGHUP, same signal a real terminal
-    /// sends its shell on close) and remove it.
-    fn close_tab(&mut self, id: u64, event_loop: &ActiveEventLoop) {
-        let Some(index) = self.tabs.iter().position(|t| t.id == id) else {
+    /// Close the focused group's active tab. Closing a group's last tab
+    /// closes the group, collapsing the split into its sibling; closing
+    /// the last group quits.
+    fn close_active_tab(&mut self, event_loop: &ActiveEventLoop) {
+        let index = self.focused_group().active_index();
+        let removed = self.focused_group_mut().close_tab(index);
+        if let Some(tab) = removed {
+            self.retire_tab(tab);
+            self.after_layout_change();
             return;
-        };
-        for pane in self.tabs[index].panes() {
-            let _ = kill(pane.pty_child, Signal::SIGHUP);
-            let _ = nix::sys::wait::waitpid(pane.pty_child, None);
         }
-        self.remove_tab(index, event_loop);
+        // That was the group's only tab, so the group itself goes.
+        let group_id = self.focused_group().id;
+        self.close_group(group_id, event_loop);
     }
 
-    /// Drop tab `index` from `self.tabs` and reassign `self.active` so it
-    /// keeps pointing at a sensible neighbor, or quit the app if that was
-    /// the last tab -- matching today's single-session "shell exits ->
-    /// app exits" behavior. Assumes the tab's shell process has already
-    /// been signaled/reaped by the caller (`close_tab`, or `PtyExited` for
-    /// a shell that exited on its own).
-    fn remove_tab(&mut self, index: usize, event_loop: &ActiveEventLoop) {
-        if self.tabs.len() == 1 {
+    /// Remove a whole group, ending every shell it held.
+    fn close_group(&mut self, group_id: u64, event_loop: &ActiveEventLoop) {
+        if self.root().groups().len() <= 1 {
+            // The last group closing means the app is done, matching the
+            // single-session "shell exits -> app exits" behavior.
             event_loop.exit();
             return;
         }
-        self.tabs.remove(index);
-        let new_len = self.tabs.len();
-        let next = if self.active > index { self.active - 1 } else { self.active.min(new_len - 1) };
-        self.activate_tab(next);
+        let root = self.root.take().expect("the tree always has at least one group");
+        let (rest, removed) = tab::remove_group(root, group_id);
+        self.root = rest;
+        if let Some(group) = removed {
+            for tab in group.drain_tabs() {
+                self.retire_tab(tab);
+            }
+        }
+        if self.root().group(self.focused_group).is_none() {
+            self.focused_group = self.root().groups()[0].id;
+        }
+        self.after_layout_change();
+    }
+
+    /// End a closed tab's shell (SIGHUP, the same signal a real terminal
+    /// sends) and release any preview texture it held.
+    fn retire_tab(&mut self, tab: Tab) {
+        if let Some(pane) = tab.pane() {
+            let _ = kill(pane.pty_child, Signal::SIGHUP);
+            let _ = nix::sys::wait::waitpid(pane.pty_child, None);
+        }
+        if let Some(renderer) = &mut self.renderer {
+            renderer.forget_preview_image(tab.id);
+        }
+    }
+
+    /// Everything that has to happen after the tree's shape or the
+    /// focused tab changes: re-fit the shells, re-resolve the status bar,
+    /// redraw.
+    fn after_layout_change(&mut self) {
+        self.relayout(true);
+        self.last_status_refresh = None;
+        if let Some(window) = &self.window {
+            window.request_redraw();
+        }
     }
 
     /// Hit-test a left click against the tab strip using the exact same
@@ -443,44 +561,81 @@ impl App {
             return;
         };
         let (cell_w, cell_h) = renderer.cell_size();
-        if self.cursor_pos.1 >= chrome::tab_bar_height(cell_h) {
+        let _ = window;
+        let tab_bar_h = chrome::tab_bar_height(cell_h);
+        // Every group has its own strip, so find the one whose strip the
+        // click is in rather than assuming a single bar across the top.
+        let (x, y) = self.cursor_pos;
+        let Some((group_id, rect)) = self
+            .group_rects()
+            .into_iter()
+            .find(|(_, r)| r.contains(x, y) && y < r.y + tab_bar_h)
+        else {
             return;
-        }
-        let window_width = window.inner_size().width as f32;
-        let titles: Vec<String> = self.tabs.iter().map(|t| t.title().to_string()).collect();
-        let layout = chrome::tab_bar_layout(&titles, window_width, cell_w);
+        };
+        let strip = tab::PaneRect { x: rect.x, y: rect.y, w: rect.w, h: tab_bar_h };
+        let Some(group) = self.root().group(group_id) else { return };
+        let titles: Vec<String> = group.tabs().iter().map(|t| t.title().to_string()).collect();
+        let layout = chrome::tab_bar_layout(&titles, strip, cell_w);
 
-        match layout.hit_test(self.cursor_pos.0) {
+        // Clicking any strip focuses that group, so the next keystroke
+        // goes where the eye just went.
+        self.focused_group = group_id;
+        match layout.hit_test(x) {
             Some(chrome::TabBarHit::Switch(index)) => {
-                self.activate_tab(index);
+                self.focused_group_mut().activate(index);
+                self.after_layout_change();
             }
             Some(chrome::TabBarHit::Close(index)) => {
-                let id = self.tabs[index].id;
-                self.close_tab(id, event_loop);
+                let removed = self.focused_group_mut().close_tab(index);
+                match removed {
+                    Some(tab) => {
+                        self.retire_tab(tab);
+                        self.after_layout_change();
+                    }
+                    // Its last tab: the group goes with it.
+                    None => self.close_group(group_id, event_loop),
+                }
             }
             Some(chrome::TabBarHit::NewTab) => self.open_tab(),
-            None => {}
+            None => self.after_layout_change(),
         }
     }
 
-    /// The active tab's pane rectangles at the current window size --
-    /// computed on demand from the same pure layout the renderer uses, so
-    /// clicks always land on what's visually under the cursor.
+    /// Every visible shell's content rectangle, keyed by pane id --
+    /// computed from the same pure layout the renderer uses, so clicks
+    /// always land on what's visually under the cursor. Groups showing a
+    /// preview contribute nothing.
     fn pane_rects(&self) -> Vec<(u64, tab::PaneRect)> {
-        let (Some(window), Some(renderer)) = (&self.window, &self.renderer) else {
+        let Some((_, cell_h)) = self.renderer.as_ref().map(Renderer::cell_size) else {
             return Vec::new();
         };
-        let size = window.inner_size();
-        let (cell_w, cell_h) = renderer.cell_size();
-        let sidebar = chrome::file_tree_width(self.file_tree_visible, self.file_tree_width, cell_w, size.width as f32);
-        let grid = chrome::grid_rect(size.width as f32, size.height as f32, cell_h, sidebar);
-        self.active_tab().layout(grid, chrome::PANE_GAP).0
+        let tab_bar_h = chrome::tab_bar_height(cell_h);
+        self.group_rects()
+            .into_iter()
+            .filter_map(|(group_id, rect)| {
+                let pane = self.root().group(group_id)?.active_tab().pane()?;
+                Some((
+                    pane.id,
+                    tab::PaneRect { x: rect.x, y: rect.y + tab_bar_h, w: rect.w, h: (rect.h - tab_bar_h).max(1.0) },
+                ))
+            })
+            .collect()
     }
 
-    /// Which of the active tab's panes is under the window-pixel position,
-    /// if any (dividers and the bars hit nothing).
+    /// Which visible shell is under the window-pixel position, if any
+    /// (tab strips, dividers, and the bars hit nothing).
     fn pane_at(&self, x: f32, y: f32) -> Option<u64> {
         self.pane_rects().into_iter().find(|(_, r)| r.contains(x, y)).map(|(id, _)| id)
+    }
+
+    /// The pane behind a pane id, wherever in the tree it lives.
+    fn pane_by_id(&self, pane_id: u64) -> Option<&tab::Pane> {
+        self.root()
+            .groups()
+            .into_iter()
+            .flat_map(|g| g.tabs())
+            .find_map(|t| t.pane().filter(|p| p.id == pane_id))
     }
 
     /// The divider under the window-pixel position, if any. The visible
@@ -497,7 +652,10 @@ impl App {
         let (cell_w, cell_h) = renderer.cell_size();
         let sidebar = chrome::file_tree_width(self.file_tree_visible, self.file_tree_width, cell_w, size.width as f32);
         let grid = chrome::grid_rect(size.width as f32, size.height as f32, cell_h, sidebar);
-        let (_, dividers) = self.active_tab().layout(grid, chrome::PANE_GAP);
+        let mut path = Vec::new();
+        let mut groups = Vec::new();
+        let mut dividers = Vec::new();
+        self.root().layout(grid, chrome::PANE_GAP, &mut path, &mut groups, &mut dividers);
         dividers.into_iter().find(|d| {
             let r = d.rect;
             let padded = tab::PaneRect { x: r.x - GRAB, y: r.y - GRAB, w: r.w + GRAB * 2.0, h: r.h + GRAB * 2.0 };
@@ -524,8 +682,8 @@ impl App {
             return; // region too small to meaningfully resize
         }
         let ratio = ((pos - start) / extent).clamp(min_px / extent, 1.0 - min_px / extent);
-        self.active_tab_mut().set_split_ratio(&divider.path, ratio);
-        self.relayout_all_tabs(false);
+        self.root_mut().set_ratio(&divider.path, ratio);
+        self.relayout(false);
         if let Some(window) = &self.window {
             window.request_redraw();
         }
@@ -563,7 +721,7 @@ impl App {
         let renderer = self.renderer.as_ref()?;
         let (cell_w, cell_h) = renderer.cell_size();
         let (_, rect) = self.pane_rects().into_iter().find(|(id, _)| *id == pane_id)?;
-        let pane = self.active_tab().pane(pane_id)?;
+        let pane = self.pane_by_id(pane_id)?;
         let grid = pane.term.grid();
         let col = (((x - rect.x) / cell_w).floor().max(0.0) as usize).min(grid.cols.saturating_sub(1));
         let view_row = (((y - rect.y) / cell_h).floor().max(0.0) as usize).min(grid.rows.saturating_sub(1));
@@ -577,7 +735,7 @@ impl App {
         let renderer = self.renderer.as_ref()?;
         let (cell_w, cell_h) = renderer.cell_size();
         let (_, rect) = self.pane_rects().into_iter().find(|(id, _)| *id == pane_id)?;
-        let pane = self.active_tab().pane(pane_id)?;
+        let pane = self.pane_by_id(pane_id)?;
         let col = (((x - rect.x) / cell_w).floor().max(0.0) as usize).min(pane.term.cols() - 1) as u16 + 1;
         let row = (((y - rect.y) / cell_h).floor().max(0.0) as usize).min(pane.term.rows() - 1) as u16 + 1;
         Some((col, row))
@@ -592,7 +750,7 @@ impl App {
             return None;
         }
         let pane_id = self.pane_at(x, y)?;
-        let pane = self.active_tab().pane(pane_id)?;
+        let pane = self.pane_by_id(pane_id)?;
         let mode = pane.term.modes.mouse_mode;
         if mode == term::MouseMode::Off {
             return None;
@@ -604,7 +762,7 @@ impl App {
     /// Write an encoded mouse event (if any) to `pane_id`'s pty.
     fn send_mouse_event(&self, pane_id: u64, bytes: Option<Vec<u8>>) {
         let Some(bytes) = bytes else { return };
-        let Some(pane) = self.active_tab().pane(pane_id) else { return };
+        let Some(pane) = self.pane_by_id(pane_id) else { return };
         write_all_to_pty(pane.pty_master.as_fd(), &bytes);
     }
 
@@ -619,7 +777,7 @@ impl App {
         let Some(tab::GridPoint { distance, col }) = self.grid_point_in_pane(pane_id, self.cursor_pos.0, self.cursor_pos.1) else {
             return false;
         };
-        let Some(pane) = self.active_tab().pane(pane_id) else {
+        let Some(pane) = self.pane_by_id(pane_id) else {
             return false;
         };
         let Some(row) = pane.term.grid().absolute_line(distance) else {
@@ -651,9 +809,12 @@ impl App {
         };
         // A click anywhere in a pane focuses it, selection or not --
         // that's the entire mouse story for pane focus.
-        if self.active_tab().focused() != Some(pane_id) {
-            self.active_tab_mut().set_focused(pane_id);
-            self.last_status_refresh = None;
+        // Clicking a shell focuses whichever group is showing it.
+        if let Some((group_id, _)) = self.group_at(self.cursor_pos.0, self.cursor_pos.1) {
+            if self.focused_group != group_id {
+                self.focused_group = group_id;
+                self.last_status_refresh = None;
+            }
         }
         let Some(point) = self.grid_point_in_pane(pane_id, self.cursor_pos.0, self.cursor_pos.1) else {
             return;
@@ -671,7 +832,7 @@ impl App {
         if count == 1 {
             self.dragging_pane = Some(pane_id);
         }
-        if let Some(pane) = self.active_tab_mut().pane_mut(pane_id) {
+        if let Some(pane) = self.pane_by_id_mut(pane_id) {
             match count {
                 2 => {
                     if let Some(selection) = tab::word_selection(pane.term.grid(), point) {
@@ -695,7 +856,7 @@ impl App {
         let Some(point) = self.grid_point_in_pane(pane_id, self.cursor_pos.0, self.cursor_pos.1) else {
             return;
         };
-        if let Some(pane) = self.active_tab_mut().pane_mut(pane_id) {
+        if let Some(pane) = self.pane_by_id_mut(pane_id) {
             if let Some(selection) = &mut pane.selection {
                 selection.cursor = point;
             }
@@ -713,7 +874,7 @@ impl App {
         let Some(pane_id) = self.dragging_pane.take() else {
             return;
         };
-        if let Some(pane) = self.active_tab_mut().pane_mut(pane_id) {
+        if let Some(pane) = self.pane_by_id_mut(pane_id) {
             if pane.selection.is_some_and(|s| s.anchor == s.cursor) {
                 pane.selection = None;
                 if let Some(window) = &self.window {
@@ -728,7 +889,7 @@ impl App {
     /// query was typed rather than clearing it, since there's no reason a
     /// repeated Cmd+F should throw away progress.
     fn open_search(&mut self) {
-        let Some(pane) = self.active_tab_mut().focused_pane_mut() else { return };
+        let Some(pane) = self.focused_pane_mut() else { return };
         if pane.search.is_none() {
             pane.search = Some(tab::Search::new());
         }
@@ -738,7 +899,7 @@ impl App {
     }
 
     fn close_search(&mut self) {
-        if let Some(pane) = self.active_tab_mut().focused_pane_mut() {
+        if let Some(pane) = self.focused_pane_mut() {
             pane.search = None;
         }
         if let Some(window) = &self.window {
@@ -762,7 +923,7 @@ impl App {
                 }
             }
             Key::Named(NamedKey::Backspace) => {
-                if let Some(search) = self.active_tab_mut().focused_pane_mut().and_then(|p| p.search.as_mut()) {
+                if let Some(search) = self.focused_pane_mut().and_then(|p| p.search.as_mut()) {
                     search.query.pop();
                 }
                 self.recompute_search();
@@ -773,7 +934,7 @@ impl App {
                     // reports `text` for for some named keys (e.g. Tab)
                     // -- only append genuinely printable input.
                     if !text.is_empty() && text.chars().all(|c| !c.is_control()) {
-                        if let Some(search) = self.active_tab_mut().focused_pane_mut().and_then(|p| p.search.as_mut()) {
+                        if let Some(search) = self.focused_pane_mut().and_then(|p| p.search.as_mut()) {
                             search.query.push_str(text);
                         }
                         self.recompute_search();
@@ -786,7 +947,7 @@ impl App {
     /// Re-runs the focused pane's search after its query changed and jumps
     /// the view to the (new) first match.
     fn recompute_search(&mut self) {
-        let Some(pane) = self.active_tab_mut().focused_pane_mut() else { return };
+        let Some(pane) = self.focused_pane_mut() else { return };
         let grid = pane.term.grid();
         if let Some(search) = &mut pane.search {
             search.recompute(grid);
@@ -798,7 +959,7 @@ impl App {
     }
 
     fn step_search(&mut self, forward: bool) {
-        let Some(pane) = self.active_tab_mut().focused_pane_mut() else { return };
+        let Some(pane) = self.focused_pane_mut() else { return };
         let Some(search) = &mut pane.search else { return };
         if forward {
             search.go_next();
@@ -815,7 +976,7 @@ impl App {
     /// centered in the viewport. No-op if there's no open search or no
     /// current match (an empty query, or one with no hits).
     fn jump_to_search_match(&mut self) {
-        let Some(pane) = self.active_tab_mut().focused_pane_mut() else { return };
+        let Some(pane) = self.focused_pane_mut() else { return };
         let Some(search) = &pane.search else { return };
         let Some((distance, _)) = search.current_target() else { return };
         let rows = pane.term.rows();
@@ -845,7 +1006,7 @@ impl App {
             self.file_tree.rebuild();
             self.last_tree_refresh = Some(Instant::now());
         }
-        self.relayout_all_tabs(true);
+        self.relayout(true);
         if let Some(window) = &self.window {
             window.request_redraw();
         }
@@ -920,14 +1081,30 @@ impl App {
     /// opened twice, so clicking around the tree doesn't pile up
     /// duplicate tabs.
     fn open_preview(&mut self, path: std::path::PathBuf) {
-        if let Some(index) = self.tabs.iter().position(|t| t.preview_content().is_some_and(|p| p.path == path)) {
-            self.activate_tab(index);
+        // Already open somewhere? Switch to it -- in its own group, so
+        // clicking around the tree doesn't pile up duplicates or yank
+        // the layout around.
+        let existing = self
+            .root()
+            .groups()
+            .into_iter()
+            .find_map(|g| {
+                g.tabs()
+                    .iter()
+                    .position(|t| t.preview_content().is_some_and(|p| p.path == path))
+                    .map(|index| (g.id, index))
+            });
+        if let Some((group_id, index)) = existing {
+            self.focused_group = group_id;
+            self.focused_group_mut().activate(index);
+            self.after_layout_change();
             return;
         }
+
         let tab_id = self.next_tab_id;
         self.next_tab_id += 1;
-        self.tabs.push(Tab::preview(tab_id, preview::Preview::loading(path.clone())));
-        self.activate_tab(self.tabs.len() - 1);
+        self.focused_group_mut().add_tab(Tab::preview(tab_id, preview::Preview::loading(path.clone())));
+        self.after_layout_change();
 
         let proxy = self.proxy.clone();
         std::thread::spawn(move || {
@@ -936,43 +1113,11 @@ impl App {
         });
     }
 
-    /// Switch to a tab by index, refreshing everything that follows the
-    /// active tab (status bar, and the preview texture, which belongs to
-    /// whichever preview tab is on screen).
-    fn activate_tab(&mut self, index: usize) {
-        if index >= self.tabs.len() {
-            return;
-        }
-        self.active = index;
-        self.last_status_refresh = None;
-        self.sync_preview_texture();
-        if let Some(window) = &self.window {
-            window.request_redraw();
-        }
-    }
-
-    /// Point the image pipeline at whatever the active tab is showing.
-    /// There is one texture for the whole app, so switching tabs has to
-    /// re-upload (or clear) it -- otherwise a preview tab would show the
-    /// image belonging to a different one.
-    fn sync_preview_texture(&mut self) {
-        // Both borrows are of distinct fields, so the pixels can be
-        // handed over by reference -- switching tabs must not copy a
-        // multi-megabyte image buffer just to satisfy the borrow checker.
-        let Some(renderer) = &mut self.renderer else { return };
-        match self.tabs.get(self.active).and_then(Tab::preview_content).map(|p| &p.state) {
-            Some(preview::State::Ready(preview::Content::Image { pixels, width, height })) => {
-                renderer.set_preview_image(pixels, *width, *height);
-            }
-            _ => renderer.clear_preview_image(),
-        }
-    }
-
     /// Scroll the active tab's text preview. Returns whether it consumed
     /// the wheel event.
     fn scroll_preview(&mut self, lines: f32) -> bool {
         let n = (lines.abs().ceil() as usize).min(30);
-        let Some(preview) = self.tabs.get_mut(self.active).and_then(Tab::preview_content_mut) else {
+        let Some(preview) = self.active_tab_mut().preview_content_mut() else {
             return false;
         };
         if let preview::State::Ready(preview::Content::Text(text)) = &preview.state {
@@ -1009,7 +1154,7 @@ impl App {
         // the single place that decides the limits, so the drag can't
         // disagree with what gets drawn.
         self.file_tree_width = width.max(0.0);
-        self.relayout_all_tabs(false);
+        self.relayout(false);
         if let Some(window) = &self.window {
             window.request_redraw();
         }
@@ -1021,9 +1166,9 @@ impl App {
     fn insert_path_at_prompt(&mut self, path: &std::path::Path) {
         let relative = path.strip_prefix(self.file_tree.root()).unwrap_or(path);
         let text = format!("{} ", filetree::shell_quote(&relative.to_string_lossy()));
-        let Some(pane) = self.active_tab().focused_pane() else { return };
+        let Some(pane) = self.focused_pane() else { return };
         write_all_to_pty(pane.pty_master.as_fd(), text.as_bytes());
-        if let Some(pane) = self.active_tab_mut().focused_pane_mut() {
+        if let Some(pane) = self.focused_pane_mut() {
             pane.scroll_offset = 0;
         }
     }
@@ -1126,7 +1271,7 @@ impl App {
 
         // A preview tab has no shell to report on, so the bar describes
         // the file instead: where it lives, and its repo if it's in one.
-        if let Some(preview) = self.tabs[self.active].preview_content() {
+        if let Some(preview) = self.active_tab().preview_content() {
             let dir = preview.path.parent().map(std::path::Path::to_path_buf);
             self.cached_status = chrome::StatusInfo {
                 shell: "preview".to_string(),
@@ -1140,9 +1285,13 @@ impl App {
             return;
         }
 
-        let Some(pane) = self.tabs[self.active].focused_pane_mut() else { return };
-        let master = pane.pty_master.as_fd();
-        let (fg_name, cwd) = match self.proc_info.foreground_process_name(master) {
+        let Some((master, pty_child, shell_name, tty_name)) = self
+            .focused_pane()
+            .map(|p| (Arc::clone(&p.pty_master), p.pty_child, p.shell_name.clone(), p.tty_name.clone()))
+        else {
+            return;
+        };
+        let (fg_name, cwd) = match self.proc_info.foreground_process_name(master.as_fd()) {
             // The shell itself sitting at its prompt: use the name we
             // derived from the configured shell path at spawn time rather
             // than whatever sysinfo reports for the pid. Right after a
@@ -1150,21 +1299,23 @@ impl App {
             // binary (named "terminal"), and losing that race used to
             // mistitle the tab -- the shell's own name is a fact we
             // already know, so never ask the process table for it.
-            Some((pid, _)) if pid == pane.pty_child => (pane.shell_name.clone(), self.proc_info.process_cwd(pid)),
+            Some((pid, _)) if pid == pty_child => (shell_name.clone(), self.proc_info.process_cwd(pid)),
             Some((pid, name)) => (name, self.proc_info.process_cwd(pid)),
-            None => (pane.shell_name.clone(), self.proc_info.process_cwd(pane.pty_child)),
+            None => (shell_name.clone(), self.proc_info.process_cwd(pty_child)),
         };
-        pane.title = fg_name;
+        if let Some(pane) = self.focused_pane_mut() {
+            pane.title = fg_name;
+        }
 
         let cwd_display = cwd.as_deref().map(display_path).unwrap_or_default();
         let branch = cwd.as_deref().and_then(status::git_branch);
         self.cached_cwd = cwd.clone();
 
         self.cached_status = chrome::StatusInfo {
-            shell: pane.shell_name.clone(),
+            shell: shell_name,
             cwd: cwd_display,
             branch,
-            tty: pane.tty_name.clone(),
+            tty: tty_name,
         };
     }
 }
@@ -1271,7 +1422,7 @@ impl ApplicationHandler<UserEvent> for App {
         // The first pane was constructed in `main()` at a placeholder
         // size (before the window/renderer existed to know the real one)
         // -- fit it to the actual window now.
-        self.relayout_all_tabs(true);
+        self.relayout(true);
 
         self.window.as_ref().unwrap().request_redraw();
 
@@ -1284,13 +1435,14 @@ impl ApplicationHandler<UserEvent> for App {
         // the next keypress produced fresh output. The pty's kernel-side
         // buffer holds onto that early output until we're ready to read
         // it, so nothing is lost by waiting.
-        self.spawn_pty_reader(self.tabs[0].panes()[0]);
+        let first = self.root().groups()[0].active_tab().pane().expect("the first tab is a shell");
+        self.spawn_pty_reader(first);
     }
 
     fn user_event(&mut self, event_loop: &ActiveEventLoop, event: UserEvent) {
         match event {
             UserEvent::PtyData(pane_id, generation, bytes) => {
-                let Some(pane) = self.tabs.iter_mut().find_map(|t| t.pane_mut(pane_id)) else {
+                let Some(pane) = self.pane_by_id_mut(pane_id) else {
                     return; // pane already closed
                 };
                 // Ignore output from a shell session that's since been
@@ -1356,26 +1508,29 @@ impl ApplicationHandler<UserEvent> for App {
                 }
             }
             UserEvent::PtyExited(pane_id, generation) => {
-                let Some(tab_index) = self.tabs.iter().position(|t| t.pane(pane_id).is_some()) else {
-                    return; // pane already closed
+                // A shell exiting closes its tab, exactly like Cmd+W on
+                // it -- and its group too, if that was the last tab.
+                let Some(pane) = self.pane_by_id(pane_id) else {
+                    return; // already closed
                 };
-                let tab = &mut self.tabs[tab_index];
-                let pane = tab.pane(pane_id).expect("position() just found it");
                 if generation != pane.pty_generation {
                     return;
                 }
                 let _ = nix::sys::wait::waitpid(pane.pty_child, None);
-                if tab.pane_count() > 1 {
-                    // A shell in one pane of a split exited: collapse just
-                    // that pane, exactly like Cmd+W on it.
-                    let _ = tab.remove_pane(pane_id);
-                    self.relayout_all_tabs(true);
-                    self.last_status_refresh = None;
-                    if let Some(window) = &self.window {
-                        window.request_redraw();
+                let located = self.root().groups().into_iter().find_map(|g| {
+                    g.tabs()
+                        .iter()
+                        .position(|t| t.pane().is_some_and(|p| p.id == pane_id))
+                        .map(|index| (g.id, index))
+                });
+                let Some((group_id, index)) = located else { return };
+                let Some(group) = self.root_mut().group_mut(group_id) else { return };
+                match group.close_tab(index) {
+                    Some(tab) => {
+                        self.retire_tab(tab);
+                        self.after_layout_change();
                     }
-                } else {
-                    self.remove_tab(tab_index, event_loop);
+                    None => self.close_group(group_id, event_loop),
                 }
             }
             UserEvent::OpenSettings => {
@@ -1389,17 +1544,17 @@ impl ApplicationHandler<UserEvent> for App {
                 self.apply_config(Config::load());
             }
             UserEvent::NewTab => self.open_tab(),
-            UserEvent::ClosePane => self.close_focused_pane(event_loop),
+            UserEvent::ClosePane => self.close_active_tab(event_loop),
             UserEvent::NextTab => {
-                let next = (self.active + 1) % self.tabs.len();
-                self.activate_tab(next);
+                self.focused_group_mut().cycle_tab(true);
+                self.after_layout_change();
             }
             UserEvent::PrevTab => {
-                let next = (self.active + self.tabs.len() - 1) % self.tabs.len();
-                self.activate_tab(next);
+                self.focused_group_mut().cycle_tab(false);
+                self.after_layout_change();
             }
-            UserEvent::SplitRight => self.split_focused_pane(tab::SplitDirection::Vertical),
-            UserEvent::SplitDown => self.split_focused_pane(tab::SplitDirection::Horizontal),
+            UserEvent::SplitRight => self.split_focused_group(tab::SplitDirection::Vertical),
+            UserEvent::SplitDown => self.split_focused_group(tab::SplitDirection::Horizontal),
             UserEvent::PreviewSelected => {
                 if let Some(path) = self.file_tree_selected.clone() {
                     self.open_preview(path);
@@ -1407,21 +1562,34 @@ impl ApplicationHandler<UserEvent> for App {
             }
             UserEvent::PreviewLoaded(path, result) => {
                 // The tab may have been closed while this was loading.
-                let Some(tab) = self
-                    .tabs
-                    .iter_mut()
+                let Some(tab_id) = self
+                    .root()
+                    .groups()
+                    .into_iter()
+                    .flat_map(|g| g.tabs())
                     .find(|t| t.preview_content().is_some_and(|p| p.path == path))
+                    .map(|t| t.id)
                 else {
                     return;
                 };
-                let Some(preview) = tab.preview_content_mut() else { return };
-                preview.scroll = 0;
-                preview.state = match result {
-                    Ok(content) => preview::State::Ready(content),
+                // Image pixels go to a texture keyed by this tab and are
+                // dropped here rather than also kept in the tab -- see
+                // `preview::Content`. Done before taking the tab borrow,
+                // since the upload needs the renderer.
+                let state = match result {
+                    Ok(preview::Loaded::Text(lines)) => preview::State::Ready(preview::Content::Text(lines)),
+                    Ok(preview::Loaded::Image { pixels, width, height }) => {
+                        if let Some(renderer) = &mut self.renderer {
+                            renderer.set_preview_image(tab_id, &pixels, width, height);
+                        }
+                        preview::State::Ready(preview::Content::Image { width, height })
+                    }
                     Err(message) => preview::State::Failed(message),
                 };
-                // Only the visible tab owns the single image texture.
-                self.sync_preview_texture();
+                let Some(tab) = self.tab_mut_by_id(tab_id) else { return };
+                let Some(preview) = tab.preview_content_mut() else { return };
+                preview.scroll = 0;
+                preview.state = state;
                 if let Some(window) = &self.window {
                     window.request_redraw();
                 }
@@ -1452,12 +1620,15 @@ impl ApplicationHandler<UserEvent> for App {
                 }
             }
             UserEvent::NextPane | UserEvent::PrevPane => {
+                // Move focus between split groups, in tree (reading)
+                // order.
                 let forward = matches!(event, UserEvent::NextPane);
-                self.active_tab_mut().cycle_focus(forward);
-                self.last_status_refresh = None;
-                if let Some(window) = &self.window {
-                    window.request_redraw();
+                let ids: Vec<u64> = self.root().groups().iter().map(|g| g.id).collect();
+                if let Some(pos) = ids.iter().position(|&id| id == self.focused_group) {
+                    let next = if forward { (pos + 1) % ids.len() } else { (pos + ids.len() - 1) % ids.len() };
+                    self.focused_group = ids[next];
                 }
+                self.after_layout_change();
             }
         }
     }
@@ -1480,7 +1651,7 @@ impl ApplicationHandler<UserEvent> for App {
                 if let Some(renderer) = &mut self.renderer {
                     renderer.resize(new_size);
                 }
-                self.relayout_all_tabs(true);
+                self.relayout(true);
                 self.track_window_frame();
                 if let Some(window) = &self.window {
                     window.request_redraw();
@@ -1506,8 +1677,7 @@ impl ApplicationHandler<UserEvent> for App {
                 // isn't there.
                 if self.active_tab().preview_content().is_some() {
                     if let winit::keyboard::Key::Named(winit::keyboard::NamedKey::Escape) = &event.logical_key {
-                        let id = self.active_tab().id;
-                        self.close_tab(id, event_loop);
+                        self.close_active_tab(event_loop);
                     }
                     return;
                 }
@@ -1526,7 +1696,7 @@ impl ApplicationHandler<UserEvent> for App {
                 // every key edits or navigates the query instead of
                 // reaching the pty, and none of it falls through past
                 // this block.
-                if self.active_tab().focused_pane().is_some_and(|p| p.search.is_some()) {
+                if self.focused_pane().is_some_and(|p| p.search.is_some()) {
                     self.handle_search_key(&event);
                     return;
                 }
@@ -1541,13 +1711,13 @@ impl ApplicationHandler<UserEvent> for App {
                 if self.modifiers.super_key() {
                     if let winit::keyboard::Key::Character(c) = &event.logical_key {
                         if c.eq_ignore_ascii_case("c") {
-                            if let Some(text) = self.active_tab().focused_pane().and_then(tab::Pane::selected_text) {
+                            if let Some(text) = self.focused_pane().and_then(tab::Pane::selected_text) {
                                 copy_to_clipboard(&text);
                             }
                             return;
                         }
                         if c.eq_ignore_ascii_case("v") {
-                            if let (Some(text), Some(pane)) = (paste_from_clipboard(), self.active_tab().focused_pane()) {
+                            if let (Some(text), Some(pane)) = (paste_from_clipboard(), self.focused_pane()) {
                                 if pane.term.modes.bracketed_paste {
                                     // Strip any end-guard sequence lurking
                                     // inside the pasted text itself so
@@ -1561,7 +1731,7 @@ impl ApplicationHandler<UserEvent> for App {
                                 } else {
                                     write_all_to_pty(pane.pty_master.as_fd(), text.as_bytes());
                                 }
-                                if let Some(pane) = self.active_tab_mut().focused_pane_mut() {
+                                if let Some(pane) = self.focused_pane_mut() {
                                     pane.scroll_offset = 0;
                                 }
                                 if let Some(window) = &self.window {
@@ -1572,7 +1742,7 @@ impl ApplicationHandler<UserEvent> for App {
                         }
                     }
                 }
-                let Some(pane) = self.active_tab().focused_pane() else { return };
+                let Some(pane) = self.focused_pane() else { return };
                 let bytes = input::encode_key(
                     &event.logical_key,
                     event.text.as_deref(),
@@ -1582,7 +1752,7 @@ impl ApplicationHandler<UserEvent> for App {
                 );
                 if let Some(bytes) = bytes {
                     write_all_to_pty(pane.pty_master.as_fd(), &bytes);
-                    if let Some(pane) = self.active_tab_mut().focused_pane_mut() {
+                    if let Some(pane) = self.focused_pane_mut() {
                         pane.scroll_offset = 0;
                     }
                     if let Some(window) = &self.window {
@@ -1620,11 +1790,11 @@ impl ApplicationHandler<UserEvent> for App {
                 // one) -- matching how iTerm2/macOS scroll views behave.
                 let Some(pane_id) = self
                     .pane_at(self.cursor_pos.0, self.cursor_pos.1)
-                    .or(self.active_tab().focused())
+                    .or(self.focused_pane().map(|p| p.id))
                 else {
                     return;
                 };
-                let Some(pane) = self.active_tab_mut().pane_mut(pane_id) else {
+                let Some(pane) = self.pane_by_id_mut(pane_id) else {
                     return;
                 };
                 if pane.term.using_alt_screen() {
@@ -1662,8 +1832,7 @@ impl ApplicationHandler<UserEvent> for App {
                 // mode -- reported once per cell crossed, not per pixel.
                 if let Some((pane_id, code, sgr, last_cell)) = self.mouse_report_drag {
                     let wants_motion = self
-                        .active_tab()
-                        .pane(pane_id)
+                        .pane_by_id(pane_id)
                         .is_some_and(|p| p.term.modes.mouse_mode >= term::MouseMode::Drag);
                     if wants_motion {
                         if let Some(cell) = self.pane_cell_coords(pane_id, self.cursor_pos.0, self.cursor_pos.1) {
@@ -1700,9 +1869,11 @@ impl ApplicationHandler<UserEvent> for App {
                     // the click instead of selecting locally. A click
                     // still focuses the pane -- Option+click bypasses
                     // reporting entirely for a local selection.
-                    if self.active_tab().focused() != Some(pane_id) {
-                        self.active_tab_mut().set_focused(pane_id);
-                        self.last_status_refresh = None;
+                    if let Some((group_id, _)) = self.group_at(self.cursor_pos.0, self.cursor_pos.1) {
+                        if self.focused_group != group_id {
+                            self.focused_group = group_id;
+                            self.last_status_refresh = None;
+                        }
                     }
                     self.mouse_report_drag = Some((pane_id, 0, sgr, (col, row)));
                     self.send_mouse_event(pane_id, input::encode_mouse(0, input::MouseEventKind::Press, col, row, sgr));
@@ -1714,7 +1885,7 @@ impl ApplicationHandler<UserEvent> for App {
                 if self.dragging_divider.take().is_some() || std::mem::take(&mut self.dragging_sidebar) {
                     // Force-flush: either drag may have throttled the pty
                     // out of sync with the final size.
-                    self.relayout_all_tabs(true);
+                    self.relayout(true);
                 }
                 if let Some((pane_id, code, sgr, last_cell)) = self.mouse_report_drag.take() {
                     let (col, row) = self.pane_cell_coords(pane_id, self.cursor_pos.0, self.cursor_pos.1).unwrap_or(last_cell);
@@ -1779,28 +1950,15 @@ impl ApplicationHandler<UserEvent> for App {
                     hover: self.file_tree_hover,
                     selected,
                 });
-                // Indexed rather than `active_tab()`, so the borrow is of
-                // `self.tabs` alone and `self.renderer` stays free to be
-                // borrowed mutably below.
-                let active_preview = self.tabs[self.active].preview_content();
-                let preview_subtitle = active_preview.map(preview::Preview::subtitle).unwrap_or_default();
-                let preview_view = active_preview.map(|p| render::PreviewView {
-                    subtitle: &preview_subtitle,
-                    body: match &p.state {
-                        preview::State::Loading => chrome::PreviewBody::Loading,
-                        preview::State::Failed(message) => chrome::PreviewBody::Failed(message),
-                        preview::State::Ready(preview::Content::Text(lines)) => chrome::PreviewBody::Text { lines, scroll: p.scroll },
-                        preview::State::Ready(preview::Content::Image { .. }) => chrome::PreviewBody::Image,
-                    },
-                    image_size: match &p.state {
-                        preview::State::Ready(preview::Content::Image { width, height, .. }) => Some((*width, *height)),
-                        _ => None,
-                    },
-                });
+                // Field access rather than `self.root()`, so the borrow
+                // is of `self.root` alone and `self.renderer` stays free
+                // to be borrowed mutably alongside it.
+                let root = self.root.as_ref().expect("the tree always has at least one group");
+                let focused_group = self.focused_group;
                 let outcome = self
                     .renderer
                     .as_mut()
-                    .map(|renderer| renderer.render(&self.tabs, self.active, &self.cached_status, cmd_held, file_tree_view, preview_view));
+                    .map(|renderer| renderer.render(root, focused_group, &self.cached_status, cmd_held, file_tree_view));
                 match outcome {
                     Some(render::RenderOutcome::Presented) => self.presented_once = true,
                     Some(render::RenderOutcome::Retry) => {
@@ -1858,7 +2016,7 @@ fn main() {
 
     let pty_handle = pty::spawn_shell(&config.shell);
     let first_pane = tab::Pane::from_handle(0, pty_handle, &config.shell, 80, 24, config.scrollback_lines);
-    let first_tab = Tab::new(0, first_pane);
+    let first_tab = Tab::shell(0, first_pane);
 
     // winit would otherwise install its own placeholder macOS menu bar,
     // which would fight the one built in `menu::install`.

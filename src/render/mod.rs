@@ -5,7 +5,7 @@ mod pipeline;
 
 use crate::config::FontConfig;
 use crate::linkify;
-use crate::tab::{Search, Selection, Tab};
+use crate::tab::{Search, Selection};
 use crate::term::color::Palette;
 use crate::term::grid::CellFlags;
 use crate::term::Term;
@@ -46,16 +46,16 @@ pub struct FileTreeView<'a> {
     pub selected: Option<usize>,
 }
 
-/// Everything a preview tab needs for one frame. `Some` means the
-/// active tab is a preview rather than a shell.
-pub struct PreviewView<'a> {
-    /// A short note about the file -- dimensions, line count. The name
-    /// itself is the tab's label, so the body doesn't repeat it.
-    pub subtitle: &'a str,
-    pub body: chrome::PreviewBody<'a>,
-    /// The decoded image's pixel dimensions, for fitting it to the
-    /// content area. Only meaningful when `body` is `Image`.
-    pub image_size: Option<(u32, u32)>,
+/// Which body the overlay draws for a preview's current state. Images
+/// carry no data here -- their pixels live in a GPU texture keyed by tab
+/// id, drawn after all instances.
+fn preview_body(preview: &crate::preview::Preview) -> chrome::PreviewBody<'_> {
+    match &preview.state {
+        crate::preview::State::Loading => chrome::PreviewBody::Loading,
+        crate::preview::State::Failed(message) => chrome::PreviewBody::Failed(message),
+        crate::preview::State::Ready(crate::preview::Content::Text(lines)) => chrome::PreviewBody::Text { lines, scroll: preview.scroll },
+        crate::preview::State::Ready(crate::preview::Content::Image { .. }) => chrome::PreviewBody::Image,
+    }
 }
 
 /// What happened when `Renderer::render` was asked to draw a frame.
@@ -165,15 +165,16 @@ impl Renderer {
         }
     }
 
-    /// Hand the preview overlay a decoded image to draw from now on.
-    pub fn set_preview_image(&mut self, pixels: &[u8], width: u32, height: u32) {
-        self.image_pipeline.set_image(&self.device, &self.queue, pixels, width, height);
+    /// Give a preview tab its decoded image. Kept per tab id, since a
+    /// split can show two previews at once.
+    pub fn set_preview_image(&mut self, tab_id: u64, pixels: &[u8], width: u32, height: u32) {
+        self.image_pipeline.set_image(tab_id, &self.device, &self.queue, pixels, width, height);
     }
 
-    /// Drop the preview texture (it can be tens of megabytes) when the
-    /// overlay closes or moves to a non-image file.
-    pub fn clear_preview_image(&mut self) {
-        self.image_pipeline.clear();
+    /// Release a closed preview tab's texture -- it can be tens of
+    /// megabytes, and nothing else would free it.
+    pub fn forget_preview_image(&mut self, tab_id: u64) {
+        self.image_pipeline.forget(tab_id);
     }
 
     pub fn cell_size(&self) -> (f32, f32) {
@@ -225,12 +226,11 @@ impl Renderer {
     /// renderer.
     pub fn render(
         &mut self,
-        tabs: &[Tab],
-        active: usize,
+        root: &crate::tab::GroupNode,
+        focused_group: u64,
         status: &chrome::StatusInfo,
         cmd_held: bool,
         file_tree: Option<FileTreeView>,
-        preview: Option<PreviewView>,
     ) -> RenderOutcome {
         let surface_texture = match self.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(t) => t,
@@ -260,7 +260,6 @@ impl Renderer {
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
 
-        let tab = &tabs[active];
         let tab_bar_h = chrome::tab_bar_height(self.atlas.cell_height);
         let status_bar_h = chrome::status_bar_height(self.atlas.cell_height);
         let window_width = self.config.width as f32;
@@ -270,27 +269,66 @@ impl Renderer {
             .as_ref()
             .map_or(0.0, |v| chrome::file_tree_width(true, v.width, self.atlas.cell_width, window_width));
         let grid_rect = chrome::grid_rect(window_width, window_height, self.atlas.cell_height, sidebar_width);
-        let (pane_rects, dividers) = tab.layout(grid_rect, chrome::PANE_GAP);
+        let mut path = Vec::new();
+        let mut group_rects = Vec::new();
+        let mut dividers = Vec::new();
+        root.layout(grid_rect, chrome::PANE_GAP, &mut path, &mut group_rects, &mut dividers);
         let divider_rects: Vec<crate::tab::PaneRect> = dividers.iter().map(|d| d.rect).collect();
 
         let mut instances = chrome::build_divider_instances(&self.atlas, &divider_rects);
-        for (pane_id, rect) in &pane_rects {
-            let pane = tab.pane(*pane_id).expect("layout only yields live panes");
-            // Full-screen apps (vim, less, htop, ...) manage their own
-            // scrolling and don't expect the terminal to scroll their
-            // alternate screen.
-            let effective_offset = if pane.term.using_alt_screen() { 0 } else { pane.scroll_offset };
-            let overlays = GridOverlays {
-                selection: pane.selection.as_ref(),
-                search: pane.search.as_ref(),
-                cmd_held,
+        // Each group draws its own tab strip and, below it, whichever of
+        // its tabs is active. Preview images are collected rather than
+        // drawn here: they belong to a different pipeline, which runs
+        // after all of these instances.
+        let mut preview_draws = Vec::new();
+        for (group_id, rect) in &group_rects {
+            let Some(group) = root.group(*group_id) else { continue };
+            let strip = crate::tab::PaneRect { x: rect.x, y: rect.y, w: rect.w, h: tab_bar_h };
+            let content = crate::tab::PaneRect {
+                x: rect.x,
+                y: rect.y + tab_bar_h,
+                w: rect.w,
+                h: (rect.h - tab_bar_h).max(1.0),
             };
-            let focused = tab.focused() == Some(*pane_id);
-            instances.extend(self.build_instances_from_pane(&pane.term, effective_offset, *rect, &overlays, focused));
-        }
-        if pane_rects.len() > 1 {
-            if let Some((_, rect)) = pane_rects.iter().find(|(id, _)| Some(*id) == tab.focused()) {
-                instances.extend(chrome::build_focus_border_instances(&self.atlas, *rect));
+            let group_focused = *group_id == focused_group;
+
+            let titles: Vec<String> = group.tabs().iter().map(|t| t.title().to_string()).collect();
+            let tab_layout = chrome::tab_bar_layout(&titles, strip, self.atlas.cell_width);
+            instances.extend(chrome::build_tab_bar_instances(&self.atlas, &tab_layout, group.active_index(), strip, group_focused));
+
+            let tab = group.active_tab();
+            match &tab.kind {
+                crate::tab::TabKind::Shell(pane) => {
+                    // Full-screen apps (vim, less, htop, ...) manage
+                    // their own scrolling and don't expect the terminal
+                    // to scroll their alternate screen.
+                    let effective_offset = if pane.term.using_alt_screen() { 0 } else { pane.scroll_offset };
+                    let overlays = GridOverlays {
+                        selection: pane.selection.as_ref(),
+                        search: pane.search.as_ref(),
+                        cmd_held,
+                    };
+                    instances.extend(self.build_instances_from_pane(&pane.term, effective_offset, content, &overlays, group_focused));
+                    if group_focused {
+                        if let Some(search) = pane.search.as_ref() {
+                            instances.extend(chrome::build_search_bar_instances(&self.atlas, search, content, self.atlas.cell_height));
+                        }
+                    }
+                }
+                crate::tab::TabKind::Preview(preview) => {
+                    let layout = chrome::preview_layout(content, self.atlas.cell_height);
+                    let body = preview_body(preview);
+                    instances.extend(chrome::build_preview_instances(&self.atlas, &layout, &preview.subtitle(), &body));
+                    if let crate::preview::State::Ready(crate::preview::Content::Image { width, height }) = &preview.state {
+                        preview_draws.push((tab.id, chrome::preview_image_rect(layout.content, *width, *height)));
+                    }
+                }
+            }
+
+            // Only worth pointing out which group is focused when there
+            // is more than one to choose between.
+            if group_rects.len() > 1 && group_focused {
+                instances.extend(chrome::build_focus_border_instances(&self.atlas, content));
             }
         }
 
@@ -300,26 +338,7 @@ impl Renderer {
             }
         }
 
-        // A preview tab has no panes, so it fills the same area they
-        // would have -- the sidebar keeps its own space either way.
-        let mut preview_image_rect = None;
-        if let Some(view) = &preview {
-            let layout = chrome::preview_layout(grid_rect, self.atlas.cell_height);
-            instances.extend(chrome::build_preview_instances(&self.atlas, &layout, view.subtitle, &view.body));
-            if let chrome::PreviewBody::Image = view.body {
-                if let Some((w, h)) = view.image_size {
-                    preview_image_rect = Some(chrome::preview_image_rect(layout.content, w, h));
-                }
-            }
-        }
-
-        let titles: Vec<String> = tabs.iter().map(|t| t.title().to_string()).collect();
-        let tab_layout = chrome::tab_bar_layout(&titles, window_width, self.atlas.cell_width);
-        instances.extend(chrome::build_tab_bar_instances(&self.atlas, &tab_layout, active, window_width, tab_bar_h));
         instances.extend(chrome::build_status_bar_instances(&self.atlas, status, window_width, window_height, status_bar_h));
-        if let Some(search) = tab.focused_pane().and_then(|p| p.search.as_ref()) {
-            instances.extend(chrome::build_search_bar_instances(&self.atlas, search, window_width, tab_bar_h));
-        }
 
         let instance_count = self
             .pipeline
@@ -346,12 +365,12 @@ impl Renderer {
                 ..Default::default()
             });
             self.pipeline.draw(&mut pass, instance_count);
-            // Last, so the decoded image lands on top of the overlay's
-            // backdrop. Its rect is inside the pane area, so it can't
-            // reach the bars that were drawn above.
-            if let Some(rect) = preview_image_rect {
-                self.image_pipeline.set_rect(&self.queue, (window_width, window_height), rect, 1.0);
-                self.image_pipeline.draw(&mut pass);
+            // Last, so each decoded image lands on top of its own tab's
+            // backdrop. Every rect is inside a group's content area, so
+            // none can reach the bars drawn above.
+            for (tab_id, rect) in &preview_draws {
+                self.image_pipeline.set_rect(&self.queue, (window_width, window_height), *rect, 1.0);
+                self.image_pipeline.draw(&mut pass, *tab_id);
             }
         }
 

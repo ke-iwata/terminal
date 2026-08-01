@@ -329,12 +329,6 @@ pub fn build_file_tree_instances(atlas: &FontAtlas, rect: PaneRect, view: &super
 }
 
 
-/// How many terminal rows fit between the two bars at this window height.
-pub fn terminal_rows(window_height: f32, cell_h: f32) -> usize {
-    let usable = (window_height - tab_bar_height(cell_h) - status_bar_height(cell_h)).max(cell_h);
-    ((usable / cell_h).floor() as usize).max(1)
-}
-
 /// Thin separator strips between split panes. Opaque like the rest of the
 /// chrome -- see the note on the chrome color constants.
 pub fn build_divider_instances(atlas: &FontAtlas, dividers: &[PaneRect]) -> Vec<Instance> {
@@ -397,20 +391,21 @@ impl TabBarLayout {
     }
 }
 
-/// Lay tabs out left to right at equal width, computed from how many
-/// character columns the window has to spare. Pure/deterministic so it can
-/// be called on every click and every redraw without drifting apart.
-pub fn tab_bar_layout(titles: &[String], window_width: f32, cell_w: f32) -> TabBarLayout {
-    let total_cols = ((window_width / cell_w).floor() as usize).max(1);
+/// Lay tabs out left to right at equal width inside `strip` -- one
+/// group's slice of the window, not necessarily the whole width.
+/// Pure/deterministic so it can be called on every click and every
+/// redraw without drifting apart.
+pub fn tab_bar_layout(titles: &[String], strip: PaneRect, cell_w: f32) -> TabBarLayout {
+    let total_cols = ((strip.w / cell_w).floor() as usize).max(1);
     let n = titles.len().max(1);
     let available_for_tabs = total_cols.saturating_sub(NEW_TAB_COLS);
     let tab_cols = (available_for_tabs / n).clamp(MIN_TAB_COLS, MAX_TAB_COLS);
     let label_cols = tab_cols.saturating_sub(LEFT_PAD_COLS + CLOSE_COLS);
 
     // Breathing room before the first tab, so its rounded corner doesn't
-    // sit flush against the window edge. Applied here (not at draw time)
-    // so click hit-testing shares the exact same offset.
-    let origin = cell_w * 0.5;
+    // sit flush against the group's edge. Applied here (not at draw
+    // time) so click hit-testing shares the exact same offset.
+    let origin = strip.x + cell_w * 0.5;
 
     let mut tabs = Vec::with_capacity(titles.len());
     for (i, title) in titles.iter().enumerate() {
@@ -462,12 +457,16 @@ pub struct StatusInfo {
     pub tty: String,
 }
 
-pub fn build_tab_bar_instances(atlas: &FontAtlas, layout: &TabBarLayout, active: usize, bar_width: f32, bar_height: f32) -> Vec<Instance> {
+/// Draw one group's tab strip inside `strip`. `group_focused` dims the
+/// whole strip when this isn't the group keyboard input goes to, so
+/// several strips on screen at once still read as one being current.
+pub fn build_tab_bar_instances(atlas: &FontAtlas, layout: &TabBarLayout, active: usize, strip: PaneRect, group_focused: bool) -> Vec<Instance> {
     let mut instances = Vec::new();
+    let bar_height = strip.h;
 
-    push_rect(&mut instances, atlas, [0.0, 0.0, bar_width, bar_height], CHROME_BACKDROP, 0.0);
+    push_rect(&mut instances, atlas, [strip.x, strip.y, strip.w, bar_height], CHROME_BACKDROP, 0.0);
 
-    let text_y = (bar_height - atlas.cell_height) / 2.0;
+    let text_y = strip.y + (bar_height - atlas.cell_height) / 2.0;
     let accent_h = (bar_height * 0.08).max(2.0);
     // Rounded-top, flush-bottom shape (Chrome/Arc-style tab): adjacent
     // tabs' rounded shoulders leave a sliver of backdrop showing through
@@ -478,16 +477,22 @@ pub fn build_tab_bar_instances(atlas: &FontAtlas, layout: &TabBarLayout, active:
     for tab in &layout.tabs {
         let is_active = tab.index == active;
         let bg = if is_active { CHROME_TAB_ACTIVE } else { CHROME_TAB_INACTIVE };
-        push_rect(&mut instances, atlas, [tab.x0, 0.0, tab.x1 - tab.x0, bar_height], bg, tab_radius);
+        push_rect(&mut instances, atlas, [tab.x0, strip.y, tab.x1 - tab.x0, bar_height], bg, tab_radius);
 
-        let fg = if is_active { CHROME_FG_ACTIVE } else { CHROME_FG_INACTIVE };
+        let fg = match (is_active, group_focused) {
+            (true, true) => CHROME_FG_ACTIVE,
+            (true, false) => CHROME_FG_INACTIVE,
+            (false, _) => CHROME_FG_DIM,
+        };
         push_text(&mut instances, atlas, &tab.label, tab.x0 + atlas.cell_width * LEFT_PAD_COLS as f32, text_y, fg);
         push_text(&mut instances, atlas, "x", tab.close_x0 + atlas.cell_width * 0.5, text_y, CHROME_FG_DIM);
 
         // A bright accent (not just a background-darkness change) is what
-        // actually reads as "selected" at a glance.
+        // actually reads as "selected" at a glance -- muted in a group
+        // that isn't focused so only one strip claims to be current.
         if is_active {
-            push_rect(&mut instances, atlas, [tab.x0, bar_height - accent_h, tab.x1 - tab.x0, accent_h], CHROME_ACCENT, 0.0);
+            let accent = if group_focused { CHROME_ACCENT } else { CHROME_STATUS_EDGE };
+            push_rect(&mut instances, atlas, [tab.x0, strip.y + bar_height - accent_h, tab.x1 - tab.x0, accent_h], accent, 0.0);
         }
     }
 
@@ -549,7 +554,7 @@ pub fn build_status_bar_instances(atlas: &FontAtlas, status: &StatusInfo, window
 /// A small floating pill anchored to the top-right of the grid (like a
 /// browser's find bar) rather than a full-width bar that would need to
 /// resize the grid every time search opens or closes.
-pub fn build_search_bar_instances(atlas: &FontAtlas, search: &Search, window_width: f32, tab_bar_bottom: f32) -> Vec<Instance> {
+pub fn build_search_bar_instances(atlas: &FontAtlas, search: &Search, area: PaneRect, _cell_h: f32) -> Vec<Instance> {
     let mut instances = Vec::new();
 
     const LABEL: &str = "Find: ";
@@ -565,8 +570,8 @@ pub fn build_search_bar_instances(atlas: &FontAtlas, search: &Search, window_wid
 
     let bar_w = content_cols as f32 * atlas.cell_width;
     let bar_h = atlas.cell_height * 1.6;
-    let x0 = (window_width - bar_w - atlas.cell_width).max(0.0);
-    let y0 = tab_bar_bottom + atlas.cell_height * 0.3;
+    let x0 = (area.x + area.w - bar_w - atlas.cell_width).max(area.x);
+    let y0 = area.y + atlas.cell_height * 0.3;
     let radius = (bar_h * 0.3).clamp(4.0, 10.0);
 
     push_rect(&mut instances, atlas, [x0, y0, bar_w, bar_h], CHROME_SEARCH_BG, radius);

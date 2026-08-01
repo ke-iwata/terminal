@@ -22,9 +22,10 @@ pub struct ImagePipeline {
     bind_group_layout: wgpu::BindGroupLayout,
     uniform_buffer: wgpu::Buffer,
     sampler: wgpu::Sampler,
-    /// `None` until an image has been uploaded; the overlay draws
-    /// nothing in that state (it's showing "Loading..." text instead).
-    bind_group: Option<wgpu::BindGroup>,
+    /// One texture per preview tab, keyed by tab id. Keyed rather than
+    /// single because a split can put two preview tabs on screen at the
+    /// same time, and each needs its own image bound while it draws.
+    bind_groups: std::collections::HashMap<u64, wgpu::BindGroup>,
 }
 
 impl ImagePipeline {
@@ -122,16 +123,16 @@ impl ImagePipeline {
             bind_group_layout,
             uniform_buffer,
             sampler,
-            bind_group: None,
+            bind_groups: std::collections::HashMap::new(),
         }
     }
 
     /// Upload RGBA8 pixels as the image to draw from now on, replacing
     /// whatever was there. `pixels` must be exactly `width * height * 4`
     /// bytes.
-    pub fn set_image(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, pixels: &[u8], width: u32, height: u32) {
+    pub fn set_image(&mut self, tab_id: u64, device: &wgpu::Device, queue: &wgpu::Queue, pixels: &[u8], width: u32, height: u32) {
         if width == 0 || height == 0 || pixels.len() != (width as usize) * (height as usize) * 4 {
-            self.bind_group = None;
+            self.bind_groups.remove(&tab_id);
             return;
         }
         let size = wgpu::Extent3d { width, height, depth_or_array_layers: 1 };
@@ -165,7 +166,7 @@ impl ImagePipeline {
         );
 
         let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
-        self.bind_group = Some(device.create_bind_group(&wgpu::BindGroupDescriptor {
+        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("image bind group"),
             layout: &self.bind_group_layout,
             entries: &[
@@ -173,14 +174,14 @@ impl ImagePipeline {
                 wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&view) },
                 wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::Sampler(&self.sampler) },
             ],
-        }));
+        });
+        self.bind_groups.insert(tab_id, bind_group);
     }
 
-    /// Forget the current image, so nothing is drawn until the next
-    /// `set_image`. Called when the overlay closes -- a preview's
-    /// texture can be tens of megabytes.
-    pub fn clear(&mut self) {
-        self.bind_group = None;
+    /// Drop a tab's texture. Called when a preview tab closes -- one can
+    /// be tens of megabytes, and nothing else would ever release it.
+    pub fn forget(&mut self, tab_id: u64) {
+        self.bind_groups.remove(&tab_id);
     }
 
     /// Place the image for this frame, in physical pixels.
@@ -195,8 +196,8 @@ impl ImagePipeline {
         queue.write_buffer(&self.uniform_buffer, 0, bytemuck::bytes_of(&uniforms));
     }
 
-    pub fn draw<'pass>(&'pass self, pass: &mut wgpu::RenderPass<'pass>) {
-        let Some(bind_group) = &self.bind_group else { return };
+    pub fn draw<'pass>(&'pass self, pass: &mut wgpu::RenderPass<'pass>, tab_id: u64) {
+        let Some(bind_group) = self.bind_groups.get(&tab_id) else { return };
         pass.set_pipeline(&self.pipeline);
         pass.set_bind_group(0, bind_group, &[]);
         pass.draw(0..6, 0..1);

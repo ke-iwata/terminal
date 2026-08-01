@@ -71,9 +71,8 @@ pub fn install(proxy: EventLoopProxy<UserEvent>) -> Menu {
         true,
         Some(Accelerator::new(Some(Modifiers::SUPER), Code::KeyT)),
     );
-    // "Close", not "Close Tab": Cmd+W closes the focused pane first and
-    // only closes the tab when it's the last pane -- same wording and
-    // behavior as iTerm2.
+    // "Close", not "Close Tab": Cmd+W closes the focused group's active
+    // tab, and the group with it when that was its last tab.
     let close_pane = MenuItem::with_id(
         CLOSE_PANE_ID,
         "Close",
@@ -94,25 +93,25 @@ pub fn install(proxy: EventLoopProxy<UserEvent>) -> Menu {
     );
     let split_right = MenuItem::with_id(
         SPLIT_RIGHT_ID,
-        "Split Pane Right",
+        "Split Right",
         true,
         Some(Accelerator::new(Some(Modifiers::SUPER), Code::KeyD)),
     );
     let split_down = MenuItem::with_id(
         SPLIT_DOWN_ID,
-        "Split Pane Down",
+        "Split Down",
         true,
         Some(Accelerator::new(Some(Modifiers::SUPER | Modifiers::SHIFT), Code::KeyD)),
     );
     let next_pane = MenuItem::with_id(
         NEXT_PANE_ID,
-        "Next Pane",
+        "Next Split",
         true,
         Some(Accelerator::new(Some(Modifiers::SUPER), Code::BracketRight)),
     );
     let prev_pane = MenuItem::with_id(
         PREV_PANE_ID,
-        "Previous Pane",
+        "Previous Split",
         true,
         Some(Accelerator::new(Some(Modifiers::SUPER), Code::BracketLeft)),
     );

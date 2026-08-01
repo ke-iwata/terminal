@@ -301,64 +301,68 @@ pub struct DividerInfo {
     pub rect: PaneRect,
 }
 
-/// The split tree: leaves are live panes, interior nodes are ratio
+/// The split tree: leaves are tab groups, interior nodes are ratio
 /// splits. A plain binary tree (rather than a flat list of rects) so
-/// closing any pane always has an unambiguous answer for what reclaims
+/// closing any group always has an unambiguous answer for what reclaims
 /// its space -- the sibling subtree it was split from.
-pub enum PaneNode {
-    /// Boxed so a leaf (a full `Pane`, ~1KB) doesn't inflate every
-    /// interior `Split` node to the same size.
-    Leaf(Box<Pane>),
+///
+/// Splitting lives here, above tabs, rather than inside a tab: each half
+/// of a split is a full tab strip of its own, so a preview can sit
+/// beside a shell (and either side can be switched independently).
+pub enum GroupNode {
+    /// Boxed so a leaf (a whole `Group`) doesn't inflate every interior
+    /// `Split` node to the same size.
+    Leaf(Box<Group>),
     Split {
         direction: SplitDirection,
         /// Fraction of the axis given to `first` (0..1). Starts at 0.5;
         /// changed by dragging the divider.
         ratio: f32,
-        first: Box<PaneNode>,
-        second: Box<PaneNode>,
+        first: Box<GroupNode>,
+        second: Box<GroupNode>,
     },
 }
 
-impl PaneNode {
-    pub fn pane(&self, id: u64) -> Option<&Pane> {
+impl GroupNode {
+    pub fn group(&self, id: u64) -> Option<&Group> {
         match self {
-            PaneNode::Leaf(p) => (p.id == id).then_some(&**p),
-            PaneNode::Split { first, second, .. } => first.pane(id).or_else(|| second.pane(id)),
+            GroupNode::Leaf(g) => (g.id == id).then_some(&**g),
+            GroupNode::Split { first, second, .. } => first.group(id).or_else(|| second.group(id)),
         }
     }
 
-    pub fn pane_mut(&mut self, id: u64) -> Option<&mut Pane> {
+    pub fn group_mut(&mut self, id: u64) -> Option<&mut Group> {
         match self {
-            PaneNode::Leaf(p) => (p.id == id).then_some(&mut **p),
-            PaneNode::Split { first, second, .. } => {
-                if first.pane(id).is_some() {
-                    first.pane_mut(id)
+            GroupNode::Leaf(g) => (g.id == id).then_some(&mut **g),
+            GroupNode::Split { first, second, .. } => {
+                if first.group(id).is_some() {
+                    first.group_mut(id)
                 } else {
-                    second.pane_mut(id)
+                    second.group_mut(id)
                 }
             }
         }
     }
 
-    /// All panes in tree order (which is also visual reading order:
+    /// All groups in tree order (which is also visual reading order:
     /// first/top/left before second/bottom/right).
-    pub fn panes(&self) -> Vec<&Pane> {
+    pub fn groups(&self) -> Vec<&Group> {
         match self {
-            PaneNode::Leaf(p) => vec![&**p],
-            PaneNode::Split { first, second, .. } => {
-                let mut all = first.panes();
-                all.extend(second.panes());
+            GroupNode::Leaf(g) => vec![&**g],
+            GroupNode::Split { first, second, .. } => {
+                let mut all = first.groups();
+                all.extend(second.groups());
                 all
             }
         }
     }
 
-    pub fn panes_mut(&mut self) -> Vec<&mut Pane> {
+    pub fn groups_mut(&mut self) -> Vec<&mut Group> {
         match self {
-            PaneNode::Leaf(p) => vec![&mut **p],
-            PaneNode::Split { first, second, .. } => {
-                let mut all = first.panes_mut();
-                all.extend(second.panes_mut());
+            GroupNode::Leaf(g) => vec![&mut **g],
+            GroupNode::Split { first, second, .. } => {
+                let mut all = first.groups_mut();
+                all.extend(second.groups_mut());
                 all
             }
         }
@@ -367,17 +371,17 @@ impl PaneNode {
     // Splitting is implemented on owned nodes (see `split_owned`) rather
     // than `&mut self`: replacing a leaf with a split that *contains* that
     // leaf can't be expressed through a mutable borrow without a
-    // placeholder node, and `Pane` has no cheap placeholder to offer.
+    // placeholder node, and `Group` has no cheap placeholder to offer.
 
-    /// Compute every pane's pixel rectangle (and each divider's) for
+    /// Compute every group's pixel rectangle (and each divider's) for
     /// this subtree laid out inside `rect`. Pure function of the tree, so
     /// rendering and click hit-testing can both call it and always agree.
     /// `path` is the running tree address of this node (see
     /// `DividerInfo::path`); callers start with an empty one.
-    pub fn layout(&self, rect: PaneRect, gap: f32, path: &mut Vec<bool>, panes: &mut Vec<(u64, PaneRect)>, dividers: &mut Vec<DividerInfo>) {
+    pub fn layout(&self, rect: PaneRect, gap: f32, path: &mut Vec<bool>, groups: &mut Vec<(u64, PaneRect)>, dividers: &mut Vec<DividerInfo>) {
         match self {
-            PaneNode::Leaf(p) => panes.push((p.id, rect)),
-            PaneNode::Split { direction, ratio, first, second } => {
+            GroupNode::Leaf(g) => groups.push((g.id, rect)),
+            GroupNode::Split { direction, ratio, first, second } => {
                 let (first_rect, divider_rect, second_rect) = match direction {
                     SplitDirection::Vertical => {
                         let w1 = ((rect.w - gap) * ratio).floor();
@@ -403,10 +407,10 @@ impl PaneNode {
                     rect: divider_rect,
                 });
                 path.push(false);
-                first.layout(first_rect, gap, path, panes, dividers);
+                first.layout(first_rect, gap, path, groups, dividers);
                 path.pop();
                 path.push(true);
-                second.layout(second_rect, gap, path, panes, dividers);
+                second.layout(second_rect, gap, path, groups, dividers);
                 path.pop();
             }
         }
@@ -419,8 +423,8 @@ impl PaneNode {
     /// resize some unrelated node.
     pub fn set_ratio(&mut self, path: &[bool], new_ratio: f32) {
         match self {
-            PaneNode::Leaf(_) => {}
-            PaneNode::Split { ratio, first, second, .. } => match path.split_first() {
+            GroupNode::Leaf(_) => {}
+            GroupNode::Split { ratio, first, second, .. } => match path.split_first() {
                 None => *ratio = new_ratio.clamp(0.05, 0.95),
                 Some((&step, rest)) => {
                     if step {
@@ -434,261 +438,233 @@ impl PaneNode {
     }
 }
 
-/// Replaces the leaf holding `target` with a split of it and `new_pane`
-/// (the existing pane keeps the first/top/left slot). Returns the new
-/// pane back unchanged if `target` isn't in this subtree.
-fn split_owned(node: PaneNode, target: u64, direction: SplitDirection, new_pane: Pane) -> (PaneNode, Result<(), Pane>) {
+/// Replaces the leaf holding `target` with a split of it and `new_group`
+/// (the existing group keeps the first/top/left slot). Returns the new
+/// group back unchanged if `target` isn't in this subtree.
+pub fn split_group(node: GroupNode, target: u64, direction: SplitDirection, new_group: Group) -> (GroupNode, Result<(), Group>) {
     match node {
-        PaneNode::Leaf(p) if p.id == target => (
-            PaneNode::Split {
+        GroupNode::Leaf(g) if g.id == target => (
+            GroupNode::Split {
                 direction,
                 ratio: 0.5,
-                first: Box::new(PaneNode::Leaf(p)),
-                second: Box::new(PaneNode::Leaf(Box::new(new_pane))),
+                first: Box::new(GroupNode::Leaf(g)),
+                second: Box::new(GroupNode::Leaf(Box::new(new_group))),
             },
             Ok(()),
         ),
-        leaf @ PaneNode::Leaf(_) => (leaf, Err(new_pane)),
-        PaneNode::Split { direction: dir, ratio, first, second } => {
-            let (first, outcome) = split_owned(*first, target, direction, new_pane);
-            let first = Box::new(first);
+        GroupNode::Leaf(g) => (GroupNode::Leaf(g), Err(new_group)),
+        GroupNode::Split { direction: d, ratio, first, second } => {
+            let (first, outcome) = split_group(*first, target, direction, new_group);
             match outcome {
-                Ok(()) => (PaneNode::Split { direction: dir, ratio, first, second }, Ok(())),
-                Err(pane) => {
-                    let (second, outcome) = split_owned(*second, target, direction, pane);
-                    (PaneNode::Split { direction: dir, ratio, first, second: Box::new(second) }, outcome)
+                Ok(()) => (
+                    GroupNode::Split { direction: d, ratio, first: Box::new(first), second },
+                    Ok(()),
+                ),
+                Err(new_group) => {
+                    let (second, outcome) = split_group(*second, target, direction, new_group);
+                    (
+                        GroupNode::Split { direction: d, ratio, first: Box::new(first), second: Box::new(second) },
+                        outcome,
+                    )
                 }
             }
         }
     }
 }
 
-/// Removes the pane `id` from an owned subtree, collapsing its parent
-/// split into the sibling. Returns the remaining tree (`None` if the
-/// removed pane WAS the whole tree) and the removed pane.
-fn remove_owned(node: PaneNode, id: u64) -> (Option<PaneNode>, Option<Pane>) {
+/// Removes the leaf holding `id`, collapsing its split into the sibling.
+/// Returns the rebuilt subtree (`None` when the removed leaf *was* the
+/// whole subtree) and the group taken out.
+pub fn remove_group(node: GroupNode, id: u64) -> (Option<GroupNode>, Option<Group>) {
     match node {
-        PaneNode::Leaf(p) if p.id == id => (None, Some(*p)),
-        leaf @ PaneNode::Leaf(_) => (Some(leaf), None),
-        PaneNode::Split { direction, ratio, first, second } => {
-            let (first_rest, removed) = remove_owned(*first, id);
-            if removed.is_some() {
-                return match first_rest {
-                    None => (Some(*second), removed),
-                    Some(f) => (Some(PaneNode::Split { direction, ratio, first: Box::new(f), second }), removed),
+        GroupNode::Leaf(g) if g.id == id => (None, Some(*g)),
+        GroupNode::Leaf(g) => (Some(GroupNode::Leaf(g)), None),
+        GroupNode::Split { direction, ratio, first, second } => {
+            // A branch only collapses when the removal emptied it
+            // *entirely*. Collapsing whenever the removal happened
+            // anywhere in the branch would throw away the sibling
+            // subtree along with it -- which, for a group holding live
+            // shells, means panes vanishing and their processes leaking.
+            let (rebuilt_first, removed) = remove_group(*first, id);
+            if let Some(removed) = removed {
+                return match rebuilt_first {
+                    Some(rebuilt) => (
+                        Some(GroupNode::Split { direction, ratio, first: Box::new(rebuilt), second }),
+                        Some(removed),
+                    ),
+                    // The whole first branch is gone: the sibling takes
+                    // over the rect the split had.
+                    None => (Some(*second), Some(removed)),
                 };
             }
-            let first = Box::new(first_rest.expect("nothing was removed from `first`, so it survives intact"));
-            let (second_rest, removed) = remove_owned(*second, id);
-            match second_rest {
-                None => (Some(*first), removed),
-                Some(s) => (Some(PaneNode::Split { direction, ratio, first, second: Box::new(s) }), removed),
+            let first = rebuilt_first.expect("nothing was removed from the first branch");
+            let (rebuilt_second, removed) = remove_group(*second, id);
+            if let Some(removed) = removed {
+                return match rebuilt_second {
+                    Some(rebuilt) => (
+                        Some(GroupNode::Split { direction, ratio, first: Box::new(first), second: Box::new(rebuilt) }),
+                        Some(removed),
+                    ),
+                    None => (Some(first), Some(removed)),
+                };
             }
+            (
+                Some(GroupNode::Split {
+                    direction,
+                    ratio,
+                    first: Box::new(first),
+                    second: Box::new(rebuilt_second.expect("nothing was removed, so nothing collapsed")),
+                }),
+                None,
+            )
         }
     }
 }
 
-/// One tab in the tab strip: a tree of one or more panes plus which of
-/// them owns keyboard focus.
-/// What a tab holds. Most tabs are shell sessions; a file preview gets
-/// its own tab rather than an overlay, so it can be switched away from
-/// and come back to, and so several previews can be open at once.
+/// One region of the split layout: its own strip of tabs, drawn with its
+/// own tab bar. The unit that gets split, and the unit keyboard focus
+/// lands on.
+pub struct Group {
+    /// Stable identity, independent of position in the tree. Never
+    /// reused within one run.
+    pub id: u64,
+    /// Never empty: a group with no tabs left is removed from the tree
+    /// by its owner rather than being kept around blank.
+    tabs: Vec<Tab>,
+    /// Index into `tabs`. Always in range.
+    active: usize,
+}
+
+impl Group {
+    pub fn new(id: u64, tab: Tab) -> Group {
+        Group { id, tabs: vec![tab], active: 0 }
+    }
+
+    pub fn tabs(&self) -> &[Tab] {
+        &self.tabs
+    }
+
+    pub fn tabs_mut(&mut self) -> &mut [Tab] {
+        &mut self.tabs
+    }
+
+    pub fn active_index(&self) -> usize {
+        self.active
+    }
+
+    pub fn active_tab(&self) -> &Tab {
+        &self.tabs[self.active.min(self.tabs.len() - 1)]
+    }
+
+    pub fn active_tab_mut(&mut self) -> &mut Tab {
+        let index = self.active.min(self.tabs.len() - 1);
+        &mut self.tabs[index]
+    }
+
+    /// Add a tab and make it active -- opening one is always in order to
+    /// use it.
+    pub fn add_tab(&mut self, tab: Tab) {
+        self.tabs.push(tab);
+        self.active = self.tabs.len() - 1;
+    }
+
+    pub fn activate(&mut self, index: usize) {
+        if index < self.tabs.len() {
+            self.active = index;
+        }
+    }
+
+    /// Remove the tab at `index` and hand it back. Returns `None` when
+    /// it was the last one -- emptying a group means removing the group,
+    /// which is its owner's decision to make.
+    pub fn close_tab(&mut self, index: usize) -> Option<Tab> {
+        if self.tabs.len() <= 1 || index >= self.tabs.len() {
+            return None;
+        }
+        let removed = self.tabs.remove(index);
+        // Stay on the tab that slid into this slot, or the new last one.
+        self.active = self.active.min(self.tabs.len() - 1);
+        Some(removed)
+    }
+
+    /// Take every tab out, for when the whole group is being removed.
+    pub fn drain_tabs(self) -> Vec<Tab> {
+        self.tabs
+    }
+
+    pub fn cycle_tab(&mut self, forward: bool) {
+        if self.tabs.len() < 2 {
+            return;
+        }
+        self.active = if forward {
+            (self.active + 1) % self.tabs.len()
+        } else {
+            (self.active + self.tabs.len() - 1) % self.tabs.len()
+        };
+    }
+}
+
+/// What a tab holds: one shell session, or one previewed file.
+///
+/// A shell tab holds exactly one pane -- splitting is a property of the
+/// layout above tabs now (see `GroupNode`), not something a tab does
+/// internally.
 pub enum TabKind {
-    Shell {
-        /// Always `Some` from the outside; `Option` only so `remove_pane`
-        /// can temporarily take ownership of the tree to restructure it.
-        root: Option<PaneNode>,
-        /// Which pane keyboard input goes to. Always a live pane's id.
-        focused: u64,
-    },
+    Shell(Box<Pane>),
     Preview(Box<crate::preview::Preview>),
 }
 
 pub struct Tab {
-    /// Stable identity, independent of position in the tab strip. Never
-    /// reused within one run of the app.
+    /// Stable identity, unique across every group. Never reused within
+    /// one run -- the image pipeline keys preview textures by it.
     pub id: u64,
     pub kind: TabKind,
 }
 
 impl Tab {
-    pub fn new(id: u64, pane: Pane) -> Tab {
-        let focused = pane.id;
-        Tab {
-            id,
-            kind: TabKind::Shell { root: Some(PaneNode::Leaf(Box::new(pane))), focused },
-        }
+    pub fn shell(id: u64, pane: Pane) -> Tab {
+        Tab { id, kind: TabKind::Shell(Box::new(pane)) }
     }
 
     pub fn preview(id: u64, preview: crate::preview::Preview) -> Tab {
         Tab { id, kind: TabKind::Preview(Box::new(preview)) }
     }
 
-    /// The preview this tab shows, if it is one. Every shell accessor
-    /// below returns `None`/empty for a preview tab, so callers that
-    /// only make sense for a shell fall out naturally rather than
-    /// needing an `is_shell` check first.
+    /// This tab's shell, or `None` on a preview tab. Callers written for
+    /// shells fall out here rather than needing a kind check first.
+    pub fn pane(&self) -> Option<&Pane> {
+        match &self.kind {
+            TabKind::Shell(pane) => Some(pane),
+            TabKind::Preview(_) => None,
+        }
+    }
+
+    pub fn pane_mut(&mut self) -> Option<&mut Pane> {
+        match &mut self.kind {
+            TabKind::Shell(pane) => Some(pane),
+            TabKind::Preview(_) => None,
+        }
+    }
+
     pub fn preview_content(&self) -> Option<&crate::preview::Preview> {
         match &self.kind {
             TabKind::Preview(preview) => Some(preview),
-            TabKind::Shell { .. } => None,
+            TabKind::Shell(_) => None,
         }
     }
 
     pub fn preview_content_mut(&mut self) -> Option<&mut crate::preview::Preview> {
         match &mut self.kind {
             TabKind::Preview(preview) => Some(preview),
-            TabKind::Shell { .. } => None,
+            TabKind::Shell(_) => None,
         }
     }
 
-    fn root(&self) -> Option<&PaneNode> {
-        match &self.kind {
-            TabKind::Shell { root, .. } => root.as_ref(),
-            TabKind::Preview(_) => None,
-        }
-    }
-
-    fn root_mut(&mut self) -> Option<&mut PaneNode> {
-        match &mut self.kind {
-            TabKind::Shell { root, .. } => root.as_mut(),
-            TabKind::Preview(_) => None,
-        }
-    }
-
-    /// Which pane keyboard input goes to, or `None` on a preview tab.
-    pub fn focused(&self) -> Option<u64> {
-        match &self.kind {
-            TabKind::Shell { focused, .. } => Some(*focused),
-            TabKind::Preview(_) => None,
-        }
-    }
-
-    /// Move keyboard focus to `id`. Ignored when `id` isn't a live pane
-    /// of this tab, so a stale id can't strand input.
-    pub fn set_focused(&mut self, id: u64) {
-        if self.pane(id).is_none() {
-            return;
-        }
-        if let TabKind::Shell { focused, .. } = &mut self.kind {
-            *focused = id;
-        }
-    }
-
-    pub fn pane(&self, id: u64) -> Option<&Pane> {
-        self.root()?.pane(id)
-    }
-
-    pub fn pane_mut(&mut self, id: u64) -> Option<&mut Pane> {
-        self.root_mut()?.pane_mut(id)
-    }
-
-    /// Every pane in tree order -- empty for a preview tab.
-    pub fn panes(&self) -> Vec<&Pane> {
-        self.root().map(PaneNode::panes).unwrap_or_default()
-    }
-
-    pub fn panes_mut(&mut self) -> Vec<&mut Pane> {
-        self.root_mut().map(PaneNode::panes_mut).unwrap_or_default()
-    }
-
-    pub fn pane_count(&self) -> usize {
-        self.panes().len()
-    }
-
-    pub fn focused_pane(&self) -> Option<&Pane> {
-        self.pane(self.focused()?)
-    }
-
-    pub fn focused_pane_mut(&mut self) -> Option<&mut Pane> {
-        self.pane_mut(self.focused()?)
-    }
-
-    /// Split the focused pane, giving the new pane the second (right or
-    /// bottom) half, and focus it -- matching what iTerm2/tmux do, since
-    /// the reason you split is almost always to use the new shell now.
-    /// Hands the pane back untouched on a preview tab, which has nothing
-    /// to split. The rejected pane comes back boxed: a `Pane` is ~1KB,
-    /// and an unboxed one in the error variant would make every caller's
-    /// `Result` that size.
-    pub fn split_focused(&mut self, direction: SplitDirection, new_pane: Pane) -> Result<(), Box<Pane>> {
-        let new_id = new_pane.id;
-        let TabKind::Shell { root, focused } = &mut self.kind else {
-            return Err(Box::new(new_pane));
-        };
-        let Some(taken) = root.take() else {
-            return Err(Box::new(new_pane));
-        };
-        let (rebuilt, outcome) = split_owned(taken, *focused, direction, new_pane);
-        *root = Some(rebuilt);
-        if outcome.is_ok() {
-            *focused = new_id;
-        }
-        outcome.map_err(Box::new)
-    }
-
-    /// Remove pane `id`, collapsing its split into the sibling. Refuses
-    /// (returns `None`) when it's the tab's only pane -- closing the last
-    /// pane means closing the tab, which is the caller's decision to make.
-    pub fn remove_pane(&mut self, id: u64) -> Option<Pane> {
-        if self.pane_count() <= 1 {
-            return None;
-        }
-        let TabKind::Shell { root, focused } = &mut self.kind else {
-            return None;
-        };
-        let taken = root.take()?;
-        let (rest, removed) = remove_owned(taken, id);
-        *root = Some(rest.expect("pane_count > 1 means a sibling survives the removal"));
-        if removed.is_some() && *focused == id {
-            let survivor = root.as_ref().and_then(|r| r.panes().first().map(|p| p.id));
-            if let Some(survivor) = survivor {
-                *focused = survivor;
-            }
-        }
-        removed
-    }
-
-    /// Move focus to the next/previous pane in tree (reading) order.
-    pub fn cycle_focus(&mut self, forward: bool) {
-        let ids: Vec<u64> = self.panes().iter().map(|p| p.id).collect();
-        let Some(current) = self.focused() else { return };
-        let Some(pos) = ids.iter().position(|&id| id == current) else {
-            return;
-        };
-        let next = if forward {
-            (pos + 1) % ids.len()
-        } else {
-            (pos + ids.len() - 1) % ids.len()
-        };
-        self.set_focused(ids[next]);
-    }
-
-    /// Every pane's rect (and each divider's) laid out inside `rect`.
-    /// Both empty on a preview tab, which fills `rect` itself.
-    pub fn layout(&self, rect: PaneRect, gap: f32) -> (Vec<(u64, PaneRect)>, Vec<DividerInfo>) {
-        let mut panes = Vec::new();
-        let mut dividers = Vec::new();
-        let mut path = Vec::new();
-        if let Some(root) = self.root() {
-            root.layout(rect, gap, &mut path, &mut panes, &mut dividers);
-        }
-        (panes, dividers)
-    }
-
-    /// Set the ratio of the split addressed by `path` -- see
-    /// `PaneNode::set_ratio`.
-    pub fn set_split_ratio(&mut self, path: &[bool], ratio: f32) {
-        if let Some(root) = self.root_mut() {
-            root.set_ratio(path, ratio);
-        }
-    }
-
-    /// What the tab strip shows: the focused pane's running command, or
-    /// the previewed file's name.
+    /// What the tab strip shows: the shell's running command, or the
+    /// previewed file's name.
     pub fn title(&self) -> &str {
         match &self.kind {
-            TabKind::Shell { .. } => self.focused_pane().map(|p| p.title.as_str()).unwrap_or("shell"),
+            TabKind::Shell(pane) => &pane.title,
             TabKind::Preview(preview) => &preview.title,
         }
     }
@@ -983,178 +959,167 @@ mod tests {
         PaneRect { x: 0.0, y: 0.0, w, h }
     }
 
-    #[test]
-    fn split_focused_focuses_the_new_pane() {
-        let mut tab = Tab::new(1, dummy_pane(10));
-        _ = tab.split_focused(SplitDirection::Vertical, dummy_pane(11));
-        assert_eq!(tab.pane_count(), 2);
-        assert_eq!(tab.focused(), Some(11));
+    /// A group holding one shell tab, for exercising tree operations
+    /// without forking shells.
+    fn dummy_group(id: u64) -> Group {
+        Group::new(id, Tab::shell(id, dummy_pane(id)))
+    }
+
+    fn tree(id: u64) -> GroupNode {
+        GroupNode::Leaf(Box::new(dummy_group(id)))
+    }
+
+    /// Split `root` at `target`, panicking if the tree refused -- the
+    /// shape of `split_group`'s owned-value API makes this noisy inline.
+    fn split(root: GroupNode, target: u64, direction: SplitDirection, new_id: u64) -> GroupNode {
+        let (root, outcome) = split_group(root, target, direction, dummy_group(new_id));
+        assert!(outcome.is_ok(), "expected {target} to be in the tree");
+        root
+    }
+
+    fn layout_of(root: &GroupNode, w: f32, h: f32) -> (Vec<(u64, PaneRect)>, Vec<DividerInfo>) {
+        let (mut groups, mut dividers, mut path) = (Vec::new(), Vec::new(), Vec::new());
+        root.layout(rect(w, h), 2.0, &mut path, &mut groups, &mut dividers);
+        (groups, dividers)
     }
 
     #[test]
-    fn layout_splits_the_rect_between_panes() {
-        let mut tab = Tab::new(1, dummy_pane(10));
-        _ = tab.split_focused(SplitDirection::Vertical, dummy_pane(11));
-        let (panes, dividers) = tab.layout(rect(100.0, 50.0), 2.0);
-        assert_eq!(panes.len(), 2);
+    fn splitting_puts_the_new_group_in_the_second_slot() {
+        let root = split(tree(1), 1, SplitDirection::Vertical, 2);
+        let ids: Vec<u64> = root.groups().iter().map(|g| g.id).collect();
+        assert_eq!(ids, vec![1, 2], "tree order is reading order: left before right");
+    }
+
+    #[test]
+    fn splitting_an_absent_target_hands_the_group_back() {
+        // The caller has already spawned a shell by then, so it must come
+        // back rather than being dropped with its process still running.
+        let (_, outcome) = split_group(tree(1), 99, SplitDirection::Vertical, dummy_group(2));
+        assert_eq!(outcome.err().map(|g| g.id), Some(2));
+    }
+
+    #[test]
+    fn layout_splits_the_rect_between_groups() {
+        let root = split(tree(1), 1, SplitDirection::Vertical, 2);
+        let (groups, dividers) = layout_of(&root, 102.0, 50.0);
+        assert_eq!(groups[0].1, PaneRect { x: 0.0, y: 0.0, w: 50.0, h: 50.0 });
+        assert_eq!(groups[1].1, PaneRect { x: 52.0, y: 0.0, w: 50.0, h: 50.0 });
         assert_eq!(dividers.len(), 1);
-        let (first_id, first) = panes[0];
-        let (second_id, second) = panes[1];
-        assert_eq!(first_id, 10, "the original pane keeps the left slot");
-        assert_eq!(second_id, 11);
-        assert_eq!(first.x, 0.0);
-        assert!(second.x > first.x + first.w, "second pane starts past the divider");
-        assert!((first.w + second.w + 2.0 - 100.0).abs() < 1.0, "panes + gap fill the rect");
-        assert_eq!(first.h, 50.0);
-        assert_eq!(second.h, 50.0);
+        assert_eq!(dividers[0].rect, PaneRect { x: 50.0, y: 0.0, w: 2.0, h: 50.0 });
     }
 
     #[test]
-    fn horizontal_split_stacks_panes() {
-        let mut tab = Tab::new(1, dummy_pane(10));
-        _ = tab.split_focused(SplitDirection::Horizontal, dummy_pane(11));
-        let (panes, _) = tab.layout(rect(100.0, 50.0), 2.0);
-        let (_, first) = panes[0];
-        let (_, second) = panes[1];
-        assert_eq!(first.y, 0.0);
-        assert!(second.y > first.y + first.h);
-        assert_eq!(first.w, 100.0);
+    fn a_horizontal_split_stacks_groups() {
+        let root = split(tree(1), 1, SplitDirection::Horizontal, 2);
+        let (groups, _) = layout_of(&root, 50.0, 102.0);
+        assert_eq!(groups[0].1, PaneRect { x: 0.0, y: 0.0, w: 50.0, h: 50.0 });
+        assert_eq!(groups[1].1, PaneRect { x: 0.0, y: 52.0, w: 50.0, h: 50.0 });
     }
 
     #[test]
-    fn remove_pane_collapses_the_split_into_the_sibling() {
-        let mut tab = Tab::new(1, dummy_pane(10));
-        _ = tab.split_focused(SplitDirection::Vertical, dummy_pane(11));
-        let removed = tab.remove_pane(11).expect("pane 11 exists and is not the last");
-        assert_eq!(removed.id, 11);
-        assert_eq!(tab.pane_count(), 1);
-        // Focus was on the removed pane; it must land on a live one.
-        assert_eq!(tab.focused(), Some(10));
-        // The sibling reclaims the whole rect.
-        let (panes, dividers) = tab.layout(rect(100.0, 50.0), 2.0);
-        assert_eq!(panes.len(), 1);
+    fn removing_a_group_collapses_the_split_into_its_sibling() {
+        let root = split(tree(1), 1, SplitDirection::Vertical, 2);
+        let (rest, removed) = remove_group(root, 1);
+        assert_eq!(removed.map(|g| g.id), Some(1));
+        let rest = rest.expect("the sibling survives");
+        assert_eq!(rest.groups().len(), 1);
+        // The survivor takes the whole rect the split occupied.
+        let (groups, dividers) = layout_of(&rest, 102.0, 50.0);
+        assert_eq!(groups[0].1, rect(102.0, 50.0));
         assert!(dividers.is_empty());
-        assert_eq!(panes[0].1, rect(100.0, 50.0));
     }
 
     #[test]
-    fn remove_refuses_the_last_pane() {
-        let mut tab = Tab::new(1, dummy_pane(10));
-        assert!(tab.remove_pane(10).is_none());
-        assert_eq!(tab.pane_count(), 1);
+    fn removing_the_only_group_leaves_nothing() {
+        let (rest, removed) = remove_group(tree(1), 1);
+        assert!(rest.is_none());
+        assert_eq!(removed.map(|g| g.id), Some(1));
     }
 
     #[test]
-    fn nested_splits_layout_and_remove() {
-        let mut tab = Tab::new(1, dummy_pane(10));
-        _ = tab.split_focused(SplitDirection::Vertical, dummy_pane(11)); // 10 | 11
-        _ = tab.split_focused(SplitDirection::Horizontal, dummy_pane(12)); // 10 | (11 / 12)
-        assert_eq!(tab.pane_count(), 3);
-        let (panes, dividers) = tab.layout(rect(200.0, 100.0), 2.0);
-        assert_eq!(panes.len(), 3);
+    fn nested_splits_lay_out_and_collapse() {
+        // 1 | (2 / 3)
+        let root = split(tree(1), 1, SplitDirection::Vertical, 2);
+        let root = split(root, 2, SplitDirection::Horizontal, 3);
+        let (groups, dividers) = layout_of(&root, 102.0, 102.0);
+        assert_eq!(groups.iter().map(|g| g.0).collect::<Vec<_>>(), vec![1, 2, 3]);
+        assert_eq!(groups[0].1, PaneRect { x: 0.0, y: 0.0, w: 50.0, h: 102.0 });
+        assert_eq!(groups[1].1, PaneRect { x: 52.0, y: 0.0, w: 50.0, h: 50.0 });
+        assert_eq!(groups[2].1, PaneRect { x: 52.0, y: 52.0, w: 50.0, h: 50.0 });
         assert_eq!(dividers.len(), 2);
 
-        // Removing the middle pane leaves 10 | 12.
-        let removed = tab.remove_pane(11).expect("not the last pane");
-        assert_eq!(removed.id, 11);
-        let ids: Vec<u64> = tab.panes().iter().map(|p| p.id).collect();
-        assert_eq!(ids, vec![10, 12]);
+        let (rest, _) = remove_group(root, 3);
+        let rest = rest.expect("still two groups");
+        let (groups, _) = layout_of(&rest, 102.0, 102.0);
+        assert_eq!(groups[1].1, PaneRect { x: 52.0, y: 0.0, w: 50.0, h: 102.0 }, "2 reclaims 3's half");
     }
 
     #[test]
-    fn set_split_ratio_moves_the_divider() {
-        let mut tab = Tab::new(1, dummy_pane(10));
-        _ = tab.split_focused(SplitDirection::Vertical, dummy_pane(11));
-        tab.set_split_ratio(&[], 0.25);
-        let (panes, dividers) = tab.layout(rect(202.0, 100.0), 2.0);
-        let (_, first) = panes[0];
+    fn set_ratio_moves_the_divider() {
+        let mut root = split(tree(1), 1, SplitDirection::Vertical, 2);
+        root.set_ratio(&[], 0.25);
+        let (groups, dividers) = layout_of(&root, 202.0, 100.0);
         // (202 - 2) * 0.25 = 50
-        assert_eq!(first.w, 50.0);
+        assert_eq!(groups[0].1.w, 50.0);
         assert_eq!(dividers[0].rect.x, 50.0);
-        assert_eq!(dividers[0].region, rect(202.0, 100.0));
     }
 
     #[test]
-    fn set_split_ratio_reaches_nested_splits_by_path() {
-        let mut tab = Tab::new(1, dummy_pane(10));
-        _ = tab.split_focused(SplitDirection::Vertical, dummy_pane(11)); // 10 | 11
-        _ = tab.split_focused(SplitDirection::Horizontal, dummy_pane(12)); // 10 | (11 / 12)
-        let (_, dividers) = tab.layout(rect(202.0, 102.0), 2.0);
+    fn set_ratio_reaches_nested_splits_by_path() {
+        let mut root = split(tree(1), 1, SplitDirection::Vertical, 2);
+        root = split(root, 2, SplitDirection::Horizontal, 3);
+        let (_, dividers) = layout_of(&root, 202.0, 102.0);
         assert_eq!(dividers[0].path, Vec::<bool>::new(), "root split");
-        assert_eq!(dividers[1].path, vec![true], "nested split lives in the root's second branch");
+        assert_eq!(dividers[1].path, vec![true], "the nested split is in the root's second branch");
 
-        tab.set_split_ratio(&[true], 0.25);
-        let (panes, _) = tab.layout(rect(202.0, 102.0), 2.0);
-        let (id, top_right) = panes[1];
-        assert_eq!(id, 11);
+        root.set_ratio(&[true], 0.25);
+        let (groups, _) = layout_of(&root, 202.0, 102.0);
         // (102 - 2) * 0.25 = 25
-        assert_eq!(top_right.h, 25.0);
+        assert_eq!(groups[1].1.h, 25.0);
     }
 
     #[test]
-    fn set_split_ratio_clamps_and_survives_stale_paths() {
-        let mut tab = Tab::new(1, dummy_pane(10));
-        _ = tab.split_focused(SplitDirection::Vertical, dummy_pane(11));
-        tab.set_split_ratio(&[], 0.0);
-        let (panes, _) = tab.layout(rect(202.0, 100.0), 2.0);
-        assert!(panes[0].1.w > 0.0, "ratio clamps above zero so a pane can't vanish");
-        // A path into a branch that is a leaf, not a split: must be a no-op.
-        tab.set_split_ratio(&[false, true], 0.9);
+    fn set_ratio_clamps_and_survives_stale_paths() {
+        let mut root = split(tree(1), 1, SplitDirection::Vertical, 2);
+        root.set_ratio(&[], 0.0);
+        let (groups, _) = layout_of(&root, 202.0, 100.0);
+        assert!(groups[0].1.w > 0.0, "ratio clamps above zero so a group can't vanish");
+        // A path into a branch that is a leaf, not a split: a no-op.
+        root.set_ratio(&[false, true], 0.9);
     }
 
     #[test]
-    fn a_preview_tab_answers_empty_to_every_shell_query() {
-        // The point of the Option/empty returns: code written for shell
-        // tabs falls out on a preview tab instead of panicking.
-        let tab = Tab::preview(7, crate::preview::Preview::loading("/tmp/x.png".into()));
-        assert!(tab.focused().is_none());
-        assert!(tab.focused_pane().is_none());
-        assert!(tab.pane(0).is_none());
-        assert!(tab.panes().is_empty());
-        assert_eq!(tab.pane_count(), 0);
-        let (panes, dividers) = tab.layout(rect(100.0, 100.0), 2.0);
-        assert!(panes.is_empty() && dividers.is_empty());
-        assert!(tab.preview_content().is_some());
+    fn a_group_cycles_and_closes_its_tabs() {
+        let mut group = dummy_group(1);
+        group.add_tab(Tab::shell(20, dummy_pane(20)));
+        group.add_tab(Tab::shell(30, dummy_pane(30)));
+        assert_eq!(group.active_tab().id, 30, "a new tab is the one you wanted to use");
+
+        group.cycle_tab(true);
+        assert_eq!(group.active_tab().id, 1, "forward from the last wraps to the first");
+        group.cycle_tab(false);
+        assert_eq!(group.active_tab().id, 30);
+
+        let closed = group.close_tab(2).expect("not the last tab");
+        assert_eq!(closed.id, 30);
+        assert_eq!(group.tabs().len(), 2);
+        assert!(group.active_index() < group.tabs().len(), "active stays in range");
     }
 
     #[test]
-    fn a_preview_tab_is_titled_by_its_file() {
+    fn a_group_refuses_to_close_its_last_tab() {
+        // Emptying a group means removing the group, which is its
+        // owner's call -- the group itself never ends up blank.
+        let mut group = dummy_group(1);
+        assert!(group.close_tab(0).is_none());
+        assert_eq!(group.tabs().len(), 1);
+    }
+
+    #[test]
+    fn a_preview_tab_has_no_shell_and_is_titled_by_its_file() {
         let tab = Tab::preview(7, crate::preview::Preview::loading("/tmp/report.pdf".into()));
+        assert!(tab.pane().is_none());
+        assert!(tab.preview_content().is_some());
         assert_eq!(tab.title(), "report.pdf");
-    }
-
-    #[test]
-    fn splitting_a_preview_tab_hands_the_pane_back() {
-        // The caller has already spawned a shell by this point, so the
-        // pane must come back rather than being dropped -- otherwise the
-        // process leaks with no pane to show it.
-        let mut tab = Tab::preview(7, crate::preview::Preview::loading("/tmp/x.png".into()));
-        let rejected = tab.split_focused(SplitDirection::Vertical, dummy_pane(1));
-        assert!(rejected.is_err());
-        assert_eq!(rejected.unwrap_err().id, 1);
-        assert_eq!(tab.pane_count(), 0, "still a preview tab");
-    }
-
-    #[test]
-    fn set_focused_ignores_ids_that_are_not_live_panes() {
-        let mut tab = Tab::new(1, dummy_pane(10));
-        tab.set_focused(999);
-        assert_eq!(tab.focused(), Some(10), "a stale id can't strand input");
-    }
-
-    #[test]
-    fn cycle_focus_walks_panes_in_order_and_wraps() {
-        let mut tab = Tab::new(1, dummy_pane(10));
-        _ = tab.split_focused(SplitDirection::Vertical, dummy_pane(11));
-        _ = tab.split_focused(SplitDirection::Horizontal, dummy_pane(12));
-        assert_eq!(tab.focused(), Some(12));
-        tab.cycle_focus(true);
-        assert_eq!(tab.focused(), Some(10), "forward from the last pane wraps to the first");
-        tab.cycle_focus(true);
-        assert_eq!(tab.focused(), Some(11));
-        tab.cycle_focus(false);
-        assert_eq!(tab.focused(), Some(10));
-        tab.cycle_focus(false);
-        assert_eq!(tab.focused(), Some(12), "backward from the first pane wraps to the last");
     }
 }

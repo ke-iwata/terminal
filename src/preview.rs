@@ -41,8 +41,18 @@ const QUICKLOOK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(8)
 
 const IMAGE_EXTENSIONS: &[&str] = &["png", "jpg", "jpeg", "gif", "bmp", "webp", "tif", "tiff"];
 
+/// A loaded preview, as it lives in the tab once the pixels (if any)
+/// have gone to the GPU. Deliberately holds no image bytes: a decoded
+/// 4096x4096 image is 64MB, and keeping a copy per open preview tab on
+/// top of its texture would be pure waste.
 pub enum Content {
-    /// Straight RGBA8, ready for a texture upload.
+    Image { width: u32, height: u32 },
+    Text(Vec<String>),
+}
+
+/// What the loader hands back -- the image case still carries its
+/// pixels, which the event loop uploads and then drops.
+pub enum Loaded {
     Image { pixels: Vec<u8>, width: u32, height: u32 },
     Text(Vec<String>),
 }
@@ -51,7 +61,7 @@ impl Content {
     /// A short "300x200" / "42 lines" note for the overlay caption.
     pub fn describe(&self) -> String {
         match self {
-            Content::Image { width, height, .. } => format!("{width}x{height}"),
+            Content::Image { width, height } => format!("{width}x{height}"),
             Content::Text(lines) => format!("{} lines", lines.len()),
         }
     }
@@ -59,7 +69,7 @@ impl Content {
 
 /// Decode `path` for preview, or explain why it can't be. Blocking; call
 /// off the event loop.
-pub fn load(path: &Path) -> Result<Content, String> {
+pub fn load(path: &Path) -> Result<Loaded, String> {
     let metadata = std::fs::metadata(path).map_err(|e| format!("can't read: {e}"))?;
     if metadata.is_dir() {
         return Err("directories have no preview".to_string());
@@ -74,13 +84,13 @@ pub fn load(path: &Path) -> Result<Content, String> {
         return decode_image(&std::fs::read(path).map_err(|e| format!("can't read: {e}"))?);
     }
     if let Some(lines) = read_as_text(path, metadata.len()) {
-        return Ok(Content::Text(lines));
+        return Ok(Loaded::Text(lines));
     }
     let png = quicklook_png(path).ok_or_else(|| "no preview available for this file type".to_string())?;
     decode_image(&png)
 }
 
-fn decode_image(bytes: &[u8]) -> Result<Content, String> {
+fn decode_image(bytes: &[u8]) -> Result<Loaded, String> {
     let decoded = image::load_from_memory(bytes).map_err(|e| format!("can't decode: {e}"))?;
     // `thumbnail` only ever shrinks -- an image already within the cap
     // passes through at full resolution.
@@ -94,7 +104,7 @@ fn decode_image(bytes: &[u8]) -> Result<Content, String> {
     if width == 0 || height == 0 {
         return Err("image has no pixels".to_string());
     }
-    Ok(Content::Image { pixels: rgba.into_raw(), width, height })
+    Ok(Loaded::Image { pixels: rgba.into_raw(), width, height })
 }
 
 /// Read `path` as text, or `None` if it doesn't look like text. The test
@@ -294,7 +304,7 @@ mod tests {
         let t = TempDir::new("text");
         let path = t.write("notes.txt", b"first\nsecond\n");
         match load(&path).unwrap() {
-            Content::Text(lines) => assert_eq!(lines, vec!["first", "second"]),
+            Loaded::Text(lines) => assert_eq!(lines, vec!["first", "second"]),
             _ => panic!("expected text"),
         }
     }
@@ -305,7 +315,7 @@ mod tests {
         let long = "x".repeat(MAX_TEXT_LINE_CHARS + 50);
         let path = t.write("wide.txt", format!("a\tb\n{long}\n").as_bytes());
         match load(&path).unwrap() {
-            Content::Text(lines) => {
+            Loaded::Text(lines) => {
                 assert_eq!(lines[0], "a    b");
                 assert_eq!(lines[1].chars().count(), MAX_TEXT_LINE_CHARS);
             }
@@ -320,7 +330,7 @@ mod tests {
         let t = TempDir::new("utf8");
         let path = t.write("jp.txt", "hello 世界\n".as_bytes());
         match load(&path).unwrap() {
-            Content::Text(lines) => assert_eq!(lines, vec!["hello ??"]),
+            Loaded::Text(lines) => assert_eq!(lines, vec!["hello ??"]),
             _ => panic!("expected text"),
         }
     }
@@ -364,7 +374,7 @@ mod tests {
         }
         let path = t.write("dot.png", &encoded);
         match load(&path).unwrap() {
-            Content::Image { pixels, width, height } => {
+            Loaded::Image { pixels, width, height } => {
                 assert_eq!((width, height), (2, 1));
                 assert_eq!(&pixels[0..4], &[255, 0, 0, 255]);
                 assert_eq!(&pixels[4..8], &[0, 0, 255, 255]);
@@ -381,7 +391,7 @@ mod tests {
 
     #[test]
     fn describe_summarizes_each_kind() {
-        let image = Content::Image { pixels: vec![0; 4], width: 640, height: 480 };
+        let image = Content::Image { width: 640, height: 480 };
         assert_eq!(image.describe(), "640x480");
         assert_eq!(Content::Text(vec!["a".into(), "b".into()]).describe(), "2 lines");
     }
