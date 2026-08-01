@@ -262,6 +262,7 @@ impl Renderer {
         status: &chrome::StatusInfo,
         cmd_held: bool,
         file_tree: Option<FileTreeView>,
+        preedit: &str,
     ) -> RenderOutcome {
         let surface_texture = match self.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(t) => t,
@@ -344,6 +345,12 @@ impl Renderer {
                         if let Some(search) = pane.search.as_ref() {
                             instances.extend(chrome::build_search_bar_instances(&self.atlas, search, content, self.atlas.cell_height));
                         }
+                        // Only the focused group can be composing.
+                        let cursor = (
+                            content.x + pane.term.cursor.col as f32 * self.atlas.cell_width,
+                            content.y + pane.term.cursor.row as f32 * self.atlas.cell_height,
+                        );
+                        instances.extend(chrome::build_preedit_instances(&self.atlas, preedit, cursor, content));
                     }
                 }
                 crate::tab::TabKind::Preview(preview) => {

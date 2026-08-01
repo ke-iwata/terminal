@@ -179,6 +179,11 @@ struct App {
     dragging_sidebar: bool,
     /// Which row the pointer is over in the sidebar, for the hover band.
     file_tree_hover: Option<usize>,
+    /// Text the input method is composing right now, not yet committed.
+    /// Held here rather than written to the pty because it isn't input
+    /// yet -- it's a proposal the user is still editing, and the shell
+    /// must not see the intermediate romaji.
+    preedit: String,
     /// The last-clicked entry, kept highlighted. Stored as a path rather
     /// than a row index so it survives the tree being rebuilt (files
     /// appearing above it would otherwise shift the highlight onto a
@@ -218,6 +223,7 @@ impl App {
             dragging_sidebar: false,
             file_tree_hover: None,
             file_tree_selected: None,
+            preedit: String::new(),
         }
     }
 
@@ -1217,6 +1223,33 @@ impl App {
         true
     }
 
+    /// Point the system's candidate window at the terminal cursor.
+    /// Without this it opens at the window's origin, which for a
+    /// bottom-of-screen prompt means the candidate list appears nowhere
+    /// near what's being typed.
+    fn update_ime_cursor_area(&self) {
+        let (Some(window), Some((cell_w, cell_h))) = (&self.window, self.renderer.as_ref().map(Renderer::cell_size)) else {
+            return;
+        };
+        let Some(rect) = self.focused_content_rect() else { return };
+        let Some(pane) = self.focused_pane() else { return };
+        let x = rect.x + pane.term.cursor.col as f32 * cell_w;
+        let y = rect.y + pane.term.cursor.row as f32 * cell_h;
+        window.set_ime_cursor_area(
+            winit::dpi::PhysicalPosition::new(x, y),
+            winit::dpi::PhysicalSize::new(cell_w.max(1.0), cell_h.max(1.0)),
+        );
+    }
+
+    /// The focused group's content rect -- below its tab strip.
+    fn focused_content_rect(&self) -> Option<tab::PaneRect> {
+        let (_, cell_h) = self.renderer.as_ref().map(Renderer::cell_size)?;
+        let tab_bar_h = chrome::tab_bar_height(cell_h);
+        let focused = self.focused_group;
+        let (_, rect) = self.group_rects().into_iter().find(|(id, _)| *id == focused)?;
+        Some(tab::PaneRect { x: rect.x, y: rect.y + tab_bar_h, w: rect.w, h: (rect.h - tab_bar_h).max(1.0) })
+    }
+
     /// Record the window's current outer position and inner size, for
     /// the state file written at exit.
     fn track_window_frame(&mut self) {
@@ -1420,6 +1453,12 @@ impl ApplicationHandler<UserEvent> for App {
         );
         let palette = Palette::from(&self.config.colors);
         let renderer = Renderer::new(window.clone(), &self.config.font, palette, self.config.opacity);
+
+        // Without this, macOS never routes keystrokes through an input
+        // method, so Japanese (and every other composed script) can't be
+        // typed at all. winit only emits `Ime` events once it's set.
+        window.set_ime_allowed(true);
+        window.set_ime_purpose(winit::window::ImePurpose::Terminal);
 
         self.window = Some(window);
         self.renderer = Some(renderer);
@@ -1668,6 +1707,33 @@ impl ApplicationHandler<UserEvent> for App {
                 // Cmd held/released toggles URL underlines in the grid --
                 // redraw right away instead of waiting for an unrelated
                 // event to happen to show/hide them.
+                if let Some(window) = &self.window {
+                    window.request_redraw();
+                }
+            }
+            // Input-method events. winit only sends these while an input
+            // method is composing: `insertText:` commits solely when
+            // there is marked text, and `keyDown:` suppresses the
+            // `KeyboardInput` it would otherwise send for keys the IME
+            // consumed. So the two paths never both fire for one
+            // keystroke, and plain typing still arrives as `text` below.
+            WindowEvent::Ime(ime) => {
+                match ime {
+                    winit::event::Ime::Preedit(text, _) => self.preedit = text,
+                    winit::event::Ime::Commit(text) => {
+                        self.preedit.clear();
+                        if let Some(pane) = self.focused_pane() {
+                            write_all_to_pty(pane.pty_master.as_fd(), text.as_bytes());
+                        }
+                        if let Some(pane) = self.focused_pane_mut() {
+                            pane.scroll_offset = 0;
+                        }
+                    }
+                    // A composition can be abandoned by switching input
+                    // source mid-word; drop what was on screen with it.
+                    winit::event::Ime::Enabled | winit::event::Ime::Disabled => self.preedit.clear(),
+                }
+                self.update_ime_cursor_area();
                 if let Some(window) = &self.window {
                     window.request_redraw();
                 }
@@ -1957,10 +2023,11 @@ impl ApplicationHandler<UserEvent> for App {
                 // to be borrowed mutably alongside it.
                 let root = self.root.as_ref().expect("the tree always has at least one group");
                 let focused_group = self.focused_group;
+                let preedit = self.preedit.clone();
                 let outcome = self
                     .renderer
                     .as_mut()
-                    .map(|renderer| renderer.render(root, focused_group, &self.cached_status, cmd_held, file_tree_view));
+                    .map(|renderer| renderer.render(root, focused_group, &self.cached_status, cmd_held, file_tree_view, &preedit));
                 match outcome {
                     Some(render::RenderOutcome::Presented) => self.presented_once = true,
                     Some(render::RenderOutcome::Retry) => {

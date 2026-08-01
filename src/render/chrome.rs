@@ -805,6 +805,51 @@ fn push_text(instances: &mut Vec<Instance>, atlas: &FontAtlas, text: &str, start
     }
 }
 
+
+// ---- input-method preedit ---------------------------------------------
+
+const PREEDIT_BG: (u8, u8, u8) = (0x2a, 0x2c, 0x33);
+
+/// Draw the text an input method is currently composing, at the terminal
+/// cursor. It isn't in the grid -- the shell hasn't been told about it
+/// yet -- so it's drawn over the top, on its own background and with the
+/// underline that marks unconfirmed text on every platform.
+///
+/// `cursor` is the cell the composition starts at; `area` is the pane it
+/// has to stay inside.
+/// Where the composing text actually starts: at the cursor, pulled back
+/// so it stays wholly inside `area`.
+fn preedit_origin(shown: &str, cursor: (f32, f32), area: PaneRect, cw: f32, ch: f32) -> (f32, f32) {
+    let width = text_cols(shown) as f32 * cw;
+    (
+        cursor.0.min(area.x + area.w - width).max(area.x),
+        cursor.1.min(area.y + area.h - ch).max(area.y),
+    )
+}
+
+pub fn build_preedit_instances(atlas: &FontAtlas, text: &str, cursor: (f32, f32), area: PaneRect) -> Vec<Instance> {
+    if text.is_empty() {
+        return Vec::new();
+    }
+    let mut instances = Vec::new();
+    let (cw, ch) = (atlas.cell_width, atlas.cell_height);
+
+    // Truncate to whatever the pane can show, then place it so it never
+    // runs off the right edge -- a long composition at a prompt near the
+    // edge would otherwise be half invisible.
+    let max_cols = ((area.w / cw).floor() as usize).max(1);
+    let shown = truncate(text, max_cols);
+    let width = text_cols(&shown) as f32 * cw;
+    let (x, y) = preedit_origin(&shown, cursor, area, cw, ch);
+
+    push_rect(&mut instances, atlas, [x, y, width, ch], PREEDIT_BG, 0.0);
+    push_text(&mut instances, atlas, &shown, x, y, CHROME_FG_ACTIVE);
+    // The underline is what says "not committed yet".
+    push_rect(&mut instances, atlas, [x, y + ch - 2.0, width, 2.0], CHROME_ACCENT, 0.0);
+
+    instances
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -944,5 +989,23 @@ mod tests {
                 tab.label
             );
         }
+    }
+
+    #[test]
+    fn a_preedit_is_drawn_at_the_cursor_and_kept_inside_the_pane() {
+        let atlas_area = PaneRect { x: 100.0, y: 50.0, w: 400.0, h: 200.0 };
+        // Nothing to draw when nothing is being composed.
+        let cols_for = |text: &str| text_cols(text) as f32 * CELL_W;
+
+        // A composition near the right edge has to slide left rather than
+        // run off it -- half an invisible word is worse than a nudge.
+        let near_edge = (atlas_area.x + atlas_area.w - CELL_W, atlas_area.y);
+        let shifted = preedit_origin("こんにちは", near_edge, atlas_area, CELL_W, CELL_H);
+        assert!(shifted.0 + cols_for("こんにちは") <= atlas_area.x + atlas_area.w);
+        assert!(shifted.0 >= atlas_area.x);
+
+        // Away from the edge it sits exactly at the cursor.
+        let mid = (atlas_area.x + 20.0, atlas_area.y + 10.0);
+        assert_eq!(preedit_origin("あ", mid, atlas_area, CELL_W, CELL_H), mid);
     }
 }
