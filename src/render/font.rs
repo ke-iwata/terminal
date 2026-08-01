@@ -35,6 +35,12 @@ impl FontAtlas {
     /// available system monospace font at `px_size` physical pixels
     /// (already multiplied by the window's scale factor by the caller, so
     /// glyphs come out crisp on Retina displays).
+    ///
+    /// Deliberately ASCII-only: chrome that wants a symbol beyond this
+    /// range (the file tree's twisties) draws it from quads instead of
+    /// asking for a glyph. Monospace fonts vary in which symbols they
+    /// carry -- SF Mono and Menlo have no U+25B8 -- and a missing glyph
+    /// rasterizes as a tofu box, which looks broken rather than plain.
     pub fn new(px_size: f32, family: Option<&str>) -> Self {
         let font = load_system_monospace_font(family);
 

@@ -162,6 +162,13 @@ struct App {
     /// The previous sidebar click (when, which path), for double-click
     /// detection on directories.
     last_tree_click: Option<(Instant, std::path::PathBuf)>,
+    /// What the pointer is over in the sidebar, for the hover band.
+    file_tree_hover: Option<chrome::FileTreeHit>,
+    /// The last-clicked entry, kept highlighted. Stored as a path rather
+    /// than a row index so it survives the tree being rebuilt (files
+    /// appearing above it would otherwise shift the highlight onto a
+    /// different entry).
+    file_tree_selected: Option<std::path::PathBuf>,
 }
 
 impl App {
@@ -193,6 +200,8 @@ impl App {
             file_tree_visible: persisted.file_tree_visible,
             last_tree_refresh: None,
             last_tree_click: None,
+            file_tree_hover: None,
+            file_tree_selected: None,
         }
     }
 
@@ -867,6 +876,7 @@ impl App {
             Some(chrome::FileTreeHit::Row(index)) => {
                 let Some(row) = self.file_tree.rows().get(index) else { return };
                 let (path, is_dir) = (row.path.clone(), row.is_dir);
+                self.file_tree_selected = Some(path.clone());
 
                 let now = Instant::now();
                 let double = self
@@ -918,6 +928,23 @@ impl App {
         let pane = self.active_tab().focused_pane();
         write_all_to_pty(pane.pty_master.as_fd(), text.as_bytes());
         self.active_tab_mut().focused_pane_mut().scroll_offset = 0;
+    }
+
+    /// Recompute what the pointer is over in the sidebar, redrawing only
+    /// when it actually moves to a different row -- a hover band that
+    /// requested a frame per pixel of mouse travel would redraw the whole
+    /// window for nothing.
+    fn update_file_tree_hover(&mut self) {
+        let hit = self.file_tree_rect().and_then(|rect| {
+            let (_, cell_h) = self.renderer.as_ref()?.cell_size();
+            chrome::file_tree_hit_test(rect, cell_h, self.file_tree.scroll, self.file_tree.rows().len(), self.cursor_pos.0, self.cursor_pos.1)
+        });
+        if hit != self.file_tree_hover {
+            self.file_tree_hover = hit;
+            if let Some(window) = &self.window {
+                window.request_redraw();
+            }
+        }
     }
 
     /// Scroll the sidebar under the mouse. Returns whether it handled the
@@ -1477,6 +1504,7 @@ impl ApplicationHandler<UserEvent> for App {
             WindowEvent::CursorMoved { position, .. } => {
                 self.cursor_pos = (position.x as f32, position.y as f32);
                 self.update_divider_drag();
+                self.update_file_tree_hover();
                 self.update_selection();
                 // Motion with a button held, for apps in drag-reporting
                 // mode -- reported once per cell crossed, not per pixel.
@@ -1575,12 +1603,25 @@ impl ApplicationHandler<UserEvent> for App {
                 self.refresh_status();
                 self.refresh_file_tree();
                 let cmd_held = self.modifiers.super_key();
-                let root_label = display_path(self.file_tree.root());
+                // The folder's own name, like VS Code's workspace title;
+                // falls back to the abbreviated path at the filesystem
+                // root, which has no name of its own.
+                let root = self.file_tree.root();
+                let title = root
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| display_path(root));
+                let selected = self
+                    .file_tree_selected
+                    .as_ref()
+                    .and_then(|path| self.file_tree.rows().iter().position(|r| &r.path == path));
                 let file_tree_view = self.file_tree_visible.then(|| render::FileTreeView {
-                    root_label: &root_label,
+                    title: &title,
                     rows: self.file_tree.rows(),
                     scroll: self.file_tree.scroll,
                     show_hidden: self.file_tree.show_hidden(),
+                    hover: self.file_tree_hover,
+                    selected,
                 });
                 let outcome = self
                     .renderer

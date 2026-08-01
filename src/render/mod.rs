@@ -28,11 +28,17 @@ struct GridOverlays<'a> {
 /// `FileTree` for the duration of one frame. `Some` means visible -- the
 /// renderer never decides that on its own.
 pub struct FileTreeView<'a> {
-    /// The rooted directory, already abbreviated for display.
-    pub root_label: &'a str,
+    /// The rooted folder's own name, shown uppercase as the section
+    /// title the way VS Code labels the open workspace.
+    pub title: &'a str,
     pub rows: &'a [crate::filetree::Row],
     pub scroll: usize,
     pub show_hidden: bool,
+    /// What the pointer is currently over, for the hover band.
+    pub hover: Option<chrome::FileTreeHit>,
+    /// Index into `rows` of the last-clicked entry, kept highlighted so
+    /// the list shows what you acted on -- VS Code's selected row.
+    pub selected: Option<usize>,
 }
 
 /// What happened when `Renderer::render` was asked to draw a frame.
@@ -246,9 +252,9 @@ impl Renderer {
             }
         }
 
-        if let Some(view) = file_tree {
+        if let Some(view) = &file_tree {
             if let Some(rect) = chrome::file_tree_rect(window_width, window_height, self.atlas.cell_width, self.atlas.cell_height, true) {
-                instances.extend(chrome::build_file_tree_instances(&self.atlas, rect, view.root_label, view.rows, view.scroll, view.show_hidden));
+                instances.extend(chrome::build_file_tree_instances(&self.atlas, rect, view));
             }
         }
 

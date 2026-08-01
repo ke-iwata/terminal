@@ -10,7 +10,6 @@
 
 use super::font::FontAtlas;
 use super::pipeline::Instance;
-use crate::filetree;
 use crate::tab::{PaneRect, Search};
 
 // Fixed chrome colors, deliberately NOT derived from the terminal palette:
@@ -103,13 +102,70 @@ pub fn file_tree_rect(window_width: f32, window_height: f32, cell_w: f32, cell_h
     })
 }
 
-/// The header strip inside the sidebar, showing the current directory and
-/// a `..` affordance.
-fn file_tree_header_height(cell_h: f32) -> f32 {
-    cell_h * 2.4
+// Sidebar palette, lifted from VS Code's Dark+ theme so the tree reads as
+// the file explorer it's modeled on: one flat panel color, one neutral
+// text color for every entry (VS Code tints icons, never names), and
+// hover/selection that differ from the panel only by a few percent of
+// lightness.
+const TREE_BG: (u8, u8, u8) = (0x25, 0x25, 0x26);
+const TREE_FG: (u8, u8, u8) = (0xcc, 0xcc, 0xcc);
+const TREE_FG_DIM: (u8, u8, u8) = (0x8c, 0x8c, 0x8c);
+const TREE_HOVER: (u8, u8, u8) = (0x2a, 0x2d, 0x2e);
+const TREE_SELECTED: (u8, u8, u8) = (0x37, 0x37, 0x3d);
+const TREE_INDENT_GUIDE: (u8, u8, u8) = (0x58, 0x58, 0x58);
+const TREE_SCROLL_THUMB: (u8, u8, u8) = (0x4f, 0x4f, 0x4f);
+
+/// One indent level, in character columns. VS Code indents 8px per level
+/// at its default 13px font; one column is within a pixel of that at the
+/// sizes a terminal font runs at.
+const TREE_INDENT_COLS: f32 = 1.0;
+
+/// Draw a filled triangle -- the twisty next to a directory -- out of
+/// stacked one-pixel bars. Built from quads rather than a glyph because
+/// the monospace fonts a terminal picks from don't reliably carry the
+/// arrow characters (SF Mono and Menlo both render U+25B8 as tofu), and
+/// a font-independent shape is worth more here than reusing the text
+/// path.
+fn push_twisty(instances: &mut Vec<Instance>, atlas: &FontAtlas, x: f32, y: f32, size: f32, expanded: bool, color: (u8, u8, u8)) {
+    let steps = (size.round() as usize).max(3);
+    for i in 0..steps {
+        let t = i as f32 / (steps - 1) as f32;
+        let (bar_x, bar_w) = if expanded {
+            // Pointing down: full width at the top, tapering to a point.
+            let half = (size / 2.0) * (1.0 - t);
+            (x + size / 2.0 - half, half * 2.0)
+        } else {
+            // Pointing right: widest at the vertical midpoint.
+            let extent = 1.0 - (t - 0.5).abs() * 2.0;
+            (x, size * extent)
+        };
+        if bar_w >= 1.0 {
+            push_rect(instances, atlas, [bar_x.round(), (y + i as f32).round(), bar_w.round().max(1.0), 1.0], color, 0.0);
+        }
+    }
 }
 
-/// What a click inside the sidebar landed on.
+/// Rows are slightly taller than a terminal line -- VS Code's list rows
+/// have noticeably more leading than its editor lines, and that airiness
+/// is a lot of what makes the explorer feel like a list rather than
+/// dumped text.
+fn file_tree_row_height(cell_h: f32) -> f32 {
+    (cell_h * 1.2).round()
+}
+
+/// The section-title band above the tree (the uppercase folder name),
+/// not counting the `..` row directly below it.
+fn file_tree_title_height(cell_h: f32) -> f32 {
+    (cell_h * 1.8).round()
+}
+
+/// Title band plus the `..` row -- everything above the scrolling list.
+fn file_tree_header_height(cell_h: f32) -> f32 {
+    file_tree_title_height(cell_h) + file_tree_row_height(cell_h)
+}
+
+/// What a click (or hover) inside the sidebar landed on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FileTreeHit {
     /// The `..` row: go to the parent directory.
     Parent,
@@ -125,86 +181,112 @@ pub fn file_tree_hit_test(rect: PaneRect, cell_h: f32, scroll: usize, row_count:
     }
     let header_h = file_tree_header_height(cell_h);
     if y < rect.y + header_h {
-        // Only the lower half of the header (the `..` line) is clickable;
-        // the path label above it isn't a button.
-        return (y >= rect.y + header_h - cell_h * 1.2).then_some(FileTreeHit::Parent);
+        // The uppercase title is a label, not a button; only the `..`
+        // row beneath it responds.
+        return (y >= rect.y + file_tree_title_height(cell_h)).then_some(FileTreeHit::Parent);
     }
-    let index = ((y - rect.y - header_h) / cell_h).floor() as usize + scroll;
+    let index = ((y - rect.y - header_h) / file_tree_row_height(cell_h)).floor() as usize + scroll;
     (index < row_count).then_some(FileTreeHit::Row(index))
 }
 
 /// How many tree rows fit below the header.
 pub fn file_tree_visible_rows(rect: PaneRect, cell_h: f32) -> usize {
-    (((rect.h - file_tree_header_height(cell_h)) / cell_h).floor() as usize).max(1)
+    (((rect.h - file_tree_header_height(cell_h)) / file_tree_row_height(cell_h)).floor() as usize).max(1)
 }
 
-/// Draw the sidebar: a header with the current directory, then one line
-/// per visible tree row (indented by depth, directories first with an
-/// expand marker).
-pub fn build_file_tree_instances(atlas: &FontAtlas, rect: PaneRect, root_label: &str, rows: &[filetree::Row], scroll: usize, show_hidden: bool) -> Vec<Instance> {
+/// Draw the sidebar in the shape of VS Code's explorer: an uppercase
+/// section title, then one row per visible entry -- twisty, indent
+/// guides, and a full-width hover/selection band.
+pub fn build_file_tree_instances(atlas: &FontAtlas, rect: PaneRect, view: &super::FileTreeView) -> Vec<Instance> {
     let mut instances = Vec::new();
     let (cw, ch) = (atlas.cell_width, atlas.cell_height);
+    let row_h = file_tree_row_height(ch);
+    let title_h = file_tree_title_height(ch);
+    let header_h = file_tree_header_height(ch);
+    // Vertical offset that centers a line of text inside a taller row.
+    let text_dy = ((row_h - ch) / 2.0).max(0.0);
 
-    push_rect(&mut instances, atlas, [rect.x, rect.y, rect.w, rect.h], CHROME_STATUS_BG, 0.0);
-    // Left edge, matching the status bar's top edge -- separates the
-    // sidebar from live terminal content.
+    push_rect(&mut instances, atlas, [rect.x, rect.y, rect.w, rect.h], TREE_BG, 0.0);
     push_rect(&mut instances, atlas, [rect.x, rect.y, 1.0, rect.h], CHROME_STATUS_EDGE, 0.0);
 
-    let header_h = file_tree_header_height(ch);
     let text_cols = ((rect.w / cw).floor() as usize).saturating_sub(2);
-    let pad_x = rect.x + cw;
+    let pad_x = rect.x + cw * 0.75;
 
-    // The path label is right-truncated (keeping the tail): the deepest
-    // directories are what identify where you are, not the leading /Users.
-    let label = truncate_start(root_label, text_cols);
-    push_text(&mut instances, atlas, &label, pad_x, rect.y + ch * 0.35, CHROME_FG_ACTIVE);
+    // Section title: the rooted folder's own name, uppercased, the way
+    // VS Code labels the open workspace. The full path lives in the
+    // status bar already, so this doesn't repeat it.
+    let title_y = rect.y + (title_h - ch) / 2.0;
+    push_twisty(&mut instances, atlas, pad_x, title_y + ch * 0.32, ch * 0.4, true, TREE_FG_DIM);
+    push_text(
+        &mut instances,
+        atlas,
+        &truncate(&view.title.to_uppercase(), text_cols.saturating_sub(2)),
+        pad_x + cw * 1.5,
+        title_y,
+        TREE_FG,
+    );
 
-    let parent_y = rect.y + header_h - ch * 1.1;
-    let hidden_marker = if show_hidden { " (all)" } else { "" };
-    push_text(&mut instances, atlas, &format!("..{hidden_marker}"), pad_x, parent_y, CHROME_FG_DIM);
-    push_rect(&mut instances, atlas, [rect.x, rect.y + header_h - 1.0, rect.w, 1.0], CHROME_STATUS_EDGE, 0.0);
+    // `..` -- styled as a list row (full-width hover band and all) so it
+    // reads as the first thing you can click, not as chrome.
+    let parent_y = rect.y + title_h;
+    if view.hover == Some(FileTreeHit::Parent) {
+        push_rect(&mut instances, atlas, [rect.x + 1.0, parent_y, rect.w - 1.0, row_h], TREE_HOVER, 0.0);
+    }
+    let hidden_marker = if view.show_hidden { "..    (showing hidden)" } else { ".." };
+    push_text(&mut instances, atlas, &truncate(hidden_marker, text_cols), pad_x + cw * 1.5, parent_y + text_dy, TREE_FG_DIM);
 
     let visible = file_tree_visible_rows(rect, ch);
-    for (i, row) in rows.iter().skip(scroll).take(visible).enumerate() {
-        let y = rect.y + header_h + i as f32 * ch;
-        let indent = row.depth as f32 * 2.0 * cw;
-        let marker_x = pad_x + indent;
+    for (i, row) in view.rows.iter().skip(view.scroll).take(visible).enumerate() {
+        let y = rect.y + header_h + i as f32 * row_h;
+        let index = view.scroll + i;
 
-        if row.is_dir {
-            // ASCII markers, since the glyph atlas only covers ASCII.
-            push_text(&mut instances, atlas, if row.expanded { "v" } else { ">" }, marker_x, y, CHROME_FG_DIM);
+        // Selection wins over hover, like every list widget.
+        let band = if view.selected == Some(index) {
+            Some(TREE_SELECTED)
+        } else if view.hover == Some(FileTreeHit::Row(index)) {
+            Some(TREE_HOVER)
+        } else {
+            None
+        };
+        if let Some(color) = band {
+            push_rect(&mut instances, atlas, [rect.x + 1.0, y, rect.w - 1.0, row_h], color, 0.0);
         }
-        let name_x = marker_x + cw * 2.0;
-        let name_cols = text_cols.saturating_sub(row.depth * 2 + 2);
-        let color = if row.is_dir { CHROME_ACCENT } else { CHROME_FG_INACTIVE };
-        push_text(&mut instances, atlas, &truncate(&row.name, name_cols), name_x, y, color);
+
+        // One hairline per ancestor level, running the full row height so
+        // consecutive rows join into a continuous guide.
+        for level in 0..row.depth {
+            let gx = (pad_x + level as f32 * TREE_INDENT_COLS * cw + cw * 0.5).round();
+            push_rect(&mut instances, atlas, [gx, y, 1.0, row_h], TREE_INDENT_GUIDE, 0.0);
+        }
+
+        let indent = row.depth as f32 * TREE_INDENT_COLS * cw;
+        let twisty_x = pad_x + indent;
+        if row.is_dir {
+            let size = ch * 0.4;
+            push_twisty(&mut instances, atlas, twisty_x + cw * 0.1, y + (row_h - size) / 2.0, size, row.expanded, TREE_FG_DIM);
+        }
+        // Files leave the twisty column empty so every name in a
+        // directory lines up, folders included.
+        let name_x = twisty_x + cw * 1.5;
+        let name_cols = text_cols.saturating_sub((row.depth as f32 * TREE_INDENT_COLS) as usize + 2);
+        push_text(&mut instances, atlas, &truncate(&row.name, name_cols), name_x, y + text_dy, TREE_FG);
     }
 
     // A minimal scroll thumb, drawn only when there's more than fits --
     // otherwise there's no scroll position worth communicating.
-    if rows.len() > visible {
+    if view.rows.len() > visible {
         let track_y = rect.y + header_h;
         let track_h = rect.h - header_h;
-        let thumb_h = (track_h * visible as f32 / rows.len() as f32).max(12.0);
-        let max_scroll = (rows.len() - visible) as f32;
-        let progress = if max_scroll > 0.0 { scroll as f32 / max_scroll } else { 0.0 };
+        let thumb_h = (track_h * visible as f32 / view.rows.len() as f32).max(12.0);
+        let max_scroll = (view.rows.len() - visible) as f32;
+        let progress = if max_scroll > 0.0 { view.scroll as f32 / max_scroll } else { 0.0 };
         let thumb_y = track_y + progress * (track_h - thumb_h);
-        push_rect(&mut instances, atlas, [rect.x + rect.w - 3.0, thumb_y, 3.0, thumb_h], CHROME_STATUS_EDGE, 0.0);
+        push_rect(&mut instances, atlas, [rect.x + rect.w - 4.0, thumb_y, 4.0, thumb_h], TREE_SCROLL_THUMB, 0.0);
     }
 
     instances
 }
 
-/// Like `truncate`, but drops characters from the *front* -- for paths,
-/// where the tail is the identifying part.
-fn truncate_start(text: &str, max_chars: usize) -> String {
-    let chars: Vec<char> = text.chars().collect();
-    if chars.len() <= max_chars || max_chars <= 3 {
-        return chars.into_iter().rev().take(max_chars).rev().collect();
-    }
-    let tail: String = chars[chars.len() - (max_chars - 3)..].iter().collect();
-    format!("...{tail}")
-}
 
 /// How many terminal rows fit between the two bars at this window height.
 pub fn terminal_rows(window_height: f32, cell_h: f32) -> usize {
