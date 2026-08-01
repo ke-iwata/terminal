@@ -18,6 +18,7 @@ pub const ZOOM_OUT_ID: &str = "zoom_out";
 pub const ZOOM_RESET_ID: &str = "zoom_reset";
 pub const TOGGLE_FILE_TREE_ID: &str = "toggle_file_tree";
 pub const TOGGLE_HIDDEN_FILES_ID: &str = "toggle_hidden_files";
+pub const PREVIEW_SELECTED_ID: &str = "preview_selected";
 
 /// Build and attach the macOS menu bar: an app menu with About, Preferences
 /// (Cmd+,), and Quit. Must be called once at startup, and pairs with
@@ -166,6 +167,13 @@ pub fn install(proxy: EventLoopProxy<UserEvent>) -> Menu {
         true,
         Some(Accelerator::new(Some(Modifiers::SUPER | Modifiers::SHIFT), Code::Period)),
     );
+    // Cmd+Y is what Finder binds Quick Look to, for the same thing.
+    let preview_selected = MenuItem::with_id(
+        PREVIEW_SELECTED_ID,
+        "Quick Look Selected File",
+        true,
+        Some(Accelerator::new(Some(Modifiers::SUPER), Code::KeyY)),
+    );
     view_menu
         .append_items(&[
             &zoom_in,
@@ -174,6 +182,7 @@ pub fn install(proxy: EventLoopProxy<UserEvent>) -> Menu {
             &PredefinedMenuItem::separator(),
             &toggle_file_tree,
             &toggle_hidden_files,
+            &preview_selected,
         ])
         .expect("failed to build view menu");
 
@@ -213,6 +222,8 @@ pub fn install(proxy: EventLoopProxy<UserEvent>) -> Menu {
             UserEvent::ToggleFileTree
         } else if event.id() == TOGGLE_HIDDEN_FILES_ID {
             UserEvent::ToggleHiddenFiles
+        } else if event.id() == PREVIEW_SELECTED_ID {
+            UserEvent::PreviewSelected
         } else {
             return;
         };

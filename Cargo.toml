@@ -24,3 +24,4 @@ egui = "0.35"
 egui-winit = "0.35"
 egui-wgpu = "0.35"
 sysinfo = "0.32"
+image = { version = "0.25.10", default-features = false, features = ["png", "jpeg", "gif", "bmp", "webp", "tiff"] }

@@ -592,8 +592,148 @@ pub fn build_search_bar_instances(atlas: &FontAtlas, search: &Search, window_wid
     instances
 }
 
+// ---- preview overlay ---------------------------------------------------
+
+const PREVIEW_BACKDROP: (u8, u8, u8) = (0x10, 0x11, 0x14);
+/// Not fully opaque: enough of the terminal shows through to keep the
+/// preview feeling like a layer over the session rather than a screen
+/// that replaced it.
+const PREVIEW_BACKDROP_ALPHA: f32 = 0.96;
+const PREVIEW_TITLE_BG: (u8, u8, u8) = (0x1d, 0x1f, 0x24);
+const PREVIEW_ERROR_FG: (u8, u8, u8) = (0xf3, 0x8b, 0xa8);
+
+/// What the overlay is showing right now. The image case carries no
+/// data: its pixels live in a GPU texture that `ImagePipeline` draws,
+/// not in the instance stream.
+pub enum PreviewBody<'a> {
+    Loading,
+    Failed(&'a str),
+    Text { lines: &'a [String], scroll: usize },
+    Image,
+}
+
+pub struct PreviewLayout {
+    /// The whole overlay, including its title strip.
+    pub area: PaneRect,
+    /// Where the image or text goes, below the title strip.
+    pub content: PaneRect,
+}
+
+/// Lay the overlay over the pane area (never the sidebar -- the tree
+/// stays clickable so you can step through files without closing the
+/// preview each time).
+pub fn preview_layout(grid: PaneRect, cell_h: f32) -> PreviewLayout {
+    let title_h = (cell_h * 2.0).round();
+    let pad = (cell_h * 0.6).round();
+    PreviewLayout {
+        area: grid,
+        content: PaneRect {
+            x: grid.x + pad,
+            y: grid.y + title_h + pad,
+            w: (grid.w - pad * 2.0).max(1.0),
+            h: (grid.h - title_h - pad * 2.0).max(1.0),
+        },
+    }
+}
+
+/// Fit `(image_w, image_h)` inside `content`, preserving aspect ratio
+/// and centering it. Scales up as well as down, like every image viewer:
+/// a 32x32 icon shown at 32x32 in the middle of a large window would
+/// read as a bug rather than as fidelity.
+pub fn preview_image_rect(content: PaneRect, image_w: u32, image_h: u32) -> PaneRect {
+    if image_w == 0 || image_h == 0 {
+        return content;
+    }
+    let scale = (content.w / image_w as f32).min(content.h / image_h as f32);
+    let w = (image_w as f32 * scale).max(1.0);
+    let h = (image_h as f32 * scale).max(1.0);
+    PaneRect {
+        x: content.x + (content.w - w) / 2.0,
+        y: content.y + (content.h - h) / 2.0,
+        w,
+        h,
+    }
+}
+
+/// How many text lines fit in the content area.
+pub fn preview_visible_lines(layout: &PreviewLayout, cell_h: f32) -> usize {
+    ((layout.content.h / cell_h).floor() as usize).max(1)
+}
+
+/// Draw the overlay's backdrop, title strip, and -- for text and status
+/// states -- its body. An image body is drawn separately by
+/// `ImagePipeline`, on top of these instances.
+pub fn build_preview_instances(atlas: &FontAtlas, layout: &PreviewLayout, title: &str, subtitle: &str, body: &PreviewBody) -> Vec<Instance> {
+    let mut instances = Vec::new();
+    let (cw, ch) = (atlas.cell_width, atlas.cell_height);
+    let area = layout.area;
+    let title_h = (ch * 2.0).round();
+
+    push_rect_alpha(&mut instances, atlas, [area.x, area.y, area.w, area.h], PREVIEW_BACKDROP, PREVIEW_BACKDROP_ALPHA);
+    push_rect(&mut instances, atlas, [area.x, area.y, area.w, title_h], PREVIEW_TITLE_BG, 0.0);
+    push_rect(&mut instances, atlas, [area.x, area.y + title_h - 1.0, area.w, 1.0], CHROME_STATUS_EDGE, 0.0);
+
+    let title_y = area.y + (title_h - ch) / 2.0;
+    let total_cols = ((area.w / cw).floor() as usize).saturating_sub(2);
+    // The dismissal hint is pinned right; the name gets whatever's left,
+    // so a long file name can't push it off the edge.
+    const HINT: &str = "esc to close";
+    let hint_cols = HINT.len() + 2;
+    let head = if subtitle.is_empty() { title.to_string() } else { format!("{title}   {subtitle}") };
+    push_text(&mut instances, atlas, &truncate(&head, total_cols.saturating_sub(hint_cols)), area.x + cw, title_y, CHROME_FG_ACTIVE);
+    let hint_x = area.x + area.w - cw * (HINT.len() as f32 + 1.0);
+    push_text(&mut instances, atlas, HINT, hint_x, title_y, CHROME_FG_DIM);
+
+    match body {
+        // The image itself is a texture, drawn by the image pipeline
+        // after these instances so it lands on top of the backdrop.
+        PreviewBody::Image => {}
+        PreviewBody::Loading => push_centered(&mut instances, atlas, &layout.content, "Loading...", CHROME_FG_INACTIVE),
+        PreviewBody::Failed(message) => push_centered(&mut instances, atlas, &layout.content, message, PREVIEW_ERROR_FG),
+        PreviewBody::Text { lines, scroll } => {
+            let visible = preview_visible_lines(layout, ch);
+            let cols = ((layout.content.w / cw).floor() as usize).max(1);
+            for (i, line) in lines.iter().skip(*scroll).take(visible).enumerate() {
+                let y = layout.content.y + i as f32 * ch;
+                push_text(&mut instances, atlas, &truncate(line, cols), layout.content.x, y, CHROME_FG_ACTIVE);
+            }
+            if lines.len() > visible {
+                let track_h = layout.content.h;
+                let thumb_h = (track_h * visible as f32 / lines.len() as f32).max(12.0);
+                let max_scroll = (lines.len() - visible) as f32;
+                let progress = if max_scroll > 0.0 { *scroll as f32 / max_scroll } else { 0.0 };
+                let thumb_y = layout.content.y + progress * (track_h - thumb_h);
+                push_rect(&mut instances, atlas, [area.x + area.w - 5.0, thumb_y, 4.0, thumb_h], TREE_SCROLL_THUMB, 0.0);
+            }
+        }
+    }
+
+    instances
+}
+
+fn push_centered(instances: &mut Vec<Instance>, atlas: &FontAtlas, area: &PaneRect, text: &str, color: (u8, u8, u8)) {
+    let width = atlas.cell_width * text.chars().count() as f32;
+    let x = area.x + (area.w - width) / 2.0;
+    let y = area.y + (area.h - atlas.cell_height) / 2.0;
+    push_text(instances, atlas, text, x.max(area.x), y, color);
+}
+
 fn rgb_to_color((r, g, b): (u8, u8, u8)) -> [f32; 4] {
     [r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0, 1.0]
+}
+
+/// `push_rect` for the one place that needs a translucent fill.
+fn push_rect_alpha(instances: &mut Vec<Instance>, atlas: &FontAtlas, rect: [f32; 4], color: (u8, u8, u8), alpha: f32) {
+    let [x, y, w, h] = rect;
+    let [r, g, b, _] = rgb_to_color(color);
+    instances.push(Instance {
+        pos: [x, y],
+        size: [w, h],
+        uv_min: atlas.white_uv,
+        uv_max: atlas.white_uv,
+        color: [r, g, b, alpha],
+        top_corner_radius: 0.0,
+    });
 }
 
 /// `rect` is `[x, y, w, h]` in window pixels.

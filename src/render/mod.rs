@@ -1,5 +1,6 @@
 pub mod chrome;
 mod font;
+mod image_pipeline;
 mod pipeline;
 
 use crate::config::FontConfig;
@@ -45,6 +46,19 @@ pub struct FileTreeView<'a> {
     pub selected: Option<usize>,
 }
 
+/// Everything the preview overlay needs for one frame. `Some` means the
+/// overlay is open.
+pub struct PreviewView<'a> {
+    /// The previewed file's name.
+    pub title: &'a str,
+    /// A short note beside it -- dimensions, line count.
+    pub subtitle: &'a str,
+    pub body: chrome::PreviewBody<'a>,
+    /// The decoded image's pixel dimensions, for fitting it to the
+    /// content area. Only meaningful when `body` is `Image`.
+    pub image_size: Option<(u32, u32)>,
+}
+
 /// What happened when `Renderer::render` was asked to draw a frame.
 ///
 /// This exists because silently skipping a failed frame caused the
@@ -71,6 +85,7 @@ pub struct Renderer {
     queue: wgpu::Queue,
     config: wgpu::SurfaceConfiguration,
     pipeline: CellPipeline,
+    image_pipeline: image_pipeline::ImagePipeline,
     atlas: FontAtlas,
     palette: Palette,
     /// Window background opacity (0..1). Only background fills respect
@@ -136,16 +151,30 @@ impl Renderer {
         let (atlas, pipeline) = build_atlas_and_pipeline(&device, &queue, config.format, px_size, font.family.as_deref());
         pipeline.set_screen_size(&queue, config.width as f32, config.height as f32);
 
+        let image_pipeline = image_pipeline::ImagePipeline::new(&device, config.format);
+
         Renderer {
             surface,
             device,
             queue,
             config,
             pipeline,
+            image_pipeline,
             atlas,
             palette,
             opacity,
         }
+    }
+
+    /// Hand the preview overlay a decoded image to draw from now on.
+    pub fn set_preview_image(&mut self, pixels: &[u8], width: u32, height: u32) {
+        self.image_pipeline.set_image(&self.device, &self.queue, pixels, width, height);
+    }
+
+    /// Drop the preview texture (it can be tens of megabytes) when the
+    /// overlay closes or moves to a non-image file.
+    pub fn clear_preview_image(&mut self) {
+        self.image_pipeline.clear();
     }
 
     pub fn cell_size(&self) -> (f32, f32) {
@@ -195,7 +224,15 @@ impl Renderer {
     /// and highlight; `status` is pre-resolved shell/cwd/git/tty info --
     /// process/filesystem lookups have no business happening in the
     /// renderer.
-    pub fn render(&mut self, tabs: &[Tab], active: usize, status: &chrome::StatusInfo, cmd_held: bool, file_tree: Option<FileTreeView>) -> RenderOutcome {
+    pub fn render(
+        &mut self,
+        tabs: &[Tab],
+        active: usize,
+        status: &chrome::StatusInfo,
+        cmd_held: bool,
+        file_tree: Option<FileTreeView>,
+        preview: Option<PreviewView>,
+    ) -> RenderOutcome {
         let surface_texture = match self.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(t) => t,
             wgpu::CurrentSurfaceTexture::Suboptimal(t) => {
@@ -264,6 +301,19 @@ impl Renderer {
             }
         }
 
+        // The preview covers the panes (never the sidebar), so it goes on
+        // after them and before the bars, which always stay on top.
+        let mut preview_image_rect = None;
+        if let Some(view) = &preview {
+            let layout = chrome::preview_layout(grid_rect, self.atlas.cell_height);
+            instances.extend(chrome::build_preview_instances(&self.atlas, &layout, view.title, view.subtitle, &view.body));
+            if let chrome::PreviewBody::Image = view.body {
+                if let Some((w, h)) = view.image_size {
+                    preview_image_rect = Some(chrome::preview_image_rect(layout.content, w, h));
+                }
+            }
+        }
+
         let titles: Vec<String> = tabs.iter().map(|t| t.title().to_string()).collect();
         let tab_layout = chrome::tab_bar_layout(&titles, window_width, self.atlas.cell_width);
         instances.extend(chrome::build_tab_bar_instances(&self.atlas, &tab_layout, active, window_width, tab_bar_h));
@@ -297,6 +347,13 @@ impl Renderer {
                 ..Default::default()
             });
             self.pipeline.draw(&mut pass, instance_count);
+            // Last, so the decoded image lands on top of the overlay's
+            // backdrop. Its rect is inside the pane area, so it can't
+            // reach the bars that were drawn above.
+            if let Some(rect) = preview_image_rect {
+                self.image_pipeline.set_rect(&self.queue, (window_width, window_height), rect, 1.0);
+                self.image_pipeline.draw(&mut pass);
+            }
         }
 
         self.queue.submit(std::iter::once(encoder.finish()));

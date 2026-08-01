@@ -3,6 +3,7 @@ mod filetree;
 mod input;
 mod linkify;
 mod menu;
+mod preview;
 mod pty;
 mod render;
 mod settings_ui;
@@ -68,6 +69,13 @@ enum UserEvent {
     ZoomReset,
     ToggleFileTree,
     ToggleHiddenFiles,
+    /// Preview the file selected in the tree (Cmd+Y, like Finder's
+    /// Quick Look).
+    PreviewSelected,
+    /// A worker thread finished loading a preview, tagged with the path
+    /// it was asked for so a result the user has already moved on from
+    /// can be dropped.
+    PreviewLoaded(std::path::PathBuf, Result<preview::Content, String>),
 }
 
 struct App {
@@ -173,6 +181,9 @@ struct App {
     /// appearing above it would otherwise shift the highlight onto a
     /// different entry).
     file_tree_selected: Option<std::path::PathBuf>,
+    /// The open preview overlay, if any. Only one at a time -- it's a
+    /// look-at-this layer, not a second workspace.
+    preview: Option<preview::Preview>,
 }
 
 impl App {
@@ -207,6 +218,7 @@ impl App {
             dragging_sidebar: false,
             file_tree_hover: None,
             file_tree_selected: None,
+            preview: None,
         }
     }
 
@@ -888,6 +900,8 @@ impl App {
                 self.insert_path_at_prompt(&path);
             } else if is_dir {
                 self.file_tree.toggle(&path);
+            } else if self.modifiers.shift_key() {
+                self.open_preview(path);
             } else {
                 open_with_default_app(&path);
             }
@@ -895,6 +909,69 @@ impl App {
         if let Some(window) = &self.window {
             window.request_redraw();
         }
+    }
+
+    /// Open the preview overlay on `path` and start loading it on a
+    /// worker thread -- decoding a large image, and especially asking
+    /// QuickLook to render a PDF, takes long enough that doing it here
+    /// would visibly freeze the window. The overlay shows "Loading..."
+    /// until `PreviewLoaded` comes back.
+    fn open_preview(&mut self, path: std::path::PathBuf) {
+        if let Some(renderer) = &mut self.renderer {
+            // Drop the previous file's texture now rather than leaving it
+            // on screen underneath the new file's title.
+            renderer.clear_preview_image();
+        }
+        self.preview = Some(preview::Preview::loading(path.clone()));
+        let proxy = self.proxy.clone();
+        std::thread::spawn(move || {
+            let result = preview::load(&path);
+            let _ = proxy.send_event(UserEvent::PreviewLoaded(path, result));
+        });
+        if let Some(window) = &self.window {
+            window.request_redraw();
+        }
+    }
+
+    fn close_preview(&mut self) {
+        if self.preview.take().is_none() {
+            return;
+        }
+        if let Some(renderer) = &mut self.renderer {
+            renderer.clear_preview_image();
+        }
+        if let Some(window) = &self.window {
+            window.request_redraw();
+        }
+    }
+
+    /// Scroll a text preview. Returns whether the overlay consumed the
+    /// wheel event -- while it's open it owns scrolling over the panes,
+    /// so the terminal underneath doesn't scroll behind it.
+    fn scroll_preview(&mut self, lines: f32) -> bool {
+        if self.preview.is_none() {
+            return false;
+        }
+        // The sidebar keeps its own scrolling even with the overlay up,
+        // so files stay browsable while previewing.
+        if self.file_tree_rect().is_some_and(|r| r.contains(self.cursor_pos.0, self.cursor_pos.1)) {
+            return false;
+        }
+        let n = (lines.abs().ceil() as usize).min(30);
+        if let Some(preview) = &mut self.preview {
+            if let preview::State::Ready(preview::Content::Text(text)) = &preview.state {
+                let max = text.len().saturating_sub(1);
+                preview.scroll = if lines > 0.0 {
+                    preview.scroll.saturating_sub(n)
+                } else {
+                    (preview.scroll + n).min(max)
+                };
+            }
+        }
+        if let Some(window) = &self.window {
+            window.request_redraw();
+        }
+        true
     }
 
     /// Whether a window position is on the sidebar's draggable inner
@@ -1296,6 +1373,36 @@ impl ApplicationHandler<UserEvent> for App {
             }
             UserEvent::SplitRight => self.split_focused_pane(tab::SplitDirection::Vertical),
             UserEvent::SplitDown => self.split_focused_pane(tab::SplitDirection::Horizontal),
+            UserEvent::PreviewSelected => {
+                // Cmd+Y toggles, like tapping space in Finder: pressing
+                // it again on the same file closes what it just opened.
+                match (&self.preview, self.file_tree_selected.clone()) {
+                    (Some(open), Some(path)) if open.path == path => self.close_preview(),
+                    (_, Some(path)) => self.open_preview(path),
+                    (_, None) => {}
+                }
+            }
+            UserEvent::PreviewLoaded(path, result) => {
+                // Ignore a result for a file the overlay has already
+                // moved off (or closed) while it was loading.
+                let Some(preview) = &mut self.preview else { return };
+                if preview.path != path {
+                    return;
+                }
+                preview.scroll = 0;
+                preview.state = match result {
+                    Ok(content) => {
+                        if let (preview::Content::Image { pixels, width, height }, Some(renderer)) = (&content, &mut self.renderer) {
+                            renderer.set_preview_image(pixels, *width, *height);
+                        }
+                        preview::State::Ready(content)
+                    }
+                    Err(message) => preview::State::Failed(message),
+                };
+                if let Some(window) = &self.window {
+                    window.request_redraw();
+                }
+            }
             UserEvent::ToggleFileTree => self.toggle_file_tree(),
             UserEvent::ToggleHiddenFiles => {
                 self.file_tree.toggle_hidden();
@@ -1369,6 +1476,17 @@ impl ApplicationHandler<UserEvent> for App {
             WindowEvent::KeyboardInput { event, is_synthetic, .. } => {
                 if is_synthetic || !event.state.is_pressed() {
                     return;
+                }
+                // While the preview overlay is up, Escape closes it
+                // rather than reaching the shell -- the one key every
+                // modal on this platform answers to. Everything else
+                // still goes through to the pty, so a command can keep
+                // running behind it.
+                if self.preview.is_some() {
+                    if let winit::keyboard::Key::Named(winit::keyboard::NamedKey::Escape) = &event.logical_key {
+                        self.close_preview();
+                        return;
+                    }
                 }
                 // Cmd+F always opens/keeps-open the search bar, checked
                 // before anything else so it works the same whether or
@@ -1459,7 +1577,7 @@ impl ApplicationHandler<UserEvent> for App {
                 if lines == 0.0 {
                     return;
                 }
-                if self.scroll_file_tree(lines) {
+                if self.scroll_file_tree(lines) || self.scroll_preview(lines) {
                     return;
                 }
                 let n = (lines.abs().ceil() as usize).min(30);
@@ -1633,10 +1751,29 @@ impl ApplicationHandler<UserEvent> for App {
                     hover: self.file_tree_hover,
                     selected,
                 });
+                let preview_title = self.preview.as_ref().map(|p| preview::title_for(&p.path)).unwrap_or_default();
+                let preview_subtitle = match self.preview.as_ref().map(|p| &p.state) {
+                    Some(preview::State::Ready(content)) => content.describe(),
+                    _ => String::new(),
+                };
+                let preview_view = self.preview.as_ref().map(|p| render::PreviewView {
+                    title: &preview_title,
+                    subtitle: &preview_subtitle,
+                    body: match &p.state {
+                        preview::State::Loading => chrome::PreviewBody::Loading,
+                        preview::State::Failed(message) => chrome::PreviewBody::Failed(message),
+                        preview::State::Ready(preview::Content::Text(lines)) => chrome::PreviewBody::Text { lines, scroll: p.scroll },
+                        preview::State::Ready(preview::Content::Image { .. }) => chrome::PreviewBody::Image,
+                    },
+                    image_size: match &p.state {
+                        preview::State::Ready(preview::Content::Image { width, height, .. }) => Some((*width, *height)),
+                        _ => None,
+                    },
+                });
                 let outcome = self
                     .renderer
                     .as_mut()
-                    .map(|renderer| renderer.render(&self.tabs, self.active, &self.cached_status, cmd_held, file_tree_view));
+                    .map(|renderer| renderer.render(&self.tabs, self.active, &self.cached_status, cmd_held, file_tree_view, preview_view));
                 match outcome {
                     Some(render::RenderOutcome::Presented) => self.presented_once = true,
                     Some(render::RenderOutcome::Retry) => {
