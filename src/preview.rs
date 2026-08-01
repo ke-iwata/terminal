@@ -145,20 +145,13 @@ fn read_as_text(path: &Path, len: u64) -> Option<Vec<String>> {
                 // Tabs would collapse to a single column in a monospace
                 // layout that has no tab stops of its own.
                 let expanded = line.replace('\t', "    ");
-                display_text(&expanded)
+                // Long lines are truncated rather than wrapped: a
+                // minified bundle on one 2MB line shouldn't turn into
+                // thousands of preview rows.
+                expanded.chars().take(MAX_TEXT_LINE_CHARS).collect()
             })
             .collect(),
     )
-}
-
-/// Replace characters the glyph atlas can't draw (printable ASCII only)
-/// with `?`, so non-ASCII text shows as visibly-unrenderable rather than
-/// as invisible gaps. Same trade-off as the file tree's names.
-fn display_text(line: &str) -> String {
-    line.chars()
-        .take(MAX_TEXT_LINE_CHARS)
-        .map(|c| if c.is_ascii_graphic() || c == ' ' { c } else { '?' })
-        .collect()
 }
 
 /// Render `path` through QuickLook and return the resulting PNG bytes.
@@ -232,7 +225,7 @@ fn wait_with_timeout(child: &mut std::process::Child, timeout: std::time::Durati
 /// is about one file at a time.
 pub fn title_for(path: &Path) -> String {
     path.file_name()
-        .map(|n| display_text(&n.to_string_lossy()))
+        .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(|| path.display().to_string())
 }
 
@@ -324,13 +317,13 @@ mod tests {
     }
 
     #[test]
-    fn non_ascii_text_becomes_visible_placeholders() {
-        // Until the atlas covers more than ASCII, a line that would draw
-        // as nothing is worse than one that draws as '?'.
+    fn non_ascii_text_is_kept_verbatim() {
+        // The atlas rasterizes any script on demand now, so Japanese text
+        // is previewed as itself rather than substituted.
         let t = TempDir::new("utf8");
         let path = t.write("jp.txt", "hello 世界\n".as_bytes());
         match load(&path).unwrap() {
-            Loaded::Text(lines) => assert_eq!(lines, vec!["hello ??"]),
+            Loaded::Text(lines) => assert_eq!(lines, vec!["hello 世界"]),
             _ => panic!("expected text"),
         }
     }

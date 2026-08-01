@@ -20,8 +20,6 @@ const MAX_ROWS: usize = 5000;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Row {
     pub path: PathBuf,
-    /// Display name -- see `display_name` for why it isn't just the
-    /// file name verbatim.
     pub name: String,
     /// Nesting level below the root (root's own children are 0).
     pub depth: usize,
@@ -142,7 +140,7 @@ impl FileTree {
             }
             let expanded = is_dir && self.expanded.contains(&path);
             self.rows.push(Row {
-                name: display_name(&name),
+                name,
                 path: path.clone(),
                 depth,
                 is_dir,
@@ -153,17 +151,6 @@ impl FileTree {
             }
         }
     }
-}
-
-/// Replace characters the glyph atlas can't draw (it rasterizes printable
-/// ASCII only) with `?`. Without this a file named entirely in Japanese
-/// would render as a blank row that's still clickable -- a visible `?`
-/// run is a worse-looking but honest stand-in until the atlas grows
-/// beyond ASCII.
-fn display_name(name: &str) -> String {
-    name.chars()
-        .map(|c| if c.is_ascii_graphic() || c == ' ' { c } else { '?' })
-        .collect()
 }
 
 /// Quote `path` so a shell receives it as a single literal argument --
@@ -292,11 +279,14 @@ mod tests {
     }
 
     #[test]
-    fn non_ascii_names_become_visible_placeholders() {
-        // Until the atlas covers more than ASCII, a name that would draw
-        // as nothing at all is worse than one that draws as '?'.
-        assert_eq!(display_name("日本語.txt"), "???.txt");
-        assert_eq!(display_name("plain.txt"), "plain.txt");
+    fn non_ascii_names_are_kept_verbatim() {
+        // The atlas rasterizes any script on demand now, so a Japanese
+        // file name is shown as itself rather than substituted.
+        let t = TempTree::new("utf8");
+        t.file("日本語.txt");
+        let mut tree = FileTree::new();
+        tree.set_root(&t.0);
+        assert_eq!(tree.rows()[0].name, "日本語.txt");
     }
 
     #[test]

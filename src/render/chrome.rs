@@ -11,6 +11,19 @@
 use super::font::FontAtlas;
 use super::pipeline::Instance;
 use crate::tab::{PaneRect, Search};
+use unicode_width::UnicodeWidthChar;
+
+/// How many monospace columns `text` occupies. Not its character count:
+/// CJK and other East Asian characters are drawn two columns wide, and
+/// treating them as one makes every width calculation here -- pen
+/// advance, truncation, centering -- lay text on top of itself.
+fn text_cols(text: &str) -> usize {
+    text.chars().map(char_cols).sum()
+}
+
+fn char_cols(c: char) -> usize {
+    c.width().unwrap_or(0)
+}
 
 // Fixed chrome colors, deliberately NOT derived from the terminal palette:
 // deriving them from the configured background made the active tab blend
@@ -242,7 +255,7 @@ pub fn build_file_tree_instances(atlas: &FontAtlas, rect: PaneRect, view: &super
     push_rect(&mut instances, atlas, [rect.x, rect.y, rect.w, rect.h], TREE_BG, 0.0);
     push_rect(&mut instances, atlas, [rect.x, rect.y, 1.0, rect.h], CHROME_STATUS_EDGE, 0.0);
 
-    let text_cols = ((rect.w / cw).floor() as usize).saturating_sub(2);
+    let avail_cols = ((rect.w / cw).floor() as usize).saturating_sub(2);
     let pad_x = rect.x + cw * 0.75;
 
     // Section title: the rooted folder's own name, uppercased, the way
@@ -253,7 +266,7 @@ pub fn build_file_tree_instances(atlas: &FontAtlas, rect: PaneRect, view: &super
     push_text(
         &mut instances,
         atlas,
-        &truncate(&view.title.to_uppercase(), text_cols.saturating_sub(2)),
+        &truncate(&view.title.to_uppercase(), avail_cols.saturating_sub(2)),
         pad_x + cw * 1.5,
         title_y,
         TREE_FG,
@@ -263,7 +276,7 @@ pub fn build_file_tree_instances(atlas: &FontAtlas, rect: PaneRect, view: &super
         // Only worth saying when it's on -- hidden entries showing with
         // no explanation is the confusing state, not the default.
         let note = " (hidden shown)";
-        let note_x = rect.x + rect.w - cw * (note.chars().count() as f32 + 0.5);
+        let note_x = rect.x + rect.w - cw * (text_cols(note) as f32 + 0.5);
         push_text(&mut instances, atlas, note, note_x.max(pad_x), title_y, TREE_FG_DIM);
     }
 
@@ -310,7 +323,7 @@ pub fn build_file_tree_instances(atlas: &FontAtlas, rect: PaneRect, view: &super
 
         let name_x = icon_x + icon_size + cw * 0.4;
         let used_cols = ((name_x - rect.x) / cw).ceil() as usize;
-        let name_cols = text_cols.saturating_sub(used_cols);
+        let name_cols = avail_cols.saturating_sub(used_cols);
         let color = if row.is_dir { TREE_FG } else { TREE_FG_FILE };
         push_text(&mut instances, atlas, &truncate(&row.name, name_cols), name_x, y + text_dy, color);
     }
@@ -436,17 +449,29 @@ pub fn tab_bar_layout(titles: &[String], strip: PaneRect, cell_w: f32) -> TabBar
     }
 }
 
-fn truncate(text: &str, max_chars: usize) -> String {
-    let chars: Vec<char> = text.chars().collect();
-    if chars.len() <= max_chars {
+/// Shorten `text` to fit `max_cols` display columns, with an ellipsis
+/// when something was cut. Budgets in columns rather than characters so
+/// a line of Japanese doesn't overflow twice its allowance.
+fn truncate(text: &str, max_cols: usize) -> String {
+    if text_cols(text) <= max_cols {
         return text.to_string();
     }
-    if max_chars <= 3 {
-        return chars.into_iter().take(max_chars).collect();
+    // Reserve room for the "..." unless there isn't even that much.
+    let budget = if max_cols > 3 { max_cols - 3 } else { max_cols };
+    let mut out = String::new();
+    let mut used = 0;
+    for c in text.chars() {
+        let w = char_cols(c);
+        if used + w > budget {
+            break;
+        }
+        out.push(c);
+        used += w;
     }
-    let mut s: String = chars.into_iter().take(max_chars - 3).collect();
-    s.push_str("...");
-    s
+    if max_cols > 3 {
+        out.push_str("...");
+    }
+    out
 }
 
 /// What the status bar shows, pre-resolved by `App::refresh_status` --
@@ -541,11 +566,11 @@ pub fn build_status_bar_instances(atlas: &FontAtlas, status: &StatusInfo, window
         }
         let remaining = max_chars.saturating_sub(used);
         let shown = truncate(text, remaining);
-        let shown_len = shown.chars().count();
+        let shown_len = text_cols(&shown);
         push_text(&mut instances, atlas, &shown, x, text_y, *color);
         x += atlas.cell_width * shown_len as f32;
         used += shown_len;
-        if shown_len < text.chars().count() {
+        if shown_len < text_cols(text) {
             break; // out of room; nothing after this would fit anyway
         }
     }
@@ -567,8 +592,8 @@ pub fn build_search_bar_instances(atlas: &FontAtlas, search: &Search, area: Pane
     };
     // Reserve room for a reasonably long query so the bar doesn't visibly
     // resize on every keystroke; it still grows past this if needed.
-    let query_cols = search.query.chars().count().max(16);
-    let content_cols = LABEL.len() + query_cols + 1 + 3 + count_text.chars().count();
+    let query_cols = text_cols(&search.query).max(16);
+    let content_cols = LABEL.len() + query_cols + 1 + 3 + text_cols(&count_text);
 
     let bar_w = content_cols as f32 * atlas.cell_width;
     let bar_h = atlas.cell_height * 1.6;
@@ -584,14 +609,14 @@ pub fn build_search_bar_instances(atlas: &FontAtlas, search: &Search, area: Pane
     x += atlas.cell_width * LABEL.len() as f32;
 
     push_text(&mut instances, atlas, &search.query, x, text_y, CHROME_FG_ACTIVE);
-    x += atlas.cell_width * search.query.chars().count() as f32;
+    x += atlas.cell_width * text_cols(&search.query) as f32;
     // A plain caret, not a blinking one -- there's no per-frame ticking
     // clock driving redraws (this app only redraws on real events), so an
     // animated blink would freeze mid-phase as often as not.
     push_text(&mut instances, atlas, "|", x, text_y, CHROME_FG_ACTIVE);
 
     if !count_text.is_empty() {
-        let count_x = x0 + bar_w - atlas.cell_width * (count_text.chars().count() + 1) as f32;
+        let count_x = x0 + bar_w - atlas.cell_width * (text_cols(&count_text) + 1) as f32;
         let count_color = if search.match_count() == 0 { CHROME_SEARCH_NO_MATCH } else { CHROME_FG_INACTIVE };
         push_text(&mut instances, atlas, &count_text, count_x, text_y, count_color);
     }
@@ -717,7 +742,7 @@ pub fn build_preview_instances(atlas: &FontAtlas, layout: &PreviewLayout, subtit
 }
 
 fn push_centered(instances: &mut Vec<Instance>, atlas: &FontAtlas, area: &PaneRect, text: &str, color: (u8, u8, u8)) {
-    let width = atlas.cell_width * text.chars().count() as f32;
+    let width = atlas.cell_width * text_cols(text) as f32;
     let x = area.x + (area.w - width) / 2.0;
     let y = area.y + (area.h - atlas.cell_height) / 2.0;
     push_text(instances, atlas, text, x.max(area.x), y, color);
@@ -774,7 +799,9 @@ fn push_text(instances: &mut Vec<Instance>, atlas: &FontAtlas, text: &str, start
                 }
             }
         }
-        x += atlas.cell_width;
+        // Wide characters occupy two cells; advancing by one would draw
+        // the next glyph on top of this one.
+        x += atlas.cell_width * char_cols(ch).max(1) as f32;
     }
 }
 
@@ -877,5 +904,45 @@ mod tests {
         assert!(matches!(layout.hit_test(layout.new_tab_x0 + 1.0), Some(TabBarHit::NewTab)));
         // Left of the strip entirely: not this group's business.
         assert!(layout.hit_test(strip.x - 50.0).is_none());
+    }
+
+    #[test]
+    fn width_is_measured_in_columns_not_characters() {
+        // The bug this guards: wide characters were advanced and budgeted
+        // as one column each, so Japanese text drew on top of itself and
+        // overflowed whatever it was supposed to fit inside.
+        assert_eq!(text_cols("abc"), 3);
+        assert_eq!(text_cols("日本語"), 6, "each is two columns wide");
+        assert_eq!(text_cols("mixed 混在"), 10);
+    }
+
+    #[test]
+    fn truncation_budgets_columns_and_marks_what_it_cut() {
+        assert_eq!(truncate("short", 10), "short");
+        // Six columns of text in a six-column budget: untouched.
+        assert_eq!(truncate("日本語", 6), "日本語");
+        // One column short, so it has to cut -- and the "..." has to fit
+        // in the budget too.
+        let cut = truncate("日本語テスト", 8);
+        assert!(text_cols(&cut) <= 8, "{cut:?} overflows its budget");
+        assert!(cut.ends_with("..."));
+        // A budget too small even for the ellipsis still never overflows.
+        assert!(text_cols(&truncate("日本語", 3)) <= 3);
+        assert!(text_cols(&truncate("日本語", 1)) <= 1);
+    }
+
+    #[test]
+    fn a_wide_tab_title_stays_inside_its_tab() {
+        let titles = vec!["読み書き.txt".to_string(), "bash".to_string()];
+        let strip = PaneRect { x: 0.0, y: 0.0, w: 600.0, h: tab_bar_height(CELL_H) };
+        let layout = tab_bar_layout(&titles, strip, CELL_W);
+        for tab in &layout.tabs {
+            let label_width = text_cols(&tab.label) as f32 * CELL_W;
+            assert!(
+                label_width <= tab.close_x0 - tab.x0,
+                "{:?} ({label_width}px) spills past its close button",
+                tab.label
+            );
+        }
     }
 }

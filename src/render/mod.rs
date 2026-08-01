@@ -14,6 +14,10 @@ use pipeline::{CellPipeline, Instance};
 use std::sync::Arc;
 use winit::window::Window;
 
+/// A cell's resolved foreground and background, after the palette and
+/// any reverse-video flag have been applied.
+type CellColors = ((u8, u8, u8), (u8, u8, u8));
+
 /// Per-tab overlay state that affects how the grid is drawn, bundled into
 /// one struct purely to keep `render`/`build_instances_from_grid`'s
 /// argument lists from growing without bound as more of these are added.
@@ -86,6 +90,7 @@ pub struct Renderer {
     pipeline: CellPipeline,
     image_pipeline: image_pipeline::ImagePipeline,
     atlas: FontAtlas,
+    atlas_texture: wgpu::Texture,
     palette: Palette,
     /// Window background opacity (0..1). Only background fills respect
     /// this -- glyphs and the cursor are always drawn fully opaque.
@@ -147,7 +152,7 @@ impl Renderer {
         // Rasterize at physical pixels (point size * scale factor) so text
         // stays crisp on Retina displays instead of being upscaled/blurry.
         let px_size = font.size.max(1.0) * scale_factor as f32;
-        let (atlas, pipeline) = build_atlas_and_pipeline(&device, &queue, config.format, px_size, font.family.as_deref());
+        let (atlas, atlas_texture, pipeline) = build_atlas_and_pipeline(&device, config.format, px_size, font.family.as_deref());
         pipeline.set_screen_size(&queue, config.width as f32, config.height as f32);
 
         let image_pipeline = image_pipeline::ImagePipeline::new(&device, config.format);
@@ -160,8 +165,34 @@ impl Renderer {
             pipeline,
             image_pipeline,
             atlas,
+            atlas_texture,
             palette,
             opacity,
+        }
+    }
+
+    /// Copy every glyph rasterized while building this frame's instances
+    /// into the atlas texture. Must run after the instances are built
+    /// (that's what discovers which characters are needed) and before the
+    /// draw, or a character seen for the first time renders blank for a
+    /// frame.
+    fn flush_atlas_uploads(&self) {
+        for upload in self.atlas.take_pending_uploads() {
+            self.queue.write_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture: &self.atlas_texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d { x: upload.x, y: upload.y, z: 0 },
+                    aspect: wgpu::TextureAspect::All,
+                },
+                &upload.coverage,
+                wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(upload.width),
+                    rows_per_image: Some(upload.height),
+                },
+                wgpu::Extent3d { width: upload.width, height: upload.height, depth_or_array_layers: 1 },
+            );
         }
     }
 
@@ -196,15 +227,15 @@ impl Renderer {
     /// `cell_size()` afterward and resizing the pty/Term to match.
     pub fn set_font(&mut self, font: &FontConfig, scale_factor: f64) {
         let px_size = font.size.max(1.0) * scale_factor as f32;
-        let (atlas, pipeline) = build_atlas_and_pipeline(
+        let (atlas, atlas_texture, pipeline) = build_atlas_and_pipeline(
             &self.device,
-            &self.queue,
             self.config.format,
             px_size,
             font.family.as_deref(),
         );
         pipeline.set_screen_size(&self.queue, self.config.width as f32, self.config.height as f32);
         self.atlas = atlas;
+        self.atlas_texture = atlas_texture;
         self.pipeline = pipeline;
     }
 
@@ -340,6 +371,11 @@ impl Renderer {
 
         instances.extend(chrome::build_status_bar_instances(&self.atlas, status, window_width, window_height, status_bar_h));
 
+        // Building the instances above is what asked the atlas for every
+        // character on screen; anything new has to reach the texture
+        // before the draw below reads from it.
+        self.flush_atlas_uploads();
+
         let instance_count = self
             .pipeline
             .upload_instances(&self.device, &self.queue, &instances);
@@ -398,54 +434,75 @@ impl Renderer {
             } else {
                 Vec::new()
             };
-            for (col, cell) in line.iter().enumerate() {
-                let reverse = cell.flags.contains(CellFlags::REVERSE);
-                let (fg_default, bg_default) = if reverse {
-                    (self.palette.background, self.palette.foreground)
-                } else {
-                    (self.palette.foreground, self.palette.background)
-                };
-                let (fg, bg) = if reverse {
-                    (
-                        cell.bg.to_rgb(fg_default, &self.palette),
-                        cell.fg.to_rgb(bg_default, &self.palette),
-                    )
-                } else {
-                    (
-                        cell.fg.to_rgb(fg_default, &self.palette),
-                        cell.bg.to_rgb(bg_default, &self.palette),
-                    )
-                };
+            // Three passes over the row rather than one, because a
+            // wide (CJK) glyph spills into the cell after it: drawing
+            // background-then-glyph per cell meant the *next* cell's
+            // background painted over the right half of the glyph before
+            // it. Backgrounds first, then glyphs on top of all of them,
+            // then the translucent tints on top of everything.
+            let colors: Vec<CellColors> = line
+                .iter()
+                .map(|cell| {
+                    let reverse = cell.flags.contains(CellFlags::REVERSE);
+                    let (fg_default, bg_default) = if reverse {
+                        (self.palette.background, self.palette.foreground)
+                    } else {
+                        (self.palette.foreground, self.palette.background)
+                    };
+                    if reverse {
+                        (
+                            cell.bg.to_rgb(fg_default, &self.palette),
+                            cell.fg.to_rgb(bg_default, &self.palette),
+                        )
+                    } else {
+                        (
+                            cell.fg.to_rgb(fg_default, &self.palette),
+                            cell.bg.to_rgb(bg_default, &self.palette),
+                        )
+                    }
+                })
+                .collect();
 
-                let cell_x = rect.x + col as f32 * cw;
-                let cell_y = rect.y + row as f32 * ch;
-
+            let cell_y = rect.y + row as f32 * ch;
+            for (col, (_, bg)) in colors.iter().enumerate() {
                 instances.push(Instance {
-                    pos: [cell_x, cell_y],
+                    pos: [rect.x + col as f32 * cw, cell_y],
                     size: [cw, ch],
                     uv_min: self.atlas.white_uv,
                     uv_max: self.atlas.white_uv,
-                    color: rgba_to_color(bg, self.opacity),
+                    color: rgba_to_color(*bg, self.opacity),
                     top_corner_radius: 0.0,
                 });
+            }
 
-                if cell.c != ' ' {
-                    if let Some(glyph) = self.atlas.glyph(cell.c) {
-                        if glyph.width > 0.0 && glyph.height > 0.0 {
-                            let gx = cell_x + glyph.xmin;
-                            let gy = cell_y + self.atlas.baseline - glyph.ymin - glyph.height;
-                            instances.push(Instance {
-                                pos: [gx, gy],
-                                size: [glyph.width, glyph.height],
-                                uv_min: glyph.uv_min,
-                                uv_max: glyph.uv_max,
-                                color: rgb_to_color(fg),
-                                top_corner_radius: 0.0,
-                            });
-                        }
-                    }
+            for (col, cell) in line.iter().enumerate() {
+                if cell.c == ' ' {
+                    continue;
                 }
+                // The trailing half of a wide character carries a
+                // placeholder space, and drawing it would just be a
+                // second blank quad over the glyph beside it.
+                if cell.flags.contains(CellFlags::WIDE_SPACER) {
+                    continue;
+                }
+                let Some(glyph) = self.atlas.glyph(cell.c) else { continue };
+                if glyph.width <= 0.0 || glyph.height <= 0.0 {
+                    continue;
+                }
+                let gx = rect.x + col as f32 * cw + glyph.xmin;
+                let gy = cell_y + self.atlas.baseline - glyph.ymin - glyph.height;
+                instances.push(Instance {
+                    pos: [gx, gy],
+                    size: [glyph.width, glyph.height],
+                    uv_min: glyph.uv_min,
+                    uv_max: glyph.uv_max,
+                    color: rgb_to_color(colors[col].0),
+                    top_corner_radius: 0.0,
+                });
+            }
 
+            for col in 0..line.len() {
+                let cell_x = rect.x + col as f32 * cw;
                 // Tinted on top of the cell's own background/glyph (not
                 // baked into `bg` above) so it reads the same regardless
                 // of the cell's own colors, and at a fixed alpha
@@ -530,12 +587,15 @@ fn rgb_to_color((r, g, b): (u8, u8, u8)) -> [f32; 4] {
 /// initial construction and by `Renderer::set_font`'s live font swap.
 fn build_atlas_and_pipeline(
     device: &wgpu::Device,
-    queue: &wgpu::Queue,
     surface_format: wgpu::TextureFormat,
     px_size: f32,
     family: Option<&str>,
-) -> (FontAtlas, CellPipeline) {
+) -> (FontAtlas, wgpu::Texture, CellPipeline) {
     let atlas = FontAtlas::new(px_size, family);
+    // Allocated empty and filled in as glyphs are rasterized (see
+    // `flush_atlas_uploads`). The texture is bound to the pipeline for
+    // its whole life, so its size can't change -- which is why the atlas
+    // picks a fixed one big enough to never need to.
     let atlas_texture = device.create_texture(&wgpu::TextureDescriptor {
         label: Some("glyph atlas"),
         size: wgpu::Extent3d {
@@ -550,28 +610,9 @@ fn build_atlas_and_pipeline(
         usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
         view_formats: &[],
     });
-    queue.write_texture(
-        wgpu::TexelCopyTextureInfo {
-            texture: &atlas_texture,
-            mip_level: 0,
-            origin: wgpu::Origin3d::ZERO,
-            aspect: wgpu::TextureAspect::All,
-        },
-        &atlas.pixels,
-        wgpu::TexelCopyBufferLayout {
-            offset: 0,
-            bytes_per_row: Some(atlas.width),
-            rows_per_image: Some(atlas.height),
-        },
-        wgpu::Extent3d {
-            width: atlas.width,
-            height: atlas.height,
-            depth_or_array_layers: 1,
-        },
-    );
     let atlas_view = atlas_texture.create_view(&wgpu::TextureViewDescriptor::default());
     let pipeline = CellPipeline::new(device, surface_format, &atlas_view);
-    (atlas, pipeline)
+    (atlas, atlas_texture, pipeline)
 }
 
 fn palette_clear_color(palette: &Palette, opacity: f32) -> wgpu::Color {
