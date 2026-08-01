@@ -70,25 +70,37 @@ pub fn grid_rect(window_width: f32, window_height: f32, cell_h: f32, sidebar_wid
     }
 }
 
-/// Sidebar width in character columns. Wide enough for a couple of
-/// indent levels plus a typical file name.
-const FILE_TREE_COLS: usize = 26;
+/// Default sidebar width in character columns -- wide enough for a
+/// couple of indent levels plus a typical file name. Only the starting
+/// point: the user drags the edge from there.
+const FILE_TREE_DEFAULT_COLS: f32 = 26.0;
+/// Narrowest the sidebar can be dragged before names stop being
+/// readable at all.
+const FILE_TREE_MIN_COLS: f32 = 10.0;
+/// Width of the draggable strip along the sidebar's inner edge. The
+/// visible border is 1px -- far too thin to grab -- so the hit zone is
+/// padded either side, the same trick the pane dividers use.
+pub const FILE_TREE_GRAB: f32 = 4.0;
 
 /// How wide the sidebar is right now -- zero when hidden, which makes it
-/// safe to feed straight into `grid_rect` unconditionally.
-pub fn file_tree_width(visible: bool, cell_w: f32, window_width: f32) -> f32 {
+/// safe to feed straight into `grid_rect` unconditionally. `requested`
+/// is the user's dragged width in pixels; zero or less means "use the
+/// default". The result is always clamped so the sidebar can neither
+/// collapse to nothing nor crowd out the terminal.
+pub fn file_tree_width(visible: bool, requested: f32, cell_w: f32, window_width: f32) -> f32 {
     if !visible {
         return 0.0;
     }
-    // Never take more than half the window: on a narrow window a fixed
-    // 26 columns could leave the terminal itself unusably thin.
-    (FILE_TREE_COLS as f32 * cell_w).min(window_width * 0.5)
+    let target = if requested > 0.0 { requested } else { FILE_TREE_DEFAULT_COLS * cell_w };
+    let min = FILE_TREE_MIN_COLS * cell_w;
+    let max = (window_width * 0.6).max(min);
+    target.clamp(min, max)
 }
 
 /// Where the sidebar sits: the full height between the two bars, flush
 /// against the window's right edge.
-pub fn file_tree_rect(window_width: f32, window_height: f32, cell_w: f32, cell_h: f32, visible: bool) -> Option<PaneRect> {
-    let w = file_tree_width(visible, cell_w, window_width);
+pub fn file_tree_rect(window_width: f32, window_height: f32, cell_w: f32, cell_h: f32, visible: bool, requested_width: f32) -> Option<PaneRect> {
+    let w = file_tree_width(visible, requested_width, cell_w, window_width);
     if w <= 0.0 {
         return None;
     }
@@ -110,6 +122,14 @@ pub fn file_tree_rect(window_width: f32, window_height: f32, cell_w: f32, cell_h
 const TREE_BG: (u8, u8, u8) = (0x25, 0x25, 0x26);
 const TREE_FG: (u8, u8, u8) = (0xcc, 0xcc, 0xcc);
 const TREE_FG_DIM: (u8, u8, u8) = (0x8c, 0x8c, 0x8c);
+/// Files sit a shade below folders in the hierarchy, and their names
+/// read a shade dimmer to match -- paired with the icon shape, that's
+/// two independent cues for which is which.
+const TREE_FG_FILE: (u8, u8, u8) = (0xa8, 0xa8, 0xa8);
+/// Folder icons in the blue every desktop uses for them; file icons in
+/// plain grey so folders are what the eye lands on first.
+const TREE_ICON_DIR: (u8, u8, u8) = (0x7a, 0xa6, 0xd8);
+const TREE_ICON_FILE: (u8, u8, u8) = (0x86, 0x8a, 0x90);
 const TREE_HOVER: (u8, u8, u8) = (0x2a, 0x2d, 0x2e);
 const TREE_SELECTED: (u8, u8, u8) = (0x37, 0x37, 0x3d);
 const TREE_INDENT_GUIDE: (u8, u8, u8) = (0x58, 0x58, 0x58);
@@ -145,6 +165,25 @@ fn push_twisty(instances: &mut Vec<Instance>, atlas: &FontAtlas, x: f32, y: f32,
     }
 }
 
+/// A folder glyph: a filled body with a tab along its top-left, the
+/// universal shorthand. Like the twisty, built from quads so it doesn't
+/// depend on the terminal font carrying a symbol for it.
+fn push_folder_icon(instances: &mut Vec<Instance>, atlas: &FontAtlas, x: f32, y: f32, size: f32, color: (u8, u8, u8)) {
+    let tab_h = (size * 0.2).max(1.0);
+    push_rect(instances, atlas, [x.round(), y.round(), (size * 0.45).round(), tab_h.round()], color, 0.0);
+    push_rect(instances, atlas, [x.round(), (y + tab_h).round(), size.round(), (size * 0.68).round()], color, 0.0);
+}
+
+/// A document glyph: a portrait rectangle with its top-right corner
+/// notched out, drawn by painting the panel color back over it.
+fn push_file_icon(instances: &mut Vec<Instance>, atlas: &FontAtlas, x: f32, y: f32, size: f32, color: (u8, u8, u8)) {
+    let w = (size * 0.72).max(2.0);
+    let x0 = (x + (size - w) / 2.0).round();
+    push_rect(instances, atlas, [x0, y.round(), w.round(), size.round()], color, 0.0);
+    let notch = (w * 0.42).max(1.0);
+    push_rect(instances, atlas, [(x0 + w - notch).round(), y.round(), notch.round(), notch.round()], TREE_BG, 0.0);
+}
+
 /// Rows are slightly taller than a terminal line -- VS Code's list rows
 /// have noticeably more leading than its editor lines, and that airiness
 /// is a lot of what makes the explorer feel like a list rather than
@@ -159,34 +198,26 @@ fn file_tree_title_height(cell_h: f32) -> f32 {
     (cell_h * 1.8).round()
 }
 
-/// Title band plus the `..` row -- everything above the scrolling list.
+/// Everything above the scrolling list. Just the section title: the tree
+/// only ever browses downward from the shell's directory, so there's no
+/// `..` row to leave room for.
 fn file_tree_header_height(cell_h: f32) -> f32 {
-    file_tree_title_height(cell_h) + file_tree_row_height(cell_h)
+    file_tree_title_height(cell_h)
 }
 
-/// What a click (or hover) inside the sidebar landed on.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum FileTreeHit {
-    /// The `..` row: go to the parent directory.
-    Parent,
-    /// A row of the tree, by index into `FileTree::rows`.
-    Row(usize),
-}
-
-/// Hit-test a window-pixel position against the sidebar. Shares its
-/// geometry with `build_file_tree_instances` so the two can't disagree.
-pub fn file_tree_hit_test(rect: PaneRect, cell_h: f32, scroll: usize, row_count: usize, x: f32, y: f32) -> Option<FileTreeHit> {
+/// Hit-test a window-pixel position against the sidebar's list, giving
+/// the row index under it. Shares its geometry with
+/// `build_file_tree_instances` so the two can't disagree.
+pub fn file_tree_hit_test(rect: PaneRect, cell_h: f32, scroll: usize, row_count: usize, x: f32, y: f32) -> Option<usize> {
     if !rect.contains(x, y) {
         return None;
     }
     let header_h = file_tree_header_height(cell_h);
     if y < rect.y + header_h {
-        // The uppercase title is a label, not a button; only the `..`
-        // row beneath it responds.
-        return (y >= rect.y + file_tree_title_height(cell_h)).then_some(FileTreeHit::Parent);
+        return None; // the uppercase title is a label, not a button
     }
     let index = ((y - rect.y - header_h) / file_tree_row_height(cell_h)).floor() as usize + scroll;
-    (index < row_count).then_some(FileTreeHit::Row(index))
+    (index < row_count).then_some(index)
 }
 
 /// How many tree rows fit below the header.
@@ -226,14 +257,13 @@ pub fn build_file_tree_instances(atlas: &FontAtlas, rect: PaneRect, view: &super
         TREE_FG,
     );
 
-    // `..` -- styled as a list row (full-width hover band and all) so it
-    // reads as the first thing you can click, not as chrome.
-    let parent_y = rect.y + title_h;
-    if view.hover == Some(FileTreeHit::Parent) {
-        push_rect(&mut instances, atlas, [rect.x + 1.0, parent_y, rect.w - 1.0, row_h], TREE_HOVER, 0.0);
+    if view.show_hidden {
+        // Only worth saying when it's on -- hidden entries showing with
+        // no explanation is the confusing state, not the default.
+        let note = " (hidden shown)";
+        let note_x = rect.x + rect.w - cw * (note.chars().count() as f32 + 0.5);
+        push_text(&mut instances, atlas, note, note_x.max(pad_x), title_y, TREE_FG_DIM);
     }
-    let hidden_marker = if view.show_hidden { "..    (showing hidden)" } else { ".." };
-    push_text(&mut instances, atlas, &truncate(hidden_marker, text_cols), pad_x + cw * 1.5, parent_y + text_dy, TREE_FG_DIM);
 
     let visible = file_tree_visible_rows(rect, ch);
     for (i, row) in view.rows.iter().skip(view.scroll).take(visible).enumerate() {
@@ -243,7 +273,7 @@ pub fn build_file_tree_instances(atlas: &FontAtlas, rect: PaneRect, view: &super
         // Selection wins over hover, like every list widget.
         let band = if view.selected == Some(index) {
             Some(TREE_SELECTED)
-        } else if view.hover == Some(FileTreeHit::Row(index)) {
+        } else if view.hover == Some(index) {
             Some(TREE_HOVER)
         } else {
             None
@@ -261,15 +291,26 @@ pub fn build_file_tree_instances(atlas: &FontAtlas, rect: PaneRect, view: &super
 
         let indent = row.depth as f32 * TREE_INDENT_COLS * cw;
         let twisty_x = pad_x + indent;
+        let icon_size = (ch * 0.5).round().max(4.0);
         if row.is_dir {
-            let size = ch * 0.4;
-            push_twisty(&mut instances, atlas, twisty_x + cw * 0.1, y + (row_h - size) / 2.0, size, row.expanded, TREE_FG_DIM);
+            let twisty_size = ch * 0.4;
+            push_twisty(&mut instances, atlas, twisty_x + cw * 0.1, y + (row_h - twisty_size) / 2.0, twisty_size, row.expanded, TREE_FG_DIM);
         }
-        // Files leave the twisty column empty so every name in a
-        // directory lines up, folders included.
-        let name_x = twisty_x + cw * 1.5;
-        let name_cols = text_cols.saturating_sub((row.depth as f32 * TREE_INDENT_COLS) as usize + 2);
-        push_text(&mut instances, atlas, &truncate(&row.name, name_cols), name_x, y + text_dy, TREE_FG);
+        // Files leave the twisty column empty so their icons and names
+        // line up with the folders' in the same directory.
+        let icon_x = twisty_x + cw * 1.3;
+        let icon_y = y + (row_h - icon_size) / 2.0;
+        if row.is_dir {
+            push_folder_icon(&mut instances, atlas, icon_x, icon_y, icon_size, TREE_ICON_DIR);
+        } else {
+            push_file_icon(&mut instances, atlas, icon_x, icon_y, icon_size, TREE_ICON_FILE);
+        }
+
+        let name_x = icon_x + icon_size + cw * 0.4;
+        let used_cols = ((name_x - rect.x) / cw).ceil() as usize;
+        let name_cols = text_cols.saturating_sub(used_cols);
+        let color = if row.is_dir { TREE_FG } else { TREE_FG_FILE };
+        push_text(&mut instances, atlas, &truncate(&row.name, name_cols), name_x, y + text_dy, color);
     }
 
     // A minimal scroll thumb, drawn only when there's more than fits --
@@ -589,5 +630,72 @@ fn push_text(instances: &mut Vec<Instance>, atlas: &FontAtlas, text: &str, start
             }
         }
         x += atlas.cell_width;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const CELL_W: f32 = 8.0;
+    const CELL_H: f32 = 17.0;
+    const WINDOW_W: f32 = 1200.0;
+
+    #[test]
+    fn hidden_sidebar_takes_no_width() {
+        assert_eq!(file_tree_width(false, 0.0, CELL_W, WINDOW_W), 0.0);
+        // Even a width the user dragged earlier stays out of the layout
+        // while the sidebar is closed.
+        assert_eq!(file_tree_width(false, 400.0, CELL_W, WINDOW_W), 0.0);
+    }
+
+    #[test]
+    fn zero_requested_width_means_the_default() {
+        assert_eq!(file_tree_width(true, 0.0, CELL_W, WINDOW_W), FILE_TREE_DEFAULT_COLS * CELL_W);
+    }
+
+    #[test]
+    fn dragged_width_is_clamped_at_both_ends() {
+        // Dragged past the right edge: floored so names stay readable.
+        assert_eq!(file_tree_width(true, 5.0, CELL_W, WINDOW_W), FILE_TREE_MIN_COLS * CELL_W);
+        // Dragged across the whole window: capped so the terminal keeps
+        // most of it.
+        assert_eq!(file_tree_width(true, 5000.0, CELL_W, WINDOW_W), WINDOW_W * 0.6);
+        // In between, honored as-is.
+        assert_eq!(file_tree_width(true, 300.0, CELL_W, WINDOW_W), 300.0);
+    }
+
+    #[test]
+    fn the_minimum_wins_on_a_window_too_narrow_to_honor_the_cap() {
+        // A 60%-of-window cap below the readable minimum would otherwise
+        // invert the clamp range and panic.
+        let narrow = 100.0;
+        assert_eq!(file_tree_width(true, 400.0, CELL_W, narrow), FILE_TREE_MIN_COLS * CELL_W);
+    }
+
+    #[test]
+    fn hit_test_maps_rows_and_ignores_the_title() {
+        let rect = file_tree_rect(WINDOW_W, 600.0, CELL_W, CELL_H, true, 0.0).unwrap();
+        let row_h = file_tree_row_height(CELL_H);
+        let first_row_y = rect.y + file_tree_header_height(CELL_H);
+
+        // The uppercase title band is a label, not a row.
+        assert_eq!(file_tree_hit_test(rect, CELL_H, 0, 10, rect.x + 20.0, rect.y + 2.0), None);
+        assert_eq!(file_tree_hit_test(rect, CELL_H, 0, 10, rect.x + 20.0, first_row_y + 1.0), Some(0));
+        assert_eq!(file_tree_hit_test(rect, CELL_H, 0, 10, rect.x + 20.0, first_row_y + row_h * 2.5), Some(2));
+        // Scrolling shifts which row a given pixel belongs to.
+        assert_eq!(file_tree_hit_test(rect, CELL_H, 5, 10, rect.x + 20.0, first_row_y + 1.0), Some(5));
+        // Past the last row, and outside the sidebar entirely.
+        assert_eq!(file_tree_hit_test(rect, CELL_H, 0, 3, rect.x + 20.0, first_row_y + row_h * 8.0), None);
+        assert_eq!(file_tree_hit_test(rect, CELL_H, 0, 10, rect.x - 5.0, first_row_y + 1.0), None);
+    }
+
+    #[test]
+    fn the_grid_gives_up_exactly_the_sidebar_width() {
+        let sidebar = file_tree_width(true, 300.0, CELL_W, WINDOW_W);
+        let grid = grid_rect(WINDOW_W, 600.0, CELL_H, sidebar);
+        let rect = file_tree_rect(WINDOW_W, 600.0, CELL_W, CELL_H, true, 300.0).unwrap();
+        assert_eq!(grid.w + rect.w, WINDOW_W, "no overlap and no gap between them");
+        assert_eq!(grid.x + grid.w, rect.x);
     }
 }

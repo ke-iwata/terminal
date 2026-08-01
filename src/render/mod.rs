@@ -34,8 +34,12 @@ pub struct FileTreeView<'a> {
     pub rows: &'a [crate::filetree::Row],
     pub scroll: usize,
     pub show_hidden: bool,
-    /// What the pointer is currently over, for the hover band.
-    pub hover: Option<chrome::FileTreeHit>,
+    /// The user's dragged sidebar width in pixels; zero means the
+    /// default. Clamped by `chrome::file_tree_width`.
+    pub width: f32,
+    /// Index into `rows` of whatever the pointer is over, for the hover
+    /// band.
+    pub hover: Option<usize>,
     /// Index into `rows` of the last-clicked entry, kept highlighted so
     /// the list shows what you acted on -- VS Code's selected row.
     pub selected: Option<usize>,
@@ -226,7 +230,9 @@ impl Renderer {
         let window_width = self.config.width as f32;
         let window_height = self.config.height as f32;
 
-        let sidebar_width = chrome::file_tree_width(file_tree.is_some(), self.atlas.cell_width, window_width);
+        let sidebar_width = file_tree
+            .as_ref()
+            .map_or(0.0, |v| chrome::file_tree_width(true, v.width, self.atlas.cell_width, window_width));
         let grid_rect = chrome::grid_rect(window_width, window_height, self.atlas.cell_height, sidebar_width);
         let (pane_rects, dividers) = tab.layout(grid_rect, chrome::PANE_GAP);
         let divider_rects: Vec<crate::tab::PaneRect> = dividers.iter().map(|d| d.rect).collect();
@@ -253,7 +259,7 @@ impl Renderer {
         }
 
         if let Some(view) = &file_tree {
-            if let Some(rect) = chrome::file_tree_rect(window_width, window_height, self.atlas.cell_width, self.atlas.cell_height, true) {
+            if let Some(rect) = chrome::file_tree_rect(window_width, window_height, self.atlas.cell_width, self.atlas.cell_height, true, view.width) {
                 instances.extend(chrome::build_file_tree_instances(&self.atlas, rect, view));
             }
         }

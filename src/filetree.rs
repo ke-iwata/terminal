@@ -70,11 +70,6 @@ impl FileTree {
         self.rebuild();
     }
 
-    /// The directory above the root, or `None` at the filesystem root.
-    pub fn parent(&self) -> Option<&Path> {
-        self.root.parent()
-    }
-
     /// Point the tree at a new directory, rebuilding it. A no-op when
     /// already rooted there, so this is cheap to call on every status
     /// refresh.

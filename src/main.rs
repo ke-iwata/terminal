@@ -159,11 +159,15 @@ struct App {
     /// picks up files created by commands without re-reading directories
     /// on every redraw.
     last_tree_refresh: Option<Instant>,
-    /// The previous sidebar click (when, which path), for double-click
-    /// detection on directories.
-    last_tree_click: Option<(Instant, std::path::PathBuf)>,
-    /// What the pointer is over in the sidebar, for the hover band.
-    file_tree_hover: Option<chrome::FileTreeHit>,
+    /// The sidebar's width in pixels, as dragged by the user. Zero means
+    /// "the default width" -- see `chrome::file_tree_width`, which also
+    /// clamps this so the sidebar can't swallow the window.
+    file_tree_width: f32,
+    /// Whether a drag on the sidebar's inner edge is currently resizing
+    /// it. Mutually exclusive with the pane-divider drag.
+    dragging_sidebar: bool,
+    /// Which row the pointer is over in the sidebar, for the hover band.
+    file_tree_hover: Option<usize>,
     /// The last-clicked entry, kept highlighted. Stored as a path rather
     /// than a row index so it survives the tree being rebuilt (files
     /// appearing above it would otherwise shift the highlight onto a
@@ -199,7 +203,8 @@ impl App {
             file_tree: filetree::FileTree::new(),
             file_tree_visible: persisted.file_tree_visible,
             last_tree_refresh: None,
-            last_tree_click: None,
+            file_tree_width: persisted.file_tree_width,
+            dragging_sidebar: false,
             file_tree_hover: None,
             file_tree_selected: None,
         }
@@ -303,7 +308,7 @@ impl App {
         };
         let (cell_w, cell_h) = renderer.cell_size();
         let size = window.inner_size();
-        let sidebar = chrome::file_tree_width(self.file_tree_visible, cell_w, size.width as f32);
+        let sidebar = chrome::file_tree_width(self.file_tree_visible, self.file_tree_width, cell_w, size.width as f32);
         let grid = chrome::grid_rect(size.width as f32, size.height as f32, cell_h, sidebar);
         let now = Instant::now();
         for tab in &mut self.tabs {
@@ -458,7 +463,7 @@ impl App {
         };
         let size = window.inner_size();
         let (cell_w, cell_h) = renderer.cell_size();
-        let sidebar = chrome::file_tree_width(self.file_tree_visible, cell_w, size.width as f32);
+        let sidebar = chrome::file_tree_width(self.file_tree_visible, self.file_tree_width, cell_w, size.width as f32);
         let grid = chrome::grid_rect(size.width as f32, size.height as f32, cell_h, sidebar);
         self.active_tab().layout(grid, chrome::PANE_GAP).0
     }
@@ -481,7 +486,7 @@ impl App {
         };
         let size = window.inner_size();
         let (cell_w, cell_h) = renderer.cell_size();
-        let sidebar = chrome::file_tree_width(self.file_tree_visible, cell_w, size.width as f32);
+        let sidebar = chrome::file_tree_width(self.file_tree_visible, self.file_tree_width, cell_w, size.width as f32);
         let grid = chrome::grid_rect(size.width as f32, size.height as f32, cell_h, sidebar);
         let (_, dividers) = self.active_tab().layout(grid, chrome::PANE_GAP);
         dividers.into_iter().find(|d| {
@@ -522,6 +527,12 @@ impl App {
     fn update_cursor_icon(&self) {
         use winit::window::CursorIcon;
         let Some(window) = &self.window else { return };
+        // The sidebar edge only ever resizes horizontally, so it maps to
+        // the same cursor as a vertical pane divider.
+        if self.dragging_sidebar || self.on_file_tree_edge(self.cursor_pos.0, self.cursor_pos.1) {
+            window.set_cursor(CursorIcon::ColResize);
+            return;
+        }
         let direction = self
             .dragging_divider
             .as_ref()
@@ -806,7 +817,7 @@ impl App {
         let (window, renderer) = (self.window.as_ref()?, self.renderer.as_ref()?);
         let (cell_w, cell_h) = renderer.cell_size();
         let size = window.inner_size();
-        chrome::file_tree_rect(size.width as f32, size.height as f32, cell_w, cell_h, self.file_tree_visible)
+        chrome::file_tree_rect(size.width as f32, size.height as f32, cell_w, cell_h, self.file_tree_visible, self.file_tree_width)
     }
 
     /// Show or hide the sidebar. Panes give up (or reclaim) the width, so
@@ -855,68 +866,61 @@ impl App {
         }
     }
 
-    /// Route a click inside the sidebar. Directories expand in place (and
-    /// a double-click `cd`s into them); files open in whatever app the
-    /// system associates with them, exactly like double-clicking in
-    /// Finder. Option+click inserts the path at the shell prompt instead,
-    /// for when the point is to type a command about the file rather than
-    /// to open it.
+    /// Route a click inside the sidebar. Directories expand and collapse
+    /// in place; files open in whatever app the system associates with
+    /// them, like double-clicking in Finder. Option+click inserts the
+    /// path at the shell prompt instead, for when the point is to type a
+    /// command about the file rather than to open it.
+    ///
+    /// Nothing here moves the shell: the tree browses downward from
+    /// wherever the shell already is, and `cd` stays something you type.
     fn handle_file_tree_click(&mut self, x: f32, y: f32) {
-        const DOUBLE_CLICK_WINDOW: Duration = Duration::from_millis(500);
         let Some(rect) = self.file_tree_rect() else { return };
         let Some((_, cell_h)) = self.renderer.as_ref().map(Renderer::cell_size) else { return };
         let hit = chrome::file_tree_hit_test(rect, cell_h, self.file_tree.scroll, self.file_tree.rows().len(), x, y);
 
-        match hit {
-            Some(chrome::FileTreeHit::Parent) => {
-                if let Some(parent) = self.file_tree.parent().map(std::path::Path::to_path_buf) {
-                    self.cd_shell_to(&parent);
-                }
-            }
-            Some(chrome::FileTreeHit::Row(index)) => {
-                let Some(row) = self.file_tree.rows().get(index) else { return };
-                let (path, is_dir) = (row.path.clone(), row.is_dir);
-                self.file_tree_selected = Some(path.clone());
+        if let Some(index) = hit {
+            let Some(row) = self.file_tree.rows().get(index) else { return };
+            let (path, is_dir) = (row.path.clone(), row.is_dir);
+            self.file_tree_selected = Some(path.clone());
 
-                let now = Instant::now();
-                let double = self
-                    .last_tree_click
-                    .as_ref()
-                    .is_some_and(|(at, p)| *p == path && now.duration_since(*at) < DOUBLE_CLICK_WINDOW);
-                self.last_tree_click = Some((now, path.clone()));
-
-                if self.modifiers.alt_key() {
-                    self.insert_path_at_prompt(&path);
-                } else if is_dir {
-                    if double {
-                        self.cd_shell_to(&path);
-                    } else {
-                        self.file_tree.toggle(&path);
-                    }
-                } else {
-                    open_with_default_app(&path);
-                }
+            if self.modifiers.alt_key() {
+                self.insert_path_at_prompt(&path);
+            } else if is_dir {
+                self.file_tree.toggle(&path);
+            } else {
+                open_with_default_app(&path);
             }
-            None => {}
         }
         if let Some(window) = &self.window {
             window.request_redraw();
         }
     }
 
-    /// Type a `cd` into the focused shell. Goes through the shell (rather
-    /// than just re-rooting the sidebar) deliberately: the tree follows
-    /// the shell's cwd, so moving the shell keeps the two in step and
-    /// leaves the user where the sidebar says they are.
-    fn cd_shell_to(&mut self, dir: &std::path::Path) {
-        let command = format!("cd {}\n", filetree::shell_quote(&dir.to_string_lossy()));
-        let pane = self.active_tab().focused_pane();
-        write_all_to_pty(pane.pty_master.as_fd(), command.as_bytes());
-        self.active_tab_mut().focused_pane_mut().scroll_offset = 0;
-        // Don't wait for the throttle: the cwd is about to change, and a
-        // stale tree for up to a second reads as the click not working.
-        self.last_tree_refresh = None;
-        self.last_status_refresh = None;
+    /// Whether a window position is on the sidebar's draggable inner
+    /// edge (a padded strip, since the visible border is a hairline).
+    fn on_file_tree_edge(&self, x: f32, y: f32) -> bool {
+        let Some(rect) = self.file_tree_rect() else { return false };
+        y >= rect.y && y < rect.y + rect.h && (x - rect.x).abs() <= chrome::FILE_TREE_GRAB
+    }
+
+    /// Resize the sidebar to follow the cursor mid-drag. Panes are
+    /// re-fitted live (with the pty resize throttled, exactly like a
+    /// divider drag).
+    fn update_sidebar_drag(&mut self) {
+        if !self.dragging_sidebar {
+            return;
+        }
+        let Some(window) = &self.window else { return };
+        let width = window.inner_size().width as f32 - self.cursor_pos.0;
+        // Left unclamped here on purpose: `chrome::file_tree_width` is
+        // the single place that decides the limits, so the drag can't
+        // disagree with what gets drawn.
+        self.file_tree_width = width.max(0.0);
+        self.relayout_all_tabs(false);
+        if let Some(window) = &self.window {
+            window.request_redraw();
+        }
     }
 
     /// Insert a path at the shell prompt without executing anything --
@@ -1504,6 +1508,7 @@ impl ApplicationHandler<UserEvent> for App {
             WindowEvent::CursorMoved { position, .. } => {
                 self.cursor_pos = (position.x as f32, position.y as f32);
                 self.update_divider_drag();
+                self.update_sidebar_drag();
                 self.update_file_tree_hover();
                 self.update_selection();
                 // Motion with a button held, for apps in drag-reporting
@@ -1531,6 +1536,10 @@ impl ApplicationHandler<UserEvent> for App {
                 };
                 if self.cursor_pos.1 < chrome::tab_bar_height(cell_h) {
                     self.handle_tab_bar_click(event_loop);
+                } else if self.on_file_tree_edge(self.cursor_pos.0, self.cursor_pos.1) {
+                    // Checked before the sidebar body: the grab strip
+                    // overlaps its first few pixels.
+                    self.dragging_sidebar = true;
                 } else if self.file_tree_rect().is_some_and(|r| r.contains(self.cursor_pos.0, self.cursor_pos.1)) {
                     self.handle_file_tree_click(self.cursor_pos.0, self.cursor_pos.1);
                 } else if let Some(divider) = self.divider_at(self.cursor_pos.0, self.cursor_pos.1) {
@@ -1556,9 +1565,9 @@ impl ApplicationHandler<UserEvent> for App {
                 }
             }
             WindowEvent::MouseInput { state: ElementState::Released, button: MouseButton::Left, .. } => {
-                if self.dragging_divider.take().is_some() {
-                    // Force-flush: the drag may have throttled the pty out
-                    // of sync with the final size.
+                if self.dragging_divider.take().is_some() || std::mem::take(&mut self.dragging_sidebar) {
+                    // Force-flush: either drag may have throttled the pty
+                    // out of sync with the final size.
                     self.relayout_all_tabs(true);
                 }
                 if let Some((pane_id, code, sgr, last_cell)) = self.mouse_report_drag.take() {
@@ -1620,6 +1629,7 @@ impl ApplicationHandler<UserEvent> for App {
                     rows: self.file_tree.rows(),
                     scroll: self.file_tree.scroll,
                     show_hidden: self.file_tree.show_hidden(),
+                    width: self.file_tree_width,
                     hover: self.file_tree_hover,
                     selected,
                 });
@@ -1657,6 +1667,7 @@ impl ApplicationHandler<UserEvent> for App {
         state::save(&state::State {
             window: self.window_frame,
             file_tree_visible: self.file_tree_visible,
+            file_tree_width: self.file_tree_width,
         });
     }
 

@@ -24,6 +24,8 @@ pub struct State {
     /// Whether the file-tree sidebar was open. Someone using it instead
     /// of Finder shouldn't have to reopen it every launch.
     pub file_tree_visible: bool,
+    /// The sidebar's dragged width in pixels; zero means the default.
+    pub file_tree_width: f32,
 }
 
 fn state_path() -> Option<PathBuf> {
@@ -62,12 +64,14 @@ mod tests {
         let state = State {
             window: Some(WindowFrame { x: -12, y: 40, width: 1280, height: 800 }),
             file_tree_visible: true,
+            file_tree_width: 320.0,
         };
         let serialized = toml::to_string(&state).unwrap();
         let parsed: State = toml::from_str(&serialized).unwrap();
         let frame = parsed.window.unwrap();
         assert_eq!((frame.x, frame.y, frame.width, frame.height), (-12, 40, 1280, 800));
         assert!(parsed.file_tree_visible);
+        assert_eq!(parsed.file_tree_width, 320.0);
     }
 
     #[test]
@@ -75,6 +79,7 @@ mod tests {
         let parsed: State = toml::from_str("").unwrap();
         assert!(parsed.window.is_none());
         assert!(!parsed.file_tree_visible, "the sidebar starts hidden");
+        assert_eq!(parsed.file_tree_width, 0.0, "zero means the default width");
         assert!(toml::from_str::<State>("not toml at all [").is_err());
     }
 }
