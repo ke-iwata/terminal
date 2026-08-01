@@ -226,9 +226,12 @@ pub fn title_for(path: &Path) -> String {
         .unwrap_or_else(|| path.display().to_string())
 }
 
-/// The state of the one preview the overlay can be showing.
+/// One previewed file -- the contents of a preview tab.
 pub struct Preview {
     pub path: PathBuf,
+    /// The file's name, resolved once at open time so the tab strip has
+    /// a label to draw before the contents finish loading.
+    pub title: String,
     pub state: State,
     /// First visible line of a text preview.
     pub scroll: usize,
@@ -242,7 +245,21 @@ pub enum State {
 
 impl Preview {
     pub fn loading(path: PathBuf) -> Self {
-        Preview { path, state: State::Loading, scroll: 0 }
+        Preview {
+            title: title_for(&path),
+            path,
+            state: State::Loading,
+            scroll: 0,
+        }
+    }
+
+    /// A short note beside the title -- dimensions, or line count.
+    pub fn subtitle(&self) -> String {
+        match &self.state {
+            State::Ready(content) => content.describe(),
+            State::Loading => String::new(),
+            State::Failed(_) => String::new(),
+        }
     }
 }
 

@@ -46,12 +46,11 @@ pub struct FileTreeView<'a> {
     pub selected: Option<usize>,
 }
 
-/// Everything the preview overlay needs for one frame. `Some` means the
-/// overlay is open.
+/// Everything a preview tab needs for one frame. `Some` means the
+/// active tab is a preview rather than a shell.
 pub struct PreviewView<'a> {
-    /// The previewed file's name.
-    pub title: &'a str,
-    /// A short note beside it -- dimensions, line count.
+    /// A short note about the file -- dimensions, line count. The name
+    /// itself is the tab's label, so the body doesn't repeat it.
     pub subtitle: &'a str,
     pub body: chrome::PreviewBody<'a>,
     /// The decoded image's pixel dimensions, for fitting it to the
@@ -276,7 +275,7 @@ impl Renderer {
 
         let mut instances = chrome::build_divider_instances(&self.atlas, &divider_rects);
         for (pane_id, rect) in &pane_rects {
-            let pane = tab.root().pane(*pane_id).expect("layout only yields live panes");
+            let pane = tab.pane(*pane_id).expect("layout only yields live panes");
             // Full-screen apps (vim, less, htop, ...) manage their own
             // scrolling and don't expect the terminal to scroll their
             // alternate screen.
@@ -286,11 +285,11 @@ impl Renderer {
                 search: pane.search.as_ref(),
                 cmd_held,
             };
-            let focused = tab.focused == *pane_id;
+            let focused = tab.focused() == Some(*pane_id);
             instances.extend(self.build_instances_from_pane(&pane.term, effective_offset, *rect, &overlays, focused));
         }
         if pane_rects.len() > 1 {
-            if let Some((_, rect)) = pane_rects.iter().find(|(id, _)| *id == tab.focused) {
+            if let Some((_, rect)) = pane_rects.iter().find(|(id, _)| Some(*id) == tab.focused()) {
                 instances.extend(chrome::build_focus_border_instances(&self.atlas, *rect));
             }
         }
@@ -301,12 +300,12 @@ impl Renderer {
             }
         }
 
-        // The preview covers the panes (never the sidebar), so it goes on
-        // after them and before the bars, which always stay on top.
+        // A preview tab has no panes, so it fills the same area they
+        // would have -- the sidebar keeps its own space either way.
         let mut preview_image_rect = None;
         if let Some(view) = &preview {
             let layout = chrome::preview_layout(grid_rect, self.atlas.cell_height);
-            instances.extend(chrome::build_preview_instances(&self.atlas, &layout, view.title, view.subtitle, &view.body));
+            instances.extend(chrome::build_preview_instances(&self.atlas, &layout, view.subtitle, &view.body));
             if let chrome::PreviewBody::Image = view.body {
                 if let Some((w, h)) = view.image_size {
                     preview_image_rect = Some(chrome::preview_image_rect(layout.content, w, h));
@@ -318,7 +317,7 @@ impl Renderer {
         let tab_layout = chrome::tab_bar_layout(&titles, window_width, self.atlas.cell_width);
         instances.extend(chrome::build_tab_bar_instances(&self.atlas, &tab_layout, active, window_width, tab_bar_h));
         instances.extend(chrome::build_status_bar_instances(&self.atlas, status, window_width, window_height, status_bar_h));
-        if let Some(search) = &tab.focused_pane().search {
+        if let Some(search) = tab.focused_pane().and_then(|p| p.search.as_ref()) {
             instances.extend(chrome::build_search_bar_instances(&self.atlas, search, window_width, tab_bar_h));
         }
 

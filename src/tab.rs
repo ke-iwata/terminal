@@ -490,55 +490,141 @@ fn remove_owned(node: PaneNode, id: u64) -> (Option<PaneNode>, Option<Pane>) {
 
 /// One tab in the tab strip: a tree of one or more panes plus which of
 /// them owns keyboard focus.
+/// What a tab holds. Most tabs are shell sessions; a file preview gets
+/// its own tab rather than an overlay, so it can be switched away from
+/// and come back to, and so several previews can be open at once.
+pub enum TabKind {
+    Shell {
+        /// Always `Some` from the outside; `Option` only so `remove_pane`
+        /// can temporarily take ownership of the tree to restructure it.
+        root: Option<PaneNode>,
+        /// Which pane keyboard input goes to. Always a live pane's id.
+        focused: u64,
+    },
+    Preview(Box<crate::preview::Preview>),
+}
+
 pub struct Tab {
     /// Stable identity, independent of position in the tab strip. Never
     /// reused within one run of the app.
     pub id: u64,
-    /// Always `Some` from the outside; `Option` only so `remove_pane` can
-    /// temporarily take ownership of the tree to restructure it.
-    root: Option<PaneNode>,
-    /// Which pane keyboard input goes to. Always a live pane's id.
-    pub focused: u64,
+    pub kind: TabKind,
 }
 
 impl Tab {
     pub fn new(id: u64, pane: Pane) -> Tab {
         let focused = pane.id;
-        Tab { id, root: Some(PaneNode::Leaf(Box::new(pane))), focused }
+        Tab {
+            id,
+            kind: TabKind::Shell { root: Some(PaneNode::Leaf(Box::new(pane))), focused },
+        }
     }
 
-    pub fn root(&self) -> &PaneNode {
-        self.root.as_ref().expect("a tab always has a root pane")
+    pub fn preview(id: u64, preview: crate::preview::Preview) -> Tab {
+        Tab { id, kind: TabKind::Preview(Box::new(preview)) }
     }
 
-    pub fn root_mut(&mut self) -> &mut PaneNode {
-        self.root.as_mut().expect("a tab always has a root pane")
+    /// The preview this tab shows, if it is one. Every shell accessor
+    /// below returns `None`/empty for a preview tab, so callers that
+    /// only make sense for a shell fall out naturally rather than
+    /// needing an `is_shell` check first.
+    pub fn preview_content(&self) -> Option<&crate::preview::Preview> {
+        match &self.kind {
+            TabKind::Preview(preview) => Some(preview),
+            TabKind::Shell { .. } => None,
+        }
+    }
+
+    pub fn preview_content_mut(&mut self) -> Option<&mut crate::preview::Preview> {
+        match &mut self.kind {
+            TabKind::Preview(preview) => Some(preview),
+            TabKind::Shell { .. } => None,
+        }
+    }
+
+    fn root(&self) -> Option<&PaneNode> {
+        match &self.kind {
+            TabKind::Shell { root, .. } => root.as_ref(),
+            TabKind::Preview(_) => None,
+        }
+    }
+
+    fn root_mut(&mut self) -> Option<&mut PaneNode> {
+        match &mut self.kind {
+            TabKind::Shell { root, .. } => root.as_mut(),
+            TabKind::Preview(_) => None,
+        }
+    }
+
+    /// Which pane keyboard input goes to, or `None` on a preview tab.
+    pub fn focused(&self) -> Option<u64> {
+        match &self.kind {
+            TabKind::Shell { focused, .. } => Some(*focused),
+            TabKind::Preview(_) => None,
+        }
+    }
+
+    /// Move keyboard focus to `id`. Ignored when `id` isn't a live pane
+    /// of this tab, so a stale id can't strand input.
+    pub fn set_focused(&mut self, id: u64) {
+        if self.pane(id).is_none() {
+            return;
+        }
+        if let TabKind::Shell { focused, .. } = &mut self.kind {
+            *focused = id;
+        }
+    }
+
+    pub fn pane(&self, id: u64) -> Option<&Pane> {
+        self.root()?.pane(id)
+    }
+
+    pub fn pane_mut(&mut self, id: u64) -> Option<&mut Pane> {
+        self.root_mut()?.pane_mut(id)
+    }
+
+    /// Every pane in tree order -- empty for a preview tab.
+    pub fn panes(&self) -> Vec<&Pane> {
+        self.root().map(PaneNode::panes).unwrap_or_default()
+    }
+
+    pub fn panes_mut(&mut self) -> Vec<&mut Pane> {
+        self.root_mut().map(PaneNode::panes_mut).unwrap_or_default()
     }
 
     pub fn pane_count(&self) -> usize {
-        self.root().panes().len()
+        self.panes().len()
     }
 
-    pub fn focused_pane(&self) -> &Pane {
-        self.root().pane(self.focused).expect("focused always points at a live pane")
+    pub fn focused_pane(&self) -> Option<&Pane> {
+        self.pane(self.focused()?)
     }
 
-    pub fn focused_pane_mut(&mut self) -> &mut Pane {
-        let focused = self.focused;
-        self.root_mut().pane_mut(focused).expect("focused always points at a live pane")
+    pub fn focused_pane_mut(&mut self) -> Option<&mut Pane> {
+        self.pane_mut(self.focused()?)
     }
 
     /// Split the focused pane, giving the new pane the second (right or
     /// bottom) half, and focus it -- matching what iTerm2/tmux do, since
     /// the reason you split is almost always to use the new shell now.
-    pub fn split_focused(&mut self, direction: SplitDirection, new_pane: Pane) {
+    /// Hands the pane back untouched on a preview tab, which has nothing
+    /// to split. The rejected pane comes back boxed: a `Pane` is ~1KB,
+    /// and an unboxed one in the error variant would make every caller's
+    /// `Result` that size.
+    pub fn split_focused(&mut self, direction: SplitDirection, new_pane: Pane) -> Result<(), Box<Pane>> {
         let new_id = new_pane.id;
-        let root = self.root.take().expect("a tab always has a root pane");
-        let (root, outcome) = split_owned(root, self.focused, direction, new_pane);
-        self.root = Some(root);
+        let TabKind::Shell { root, focused } = &mut self.kind else {
+            return Err(Box::new(new_pane));
+        };
+        let Some(taken) = root.take() else {
+            return Err(Box::new(new_pane));
+        };
+        let (rebuilt, outcome) = split_owned(taken, *focused, direction, new_pane);
+        *root = Some(rebuilt);
         if outcome.is_ok() {
-            self.focused = new_id;
+            *focused = new_id;
         }
+        outcome.map_err(Box::new)
     }
 
     /// Remove pane `id`, collapsing its split into the sibling. Refuses
@@ -548,19 +634,26 @@ impl Tab {
         if self.pane_count() <= 1 {
             return None;
         }
-        let root = self.root.take().expect("a tab always has a root pane");
-        let (rest, removed) = remove_owned(root, id);
-        self.root = Some(rest.expect("pane_count > 1 means a sibling survives the removal"));
-        if removed.is_some() && self.focused == id {
-            self.focused = self.root().panes()[0].id;
+        let TabKind::Shell { root, focused } = &mut self.kind else {
+            return None;
+        };
+        let taken = root.take()?;
+        let (rest, removed) = remove_owned(taken, id);
+        *root = Some(rest.expect("pane_count > 1 means a sibling survives the removal"));
+        if removed.is_some() && *focused == id {
+            let survivor = root.as_ref().and_then(|r| r.panes().first().map(|p| p.id));
+            if let Some(survivor) = survivor {
+                *focused = survivor;
+            }
         }
         removed
     }
 
     /// Move focus to the next/previous pane in tree (reading) order.
     pub fn cycle_focus(&mut self, forward: bool) {
-        let ids: Vec<u64> = self.root().panes().iter().map(|p| p.id).collect();
-        let Some(pos) = ids.iter().position(|&id| id == self.focused) else {
+        let ids: Vec<u64> = self.panes().iter().map(|p| p.id).collect();
+        let Some(current) = self.focused() else { return };
+        let Some(pos) = ids.iter().position(|&id| id == current) else {
             return;
         };
         let next = if forward {
@@ -568,27 +661,36 @@ impl Tab {
         } else {
             (pos + ids.len() - 1) % ids.len()
         };
-        self.focused = ids[next];
+        self.set_focused(ids[next]);
     }
 
     /// Every pane's rect (and each divider's) laid out inside `rect`.
+    /// Both empty on a preview tab, which fills `rect` itself.
     pub fn layout(&self, rect: PaneRect, gap: f32) -> (Vec<(u64, PaneRect)>, Vec<DividerInfo>) {
         let mut panes = Vec::new();
         let mut dividers = Vec::new();
         let mut path = Vec::new();
-        self.root().layout(rect, gap, &mut path, &mut panes, &mut dividers);
+        if let Some(root) = self.root() {
+            root.layout(rect, gap, &mut path, &mut panes, &mut dividers);
+        }
         (panes, dividers)
     }
 
     /// Set the ratio of the split addressed by `path` -- see
     /// `PaneNode::set_ratio`.
     pub fn set_split_ratio(&mut self, path: &[bool], ratio: f32) {
-        self.root_mut().set_ratio(path, ratio);
+        if let Some(root) = self.root_mut() {
+            root.set_ratio(path, ratio);
+        }
     }
 
-    /// What the tab strip shows for this tab: the focused pane's title.
+    /// What the tab strip shows: the focused pane's running command, or
+    /// the previewed file's name.
     pub fn title(&self) -> &str {
-        &self.focused_pane().title
+        match &self.kind {
+            TabKind::Shell { .. } => self.focused_pane().map(|p| p.title.as_str()).unwrap_or("shell"),
+            TabKind::Preview(preview) => &preview.title,
+        }
     }
 }
 
@@ -884,15 +986,15 @@ mod tests {
     #[test]
     fn split_focused_focuses_the_new_pane() {
         let mut tab = Tab::new(1, dummy_pane(10));
-        tab.split_focused(SplitDirection::Vertical, dummy_pane(11));
+        _ = tab.split_focused(SplitDirection::Vertical, dummy_pane(11));
         assert_eq!(tab.pane_count(), 2);
-        assert_eq!(tab.focused, 11);
+        assert_eq!(tab.focused(), Some(11));
     }
 
     #[test]
     fn layout_splits_the_rect_between_panes() {
         let mut tab = Tab::new(1, dummy_pane(10));
-        tab.split_focused(SplitDirection::Vertical, dummy_pane(11));
+        _ = tab.split_focused(SplitDirection::Vertical, dummy_pane(11));
         let (panes, dividers) = tab.layout(rect(100.0, 50.0), 2.0);
         assert_eq!(panes.len(), 2);
         assert_eq!(dividers.len(), 1);
@@ -910,7 +1012,7 @@ mod tests {
     #[test]
     fn horizontal_split_stacks_panes() {
         let mut tab = Tab::new(1, dummy_pane(10));
-        tab.split_focused(SplitDirection::Horizontal, dummy_pane(11));
+        _ = tab.split_focused(SplitDirection::Horizontal, dummy_pane(11));
         let (panes, _) = tab.layout(rect(100.0, 50.0), 2.0);
         let (_, first) = panes[0];
         let (_, second) = panes[1];
@@ -922,12 +1024,12 @@ mod tests {
     #[test]
     fn remove_pane_collapses_the_split_into_the_sibling() {
         let mut tab = Tab::new(1, dummy_pane(10));
-        tab.split_focused(SplitDirection::Vertical, dummy_pane(11));
+        _ = tab.split_focused(SplitDirection::Vertical, dummy_pane(11));
         let removed = tab.remove_pane(11).expect("pane 11 exists and is not the last");
         assert_eq!(removed.id, 11);
         assert_eq!(tab.pane_count(), 1);
         // Focus was on the removed pane; it must land on a live one.
-        assert_eq!(tab.focused, 10);
+        assert_eq!(tab.focused(), Some(10));
         // The sibling reclaims the whole rect.
         let (panes, dividers) = tab.layout(rect(100.0, 50.0), 2.0);
         assert_eq!(panes.len(), 1);
@@ -945,8 +1047,8 @@ mod tests {
     #[test]
     fn nested_splits_layout_and_remove() {
         let mut tab = Tab::new(1, dummy_pane(10));
-        tab.split_focused(SplitDirection::Vertical, dummy_pane(11)); // 10 | 11
-        tab.split_focused(SplitDirection::Horizontal, dummy_pane(12)); // 10 | (11 / 12)
+        _ = tab.split_focused(SplitDirection::Vertical, dummy_pane(11)); // 10 | 11
+        _ = tab.split_focused(SplitDirection::Horizontal, dummy_pane(12)); // 10 | (11 / 12)
         assert_eq!(tab.pane_count(), 3);
         let (panes, dividers) = tab.layout(rect(200.0, 100.0), 2.0);
         assert_eq!(panes.len(), 3);
@@ -955,14 +1057,14 @@ mod tests {
         // Removing the middle pane leaves 10 | 12.
         let removed = tab.remove_pane(11).expect("not the last pane");
         assert_eq!(removed.id, 11);
-        let ids: Vec<u64> = tab.root().panes().iter().map(|p| p.id).collect();
+        let ids: Vec<u64> = tab.panes().iter().map(|p| p.id).collect();
         assert_eq!(ids, vec![10, 12]);
     }
 
     #[test]
     fn set_split_ratio_moves_the_divider() {
         let mut tab = Tab::new(1, dummy_pane(10));
-        tab.split_focused(SplitDirection::Vertical, dummy_pane(11));
+        _ = tab.split_focused(SplitDirection::Vertical, dummy_pane(11));
         tab.set_split_ratio(&[], 0.25);
         let (panes, dividers) = tab.layout(rect(202.0, 100.0), 2.0);
         let (_, first) = panes[0];
@@ -975,8 +1077,8 @@ mod tests {
     #[test]
     fn set_split_ratio_reaches_nested_splits_by_path() {
         let mut tab = Tab::new(1, dummy_pane(10));
-        tab.split_focused(SplitDirection::Vertical, dummy_pane(11)); // 10 | 11
-        tab.split_focused(SplitDirection::Horizontal, dummy_pane(12)); // 10 | (11 / 12)
+        _ = tab.split_focused(SplitDirection::Vertical, dummy_pane(11)); // 10 | 11
+        _ = tab.split_focused(SplitDirection::Horizontal, dummy_pane(12)); // 10 | (11 / 12)
         let (_, dividers) = tab.layout(rect(202.0, 102.0), 2.0);
         assert_eq!(dividers[0].path, Vec::<bool>::new(), "root split");
         assert_eq!(dividers[1].path, vec![true], "nested split lives in the root's second branch");
@@ -992,7 +1094,7 @@ mod tests {
     #[test]
     fn set_split_ratio_clamps_and_survives_stale_paths() {
         let mut tab = Tab::new(1, dummy_pane(10));
-        tab.split_focused(SplitDirection::Vertical, dummy_pane(11));
+        _ = tab.split_focused(SplitDirection::Vertical, dummy_pane(11));
         tab.set_split_ratio(&[], 0.0);
         let (panes, _) = tab.layout(rect(202.0, 100.0), 2.0);
         assert!(panes[0].1.w > 0.0, "ratio clamps above zero so a pane can't vanish");
@@ -1001,18 +1103,58 @@ mod tests {
     }
 
     #[test]
+    fn a_preview_tab_answers_empty_to_every_shell_query() {
+        // The point of the Option/empty returns: code written for shell
+        // tabs falls out on a preview tab instead of panicking.
+        let tab = Tab::preview(7, crate::preview::Preview::loading("/tmp/x.png".into()));
+        assert!(tab.focused().is_none());
+        assert!(tab.focused_pane().is_none());
+        assert!(tab.pane(0).is_none());
+        assert!(tab.panes().is_empty());
+        assert_eq!(tab.pane_count(), 0);
+        let (panes, dividers) = tab.layout(rect(100.0, 100.0), 2.0);
+        assert!(panes.is_empty() && dividers.is_empty());
+        assert!(tab.preview_content().is_some());
+    }
+
+    #[test]
+    fn a_preview_tab_is_titled_by_its_file() {
+        let tab = Tab::preview(7, crate::preview::Preview::loading("/tmp/report.pdf".into()));
+        assert_eq!(tab.title(), "report.pdf");
+    }
+
+    #[test]
+    fn splitting_a_preview_tab_hands_the_pane_back() {
+        // The caller has already spawned a shell by this point, so the
+        // pane must come back rather than being dropped -- otherwise the
+        // process leaks with no pane to show it.
+        let mut tab = Tab::preview(7, crate::preview::Preview::loading("/tmp/x.png".into()));
+        let rejected = tab.split_focused(SplitDirection::Vertical, dummy_pane(1));
+        assert!(rejected.is_err());
+        assert_eq!(rejected.unwrap_err().id, 1);
+        assert_eq!(tab.pane_count(), 0, "still a preview tab");
+    }
+
+    #[test]
+    fn set_focused_ignores_ids_that_are_not_live_panes() {
+        let mut tab = Tab::new(1, dummy_pane(10));
+        tab.set_focused(999);
+        assert_eq!(tab.focused(), Some(10), "a stale id can't strand input");
+    }
+
+    #[test]
     fn cycle_focus_walks_panes_in_order_and_wraps() {
         let mut tab = Tab::new(1, dummy_pane(10));
-        tab.split_focused(SplitDirection::Vertical, dummy_pane(11));
-        tab.split_focused(SplitDirection::Horizontal, dummy_pane(12));
-        assert_eq!(tab.focused, 12);
+        _ = tab.split_focused(SplitDirection::Vertical, dummy_pane(11));
+        _ = tab.split_focused(SplitDirection::Horizontal, dummy_pane(12));
+        assert_eq!(tab.focused(), Some(12));
         tab.cycle_focus(true);
-        assert_eq!(tab.focused, 10, "forward from the last pane wraps to the first");
+        assert_eq!(tab.focused(), Some(10), "forward from the last pane wraps to the first");
         tab.cycle_focus(true);
-        assert_eq!(tab.focused, 11);
+        assert_eq!(tab.focused(), Some(11));
         tab.cycle_focus(false);
-        assert_eq!(tab.focused, 10);
+        assert_eq!(tab.focused(), Some(10));
         tab.cycle_focus(false);
-        assert_eq!(tab.focused, 12, "backward from the first pane wraps to the last");
+        assert_eq!(tab.focused(), Some(12), "backward from the first pane wraps to the last");
     }
 }

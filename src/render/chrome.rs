@@ -663,7 +663,7 @@ pub fn preview_visible_lines(layout: &PreviewLayout, cell_h: f32) -> usize {
 /// Draw the overlay's backdrop, title strip, and -- for text and status
 /// states -- its body. An image body is drawn separately by
 /// `ImagePipeline`, on top of these instances.
-pub fn build_preview_instances(atlas: &FontAtlas, layout: &PreviewLayout, title: &str, subtitle: &str, body: &PreviewBody) -> Vec<Instance> {
+pub fn build_preview_instances(atlas: &FontAtlas, layout: &PreviewLayout, subtitle: &str, body: &PreviewBody) -> Vec<Instance> {
     let mut instances = Vec::new();
     let (cw, ch) = (atlas.cell_width, atlas.cell_height);
     let area = layout.area;
@@ -675,12 +675,10 @@ pub fn build_preview_instances(atlas: &FontAtlas, layout: &PreviewLayout, title:
 
     let title_y = area.y + (title_h - ch) / 2.0;
     let total_cols = ((area.w / cw).floor() as usize).saturating_sub(2);
-    // The dismissal hint is pinned right; the name gets whatever's left,
-    // so a long file name can't push it off the edge.
+    // The dismissal hint is pinned right; the note gets whatever's left.
     const HINT: &str = "esc to close";
     let hint_cols = HINT.len() + 2;
-    let head = if subtitle.is_empty() { title.to_string() } else { format!("{title}   {subtitle}") };
-    push_text(&mut instances, atlas, &truncate(&head, total_cols.saturating_sub(hint_cols)), area.x + cw, title_y, CHROME_FG_ACTIVE);
+    push_text(&mut instances, atlas, &truncate(subtitle, total_cols.saturating_sub(hint_cols)), area.x + cw, title_y, CHROME_FG_INACTIVE);
     let hint_x = area.x + area.w - cw * (HINT.len() as f32 + 1.0);
     push_text(&mut instances, atlas, HINT, hint_x, title_y, CHROME_FG_DIM);
 
