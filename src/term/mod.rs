@@ -357,6 +357,11 @@ impl Term {
 
     fn erase_in_line(&mut self, mode: u16) {
         let (cols, cur_row, cur_col) = (self.cols, self.cursor.row, self.cursor.col);
+        // The cursor column is the boundary every mode erases up to or
+        // from, so it's the one that can cut a wide character in half.
+        if mode != 2 {
+            self.clear_wide_pair_at(cur_row, cur_col);
+        }
         let grid = self.active_grid_mut();
         match mode {
             0 => {
@@ -406,6 +411,12 @@ impl Term {
     fn erase_chars(&mut self, n: usize) {
         let (row, col, cols) = (self.cursor.row, self.cursor.col, self.cols);
         let end = (col + n).min(cols);
+        // Erasing part of a wide character has to take the rest with it,
+        // at both ends of the run -- see `clear_wide_pair_at`.
+        self.clear_wide_pair_at(row, col);
+        if end > col {
+            self.clear_wide_pair_at(row, end - 1);
+        }
         let line = self.active_grid_mut().row_mut(row);
         line[col..end].fill(Cell::default());
     }
@@ -434,6 +445,27 @@ impl Term {
         self.carriage_return();
     }
 
+    /// Blank whichever half of a double-width character straddles `col`,
+    /// before something else is written there.
+    ///
+    /// Overwriting one half orphans the other: a `WIDE` cell whose spacer
+    /// is gone still draws two columns wide, on top of whatever replaced
+    /// it, and a stranded `WIDE_SPACER` is skipped when copying, quietly
+    /// swallowing a character. Full-screen apps redraw lines in place
+    /// constantly, so this happens the moment one edits a line with CJK
+    /// in it.
+    fn clear_wide_pair_at(&mut self, row: usize, col: usize) {
+        let cols = self.cols;
+        let grid = self.active_grid_mut();
+        let flags = grid.cell(row, col).flags;
+        if flags.contains(CellFlags::WIDE_SPACER) && col > 0 {
+            *grid.cell_mut(row, col - 1) = Cell::default();
+        }
+        if flags.contains(CellFlags::WIDE) && col + 1 < cols {
+            *grid.cell_mut(row, col + 1) = Cell::default();
+        }
+    }
+
     fn print_char(&mut self, c: char) {
         let width = c.width().unwrap_or(1);
         if width == 0 {
@@ -458,6 +490,13 @@ impl Term {
         }
 
         let (row, col, cols) = (self.cursor.row, self.cursor.col, self.cols);
+        // Both cells this character will occupy have to be freed of any
+        // wide pair they're currently half of, before either is written.
+        self.clear_wide_pair_at(row, col);
+        if width == 2 && col + 1 < cols {
+            self.clear_wide_pair_at(row, col + 1);
+        }
+
         let (fg, bg, flags) = (self.cursor.fg, self.cursor.bg, self.cursor.flags);
         let grid = self.active_grid_mut();
         *grid.cell_mut(row, col) = Cell {
@@ -576,6 +615,60 @@ mod tests {
     /// The visible text of a live row, for edit-sequence assertions.
     fn row_text(term: &Term, row: usize) -> String {
         (0..term.cols()).map(|c| term.grid().cell(row, c).c).collect()
+    }
+
+    #[test]
+    fn overwriting_half_of_a_wide_character_clears_the_other_half() {
+        // What vim does constantly: redraw a line in place, landing a
+        // narrow character on one half of a double-width one. The
+        // orphaned half kept its WIDE flag and went on drawing two
+        // columns wide, over whatever replaced it.
+        let mut term = Term::new(10, 2, 100);
+        term.advance("日x".as_bytes());
+        assert!(term.grid().cell(0, 0).flags.contains(CellFlags::WIDE));
+        assert!(term.grid().cell(0, 1).flags.contains(CellFlags::WIDE_SPACER));
+
+        // Land on the right half.
+        term.advance(b"\x1b[1;2H");
+        term.advance(b"a");
+        assert_eq!(term.grid().cell(0, 1).c, 'a');
+        assert!(!term.grid().cell(0, 0).flags.contains(CellFlags::WIDE), "the left half still claims to be wide");
+        assert_eq!(term.grid().cell(0, 0).c, ' ', "and still draws its glyph");
+    }
+
+    #[test]
+    fn overwriting_the_left_half_clears_the_orphaned_spacer() {
+        let mut term = Term::new(10, 2, 100);
+        term.advance("日".as_bytes());
+        term.advance(b"\x1b[1;1H");
+        term.advance(b"a");
+        assert_eq!(term.grid().cell(0, 0).c, 'a');
+        assert!(
+            !term.grid().cell(0, 1).flags.contains(CellFlags::WIDE_SPACER),
+            "a stranded spacer is skipped when copying, swallowing a real character"
+        );
+    }
+
+    #[test]
+    fn a_wide_character_replacing_another_clears_both_neighbours() {
+        let mut term = Term::new(10, 2, 100);
+        term.advance("日本".as_bytes()); // cols 0-1 and 2-3
+        // Write a wide char straddling the two pairs.
+        term.advance(b"\x1b[1;2H");
+        term.advance("語".as_bytes()); // takes cols 1-2
+        assert!(!term.grid().cell(0, 0).flags.contains(CellFlags::WIDE));
+        assert!(term.grid().cell(0, 1).flags.contains(CellFlags::WIDE));
+        assert!(term.grid().cell(0, 2).flags.contains(CellFlags::WIDE_SPACER));
+        assert!(!term.grid().cell(0, 3).flags.contains(CellFlags::WIDE_SPACER), "the old pair's spacer is orphaned");
+    }
+
+    #[test]
+    fn erasing_half_a_wide_character_clears_the_whole_pair() {
+        let mut term = Term::new(10, 2, 100);
+        term.advance("あい".as_bytes());
+        // ECH one cell at the spacer of the first pair.
+        term.advance(b"\x1b[1;2H\x1b[1X");
+        assert!(!term.grid().cell(0, 0).flags.contains(CellFlags::WIDE));
     }
 
     #[test]

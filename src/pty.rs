@@ -61,6 +61,58 @@ pub fn tty_name(master: BorrowedFd) -> Option<String> {
 /// deadlock window is vanishingly small -- but if a new tab ever hangs
 /// before exec, this is the place to suspect (the fix would be
 /// `posix_spawn` plus manual pty plumbing).
+/// A UTF-8 locale to hand the shell, or `None` when the environment
+/// already specifies one (in which case the user's choice wins).
+///
+/// Resolved once and cached: it shells out, which must happen in the
+/// parent -- between `fork` and `exec` only async-signal-safe calls are
+/// allowed, and spawning a process is emphatically not one.
+fn utf8_locale() -> Option<&'static str> {
+    static LOCALE: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    LOCALE.get_or_init(resolve_utf8_locale).as_deref()
+}
+
+fn resolve_utf8_locale() -> Option<String> {
+    // Anything already set is the user's decision -- a login shell's
+    // profile may well set it, and overriding that would be worse than
+    // the problem being fixed.
+    for var in ["LC_ALL", "LC_CTYPE", "LANG"] {
+        if std::env::var_os(var).is_some_and(|v| !v.is_empty()) {
+            return None;
+        }
+    }
+
+    // macOS keeps the user's region here rather than in the environment;
+    // it looks like "ja_JP" or "en_US@calendar=gregorian".
+    let region = std::process::Command::new("defaults")
+        .args(["read", "-g", "AppleLocale"])
+        .output()
+        .ok()
+        .filter(|out| out.status.success())
+        .and_then(|out| String::from_utf8(out.stdout).ok())
+        .map(|s| s.trim().split('@').next().unwrap_or_default().to_string())
+        .filter(|s| !s.is_empty());
+
+    let candidate = region.map(|r| format!("{r}.UTF-8"));
+    // A locale the system doesn't actually have makes things worse, not
+    // better: setlocale fails and half the toolchain warns about it on
+    // every command. `en_US.UTF-8` is present on every macOS install.
+    match candidate {
+        Some(locale) if locale_exists(&locale) => Some(locale),
+        _ => Some("en_US.UTF-8".to_string()),
+    }
+}
+
+fn locale_exists(locale: &str) -> bool {
+    std::process::Command::new("locale")
+        .arg("-a")
+        .output()
+        .ok()
+        .filter(|out| out.status.success())
+        .and_then(|out| String::from_utf8(out.stdout).ok())
+        .is_some_and(|list| list.lines().any(|line| line.eq_ignore_ascii_case(locale)))
+}
+
 pub fn spawn_shell(shell: &ShellConfig) -> PtyHandle {
     let shell_path = shell
         .command
@@ -78,6 +130,12 @@ pub fn spawn_shell(shell: &ShellConfig) -> PtyHandle {
         argv.push(CString::new(arg.as_str()).expect("shell arg contains a NUL byte"));
     }
 
+    // Resolve the locale *before* forking so the child's lookup is a
+    // cached read. Left to the child, the first call would run
+    // subprocesses between fork and exec, which is exactly the
+    // async-signal-safety violation this file is otherwise careful about.
+    let _ = utf8_locale();
+
     match unsafe { forkpty(None, None) }.expect("forkpty failed") {
         ForkptyResult::Child => {
             // Force a known-good TERM regardless of whatever the parent
@@ -90,6 +148,19 @@ pub fn spawn_shell(shell: &ShellConfig) -> PtyHandle {
             // Safety: single-threaded child right after fork, before
             // execvp -- same invariant the rest of this function relies on.
             unsafe { std::env::set_var("TERM", "xterm-256color") };
+            // Same problem, different variable: a GUI-launched app
+            // inherits launchd's environment, which has no locale at
+            // all. Programs that decide their character encoding from
+            // the locale then fall back to latin1 -- vim opens a UTF-8
+            // file as one character per *byte*, so Japanese shows as
+            // mojibake and editing it corrupts it. Every terminal
+            // emulator on this platform sets a locale for this reason.
+            // Resolved in the parent (see `utf8_locale`), because
+            // resolving it here would mean running subprocesses between
+            // fork and exec.
+            if let Some(locale) = utf8_locale() {
+                unsafe { std::env::set_var("LANG", locale) };
+            }
             // Start in $HOME rather than whatever cwd this process
             // inherited. Unlike a shell launching a child, there's no
             // meaningful directory to inherit here -- a GUI app launched
