@@ -41,6 +41,24 @@ impl Selection {
         if a_reads_first { (a, b) } else { (b, a) }
     }
 
+    /// Follow `delta` lines of new output scrolling into scrollback.
+    ///
+    /// Both endpoints are distances from the live bottom, so pushing
+    /// lines into scrollback moves the selected text the same distance
+    /// further back -- shifting by `delta` keeps the highlight on the
+    /// text the user actually picked instead of on whatever slid into
+    /// its place. `reachable` is how far back the buffer still goes
+    /// (scrollback plus the live screen); past that the text is gone for
+    /// good and so is the selection.
+    pub fn follow_scrollback(self, delta: usize, reachable: usize) -> Option<Selection> {
+        let shifted = Selection {
+            anchor: GridPoint { distance: self.anchor.distance + delta, col: self.anchor.col },
+            cursor: GridPoint { distance: self.cursor.distance + delta, col: self.cursor.col },
+        };
+        let lost = shifted.anchor.distance >= reachable || shifted.cursor.distance >= reachable;
+        (!lost).then_some(shifted)
+    }
+
     /// If `distance` (see `Grid::distance_from_bottom`) is one of this
     /// selection's lines, the inclusive `(from_col, to_col)` range
     /// highlighted on it -- the renderer's cue for which cells to tint.
@@ -762,6 +780,34 @@ mod tests {
 
     fn selection(anchor: (usize, usize), cursor: (usize, usize)) -> Selection {
         Selection { anchor: point(anchor), cursor: point(cursor) }
+    }
+
+    #[test]
+    fn a_selection_follows_text_into_scrollback() {
+        let sel = selection((2, 1), (0, 5));
+        let moved = sel.follow_scrollback(3, 100).expect("still in the buffer");
+        assert_eq!((moved.anchor.distance, moved.anchor.col), (5, 1));
+        assert_eq!((moved.cursor.distance, moved.cursor.col), (3, 5));
+    }
+
+    #[test]
+    fn a_selection_that_scrolled_out_of_the_buffer_is_dropped() {
+        // Shifting it past what the buffer still holds means the text is
+        // gone; a highlight over rows that no longer exist would extract
+        // nothing (or someone else's text).
+        let sel = selection((8, 0), (7, 4));
+        assert!(sel.follow_scrollback(2, 10).is_none());
+        assert!(sel.follow_scrollback(1, 10).is_some());
+    }
+
+    #[test]
+    fn a_selection_stands_still_when_nothing_scrolled() {
+        // Output that doesn't push anything into scrollback -- a
+        // full-screen app repainting -- must leave the highlight alone.
+        let sel = selection((3, 2), (1, 6));
+        let moved = sel.follow_scrollback(0, 50).expect("nothing was lost");
+        assert_eq!((moved.anchor.distance, moved.anchor.col), (3, 2));
+        assert_eq!((moved.cursor.distance, moved.cursor.col), (1, 6));
     }
 
     #[test]

@@ -1505,12 +1505,27 @@ impl ApplicationHandler<UserEvent> for App {
                 if !responses.is_empty() {
                     write_all_to_pty(pane.pty_master.as_fd(), &responses);
                 }
-                if was_alt || pane.term.using_alt_screen() {
-                    // Full-screen apps redraw arbitrarily; there's no
-                    // stable content for a scroll position or selection
-                    // to stay anchored to.
-                    pane.scroll_offset = 0;
+                // Switching screens replaces everything on it, so a
+                // selection made against the old one means nothing now.
+                // Repainting *within* a screen is a different matter --
+                // see below.
+                if was_alt != pane.term.using_alt_screen() {
                     pane.selection = None;
+                }
+                if pane.term.using_alt_screen() {
+                    // The alternate screen keeps no scrollback, so the
+                    // view is always at the bottom of it.
+                    pane.scroll_offset = 0;
+                    // The selection deliberately survives everything
+                    // else. Dropping it on any output at all made
+                    // mouse-selecting inside vim or less impossible:
+                    // those apps repaint after every keystroke -- and
+                    // even once on their own, a second after starting --
+                    // so the highlight vanished before Cmd+C could be
+                    // pressed. A full-screen app repainting is not the
+                    // user changing their mind about what they
+                    // highlighted; every other terminal keeps it until
+                    // the next click.
                 } else {
                     // New output pushes lines into scrollback, moving all
                     // existing content further from the live bottom. Both
@@ -1526,16 +1541,8 @@ impl ApplicationHandler<UserEvent> for App {
                     if pane.scroll_offset > 0 {
                         pane.scroll_offset = (pane.scroll_offset + delta).min(scrollback);
                     }
-                    if let Some(selection) = &mut pane.selection {
-                        selection.anchor.distance += delta;
-                        selection.cursor.distance += delta;
-                        // Drop it once the text it covered has fallen out
-                        // of scrollback entirely.
-                        let reachable = scrollback + pane.term.rows();
-                        if selection.anchor.distance >= reachable || selection.cursor.distance >= reachable {
-                            pane.selection = None;
-                        }
-                    }
+                    let reachable = scrollback + pane.term.rows();
+                    pane.selection = pane.selection.and_then(|s| s.follow_scrollback(delta, reachable));
                 }
                 // Unlike selection, a search stays open across new
                 // output -- just refreshed against it (see the field doc
