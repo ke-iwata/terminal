@@ -3338,7 +3338,7 @@ dependencies = [
 
 [[package]]
 name = "terminal"
-version = "0.0.8"
+version = "0.0.9"
 dependencies = [
  "bitflags 2.13.0",
  "bytemuck",
