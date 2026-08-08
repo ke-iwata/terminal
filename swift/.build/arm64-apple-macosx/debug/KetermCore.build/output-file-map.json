@@ -1,0 +1,40 @@
+{
+  "": {
+    "swift-dependencies": "/Users/kentaro/workspace/claude/terminal/swift/.build/arm64-apple-macosx/debug/KetermCore.build/primary.swiftdeps"
+  },
+  "/Users/kentaro/workspace/claude/terminal/swift/Sources/KetermCore/Cell.swift": {
+    "dependencies": "/Users/kentaro/workspace/claude/terminal/swift/.build/arm64-apple-macosx/debug/KetermCore.build/Cell.d",
+    "object": "/Users/kentaro/workspace/claude/terminal/swift/.build/arm64-apple-macosx/debug/KetermCore.build/Cell.swift.o",
+    "swiftmodule": "/Users/kentaro/workspace/claude/terminal/swift/.build/arm64-apple-macosx/debug/KetermCore.build/Cell~partial.swiftmodule",
+    "swift-dependencies": "/Users/kentaro/workspace/claude/terminal/swift/.build/arm64-apple-macosx/debug/KetermCore.build/Cell.swiftdeps",
+    "diagnostics": "/Users/kentaro/workspace/claude/terminal/swift/.build/arm64-apple-macosx/debug/KetermCore.build/Cell.dia"
+  },
+  "/Users/kentaro/workspace/claude/terminal/swift/Sources/KetermCore/Grid.swift": {
+    "dependencies": "/Users/kentaro/workspace/claude/terminal/swift/.build/arm64-apple-macosx/debug/KetermCore.build/Grid.d",
+    "object": "/Users/kentaro/workspace/claude/terminal/swift/.build/arm64-apple-macosx/debug/KetermCore.build/Grid.swift.o",
+    "swiftmodule": "/Users/kentaro/workspace/claude/terminal/swift/.build/arm64-apple-macosx/debug/KetermCore.build/Grid~partial.swiftmodule",
+    "swift-dependencies": "/Users/kentaro/workspace/claude/terminal/swift/.build/arm64-apple-macosx/debug/KetermCore.build/Grid.swiftdeps",
+    "diagnostics": "/Users/kentaro/workspace/claude/terminal/swift/.build/arm64-apple-macosx/debug/KetermCore.build/Grid.dia"
+  },
+  "/Users/kentaro/workspace/claude/terminal/swift/Sources/KetermCore/Parser.swift": {
+    "dependencies": "/Users/kentaro/workspace/claude/terminal/swift/.build/arm64-apple-macosx/debug/KetermCore.build/Parser.d",
+    "object": "/Users/kentaro/workspace/claude/terminal/swift/.build/arm64-apple-macosx/debug/KetermCore.build/Parser.swift.o",
+    "swiftmodule": "/Users/kentaro/workspace/claude/terminal/swift/.build/arm64-apple-macosx/debug/KetermCore.build/Parser~partial.swiftmodule",
+    "swift-dependencies": "/Users/kentaro/workspace/claude/terminal/swift/.build/arm64-apple-macosx/debug/KetermCore.build/Parser.swiftdeps",
+    "diagnostics": "/Users/kentaro/workspace/claude/terminal/swift/.build/arm64-apple-macosx/debug/KetermCore.build/Parser.dia"
+  },
+  "/Users/kentaro/workspace/claude/terminal/swift/Sources/KetermCore/Terminal.swift": {
+    "dependencies": "/Users/kentaro/workspace/claude/terminal/swift/.build/arm64-apple-macosx/debug/KetermCore.build/Terminal.d",
+    "object": "/Users/kentaro/workspace/claude/terminal/swift/.build/arm64-apple-macosx/debug/KetermCore.build/Terminal.swift.o",
+    "swiftmodule": "/Users/kentaro/workspace/claude/terminal/swift/.build/arm64-apple-macosx/debug/KetermCore.build/Terminal~partial.swiftmodule",
+    "swift-dependencies": "/Users/kentaro/workspace/claude/terminal/swift/.build/arm64-apple-macosx/debug/KetermCore.build/Terminal.swiftdeps",
+    "diagnostics": "/Users/kentaro/workspace/claude/terminal/swift/.build/arm64-apple-macosx/debug/KetermCore.build/Terminal.dia"
+  },
+  "/Users/kentaro/workspace/claude/terminal/swift/Sources/KetermCore/Width.swift": {
+    "dependencies": "/Users/kentaro/workspace/claude/terminal/swift/.build/arm64-apple-macosx/debug/KetermCore.build/Width.d",
+    "object": "/Users/kentaro/workspace/claude/terminal/swift/.build/arm64-apple-macosx/debug/KetermCore.build/Width.swift.o",
+    "swiftmodule": "/Users/kentaro/workspace/claude/terminal/swift/.build/arm64-apple-macosx/debug/KetermCore.build/Width~partial.swiftmodule",
+    "swift-dependencies": "/Users/kentaro/workspace/claude/terminal/swift/.build/arm64-apple-macosx/debug/KetermCore.build/Width.swiftdeps",
+    "diagnostics": "/Users/kentaro/workspace/claude/terminal/swift/.build/arm64-apple-macosx/debug/KetermCore.build/Width.dia"
+  }
+}

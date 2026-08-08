@@ -1,0 +1,3 @@
+module ketermPackageTests {
+    header "/Users/kentaro/workspace/claude/terminal/swift/.build/arm64-apple-macosx/debug/ketermPackageTests.build/include/ketermPackageTests-Swift.h"
+}

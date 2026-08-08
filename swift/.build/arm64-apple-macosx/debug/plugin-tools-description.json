@@ -1,0 +1,898 @@
+{
+  "builtTestProducts" : [
+    {
+      "binaryPath" : "/Users/kentaro/workspace/claude/terminal/swift/.build/arm64-apple-macosx/debug/ketermPackageTests.xctest/Contents/MacOS/ketermPackageTests",
+      "packagePath" : "/Users/kentaro/workspace/claude/terminal/swift",
+      "productName" : "ketermPackageTests"
+    }
+  ],
+  "copyCommands" : {
+
+  },
+  "explicitTargetDependencyImportCheckingMode" : {
+    "none" : {
+
+    }
+  },
+  "generatedSourceTargetSet" : [
+
+  ],
+  "pluginDescriptions" : [
+
+  ],
+  "swiftCommands" : {
+    "C.KetermCore-arm64-apple-macosx-debug.module" : {
+      "executable" : "/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/swiftc",
+      "fileList" : "/Users/kentaro/workspace/claude/terminal/swift/.build/arm64-apple-macosx/debug/KetermCore.build/sources",
+      "importPath" : "/Users/kentaro/workspace/claude/terminal/swift/.build/arm64-apple-macosx/debug/Modules",
+      "inputs" : [
+        {
+          "kind" : "file",
+          "name" : "/Users/kentaro/workspace/claude/terminal/swift/Sources/KetermCore/Cell.swift"
+        },
+        {
+          "kind" : "file",
+          "name" : "/Users/kentaro/workspace/claude/terminal/swift/Sources/KetermCore/Grid.swift"
+        },
+        {
+          "kind" : "file",
+          "name" : "/Users/kentaro/workspace/claude/terminal/swift/Sources/KetermCore/Parser.swift"
+        },
+        {
+          "kind" : "file",
+          "name" : "/Users/kentaro/workspace/claude/terminal/swift/Sources/KetermCore/Terminal.swift"
+        },
+        {
+          "kind" : "file",
+          "name" : "/Users/kentaro/workspace/claude/terminal/swift/Sources/KetermCore/Width.swift"
+        },
+        {
+          "kind" : "file",
+          "name" : "/Users/kentaro/workspace/claude/terminal/swift/.build/arm64-apple-macosx/debug/swift-version--58304C5D6DBC2206.txt"
+        },
+        {
+          "kind" : "file",
+          "name" : "/Users/kentaro/workspace/claude/terminal/swift/.build/arm64-apple-macosx/debug/KetermCore.build/sources"
+        }
+      ],
+      "isLibrary" : true,
+      "moduleName" : "KetermCore",
+      "moduleOutputPath" : "/Users/kentaro/workspace/claude/terminal/swift/.build/arm64-apple-macosx/debug/Modules/KetermCore.swiftmodule",
+      "objects" : [
+        "/Users/kentaro/workspace/claude/terminal/swift/.build/arm64-apple-macosx/debug/KetermCore.build/Cell.swift.o",
+        "/Users/kentaro/workspace/claude/terminal/swift/.build/arm64-apple-macosx/debug/KetermCore.build/Grid.swift.o",
+        "/Users/kentaro/workspace/claude/terminal/swift/.build/arm64-apple-macosx/debug/KetermCore.build/Parser.swift.o",
+        "/Users/kentaro/workspace/claude/terminal/swift/.build/arm64-apple-macosx/debug/KetermCore.build/Terminal.swift.o",
+        "/Users/kentaro/workspace/claude/terminal/swift/.build/arm64-apple-macosx/debug/KetermCore.build/Width.swift.o"
+      ],
+      "otherArguments" : [
+        "-target",
+        "arm64-apple-macosx14.0",
+        "-incremental",
+        "-enable-batch-mode",
+        "-serialize-diagnostics",
+        "-index-store-path",
+        "/Users/kentaro/workspace/claude/terminal/swift/.build/arm64-apple-macosx/debug/index/store",
+        "-Onone",
+        "-enable-testing",
+        "-j10",
+        "-DSWIFT_PACKAGE",
+        "-DDEBUG",
+        "-DSWIFT_MODULE_RESOURCE_BUNDLE_UNAVAILABLE",
+        "-module-cache-path",
+        "/Users/kentaro/workspace/claude/terminal/swift/.build/arm64-apple-macosx/debug/ModuleCache",
+        "-parseable-output",
+        "-parse-as-library",
+        "-emit-objc-header",
+        "-emit-objc-header-path",
+        "/Users/kentaro/workspace/claude/terminal/swift/.build/arm64-apple-macosx/debug/KetermCore.build/include/KetermCore-Swift.h",
+        "-swift-version",
+        "6",
+        "-plugin-path",
+        "/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/lib/swift/host/plugins/testing",
+        "-sdk",
+        "/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX26.5.sdk",
+        "-F",
+        "/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/Library/Frameworks",
+        "-I",
+        "/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/usr/lib",
+        "-L",
+        "/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/usr/lib",
+        "-g",
+        "-Xcc",
+        "-isysroot",
+        "-Xcc",
+        "/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX26.5.sdk",
+        "-Xcc",
+        "-F",
+        "-Xcc",
+        "/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/Library/Frameworks",
+        "-Xcc",
+        "-fPIC",
+        "-Xcc",
+        "-g",
+        "-package-name",
+        "swift"
+      ],
+      "outputFileMapPath" : "/Users/kentaro/workspace/claude/terminal/swift/.build/arm64-apple-macosx/debug/KetermCore.build/output-file-map.json",
+      "outputs" : [
+        {
+          "kind" : "file",
+          "name" : "/Users/kentaro/workspace/claude/terminal/swift/.build/arm64-apple-macosx/debug/KetermCore.build/Cell.swift.o"
+        },
+        {
+          "kind" : "file",
+          "name" : "/Users/kentaro/workspace/claude/terminal/swift/.build/arm64-apple-macosx/debug/KetermCore.build/Grid.swift.o"
+        },
+        {
+          "kind" : "file",
+          "name" : "/Users/kentaro/workspace/claude/terminal/swift/.build/arm64-apple-macosx/debug/KetermCore.build/Parser.swift.o"
+        },
+        {
+          "kind" : "file",
+          "name" : "/Users/kentaro/workspace/claude/terminal/swift/.build/arm64-apple-macosx/debug/KetermCore.build/Terminal.swift.o"
+        },
+        {
+          "kind" : "file",
+          "name" : "/Users/kentaro/workspace/claude/terminal/swift/.build/arm64-apple-macosx/debug/KetermCore.build/Width.swift.o"
+        },
+        {
+          "kind" : "file",
+          "name" : "/Users/kentaro/workspace/claude/terminal/swift/.build/arm64-apple-macosx/debug/Modules/KetermCore.swiftmodule"
+        }
+      ],
+      "prepareForIndexing" : false,
+      "sources" : [
+        "/Users/kentaro/workspace/claude/terminal/swift/Sources/KetermCore/Cell.swift",
+        "/Users/kentaro/workspace/claude/terminal/swift/Sources/KetermCore/Grid.swift",
+        "/Users/kentaro/workspace/claude/terminal/swift/Sources/KetermCore/Parser.swift",
+        "/Users/kentaro/workspace/claude/terminal/swift/Sources/KetermCore/Terminal.swift",
+        "/Users/kentaro/workspace/claude/terminal/swift/Sources/KetermCore/Width.swift"
+      ],
+      "tempsPath" : "/Users/kentaro/workspace/claude/terminal/swift/.build/arm64-apple-macosx/debug/KetermCore.build",
+      "wholeModuleOptimization" : false
+    },
+    "C.KetermCoreTests-arm64-apple-macosx-debug.module" : {
+      "executable" : "/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/swiftc",
+      "fileList" : "/Users/kentaro/workspace/claude/terminal/swift/.build/arm64-apple-macosx/debug/KetermCoreTests.build/sources",
+      "importPath" : "/Users/kentaro/workspace/claude/terminal/swift/.build/arm64-apple-macosx/debug/Modules",
+      "inputs" : [
+        {
+          "kind" : "file",
+          "name" : "/Users/kentaro/workspace/claude/terminal/swift/Tests/KetermCoreTests/TerminalTests.swift"
+        },
+        {
+          "kind" : "file",
+          "name" : "/Users/kentaro/workspace/claude/terminal/swift/.build/arm64-apple-macosx/debug/swift-version--58304C5D6DBC2206.txt"
+        },
+        {
+          "kind" : "file",
+          "name" : "/Users/kentaro/workspace/claude/terminal/swift/.build/arm64-apple-macosx/debug/Modules/KetermCore.swiftmodule"
+        },
+        {
+          "kind" : "file",
+          "name" : "/Users/kentaro/workspace/claude/terminal/swift/.build/arm64-apple-macosx/debug/KetermCoreTests.build/sources"
+        }
+      ],
+      "isLibrary" : true,
+      "moduleName" : "KetermCoreTests",
+      "moduleOutputPath" : "/Users/kentaro/workspace/claude/terminal/swift/.build/arm64-apple-macosx/debug/Modules/KetermCoreTests.swiftmodule",
+      "objects" : [
+        "/Users/kentaro/workspace/claude/terminal/swift/.build/arm64-apple-macosx/debug/KetermCoreTests.build/TerminalTests.swift.o"
+      ],
+      "otherArguments" : [
+        "-target",
+        "arm64-apple-macosx14.0",
+        "-incremental",
+        "-enable-batch-mode",
+        "-serialize-diagnostics",
+        "-index-store-path",
+        "/Users/kentaro/workspace/claude/terminal/swift/.build/arm64-apple-macosx/debug/index/store",
+        "-Onone",
+        "-enable-testing",
+        "-Xfrontend",
+        "-enable-cross-import-overlays",
+        "-j10",
+        "-DSWIFT_PACKAGE",
+        "-DDEBUG",
+        "-DSWIFT_MODULE_RESOURCE_BUNDLE_UNAVAILABLE",
+        "-module-cache-path",
+        "/Users/kentaro/workspace/claude/terminal/swift/.build/arm64-apple-macosx/debug/ModuleCache",
+        "-parseable-output",
+        "-parse-as-library",
+        "-swift-version",
+        "6",
+        "-plugin-path",
+        "/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/lib/swift/host/plugins/testing",
+        "-sdk",
+        "/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX26.5.sdk",
+        "-F",
+        "/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/Library/Frameworks",
+        "-I",
+        "/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/usr/lib",
+        "-L",
+        "/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/usr/lib",
+        "-g",
+        "-Xcc",
+        "-isysroot",
+        "-Xcc",
+        "/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX26.5.sdk",
+        "-Xcc",
+        "-F",
+        "-Xcc",
+        "/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/Library/Frameworks",
+        "-Xcc",
+        "-fPIC",
+        "-Xcc",
+        "-g",
+        "-package-name",
+        "swift"
+      ],
+      "outputFileMapPath" : "/Users/kentaro/workspace/claude/terminal/swift/.build/arm64-apple-macosx/debug/KetermCoreTests.build/output-file-map.json",
+      "outputs" : [
+        {
+          "kind" : "file",
+          "name" : "/Users/kentaro/workspace/claude/terminal/swift/.build/arm64-apple-macosx/debug/KetermCoreTests.build/TerminalTests.swift.o"
+        },
+        {
+          "kind" : "file",
+          "name" : "/Users/kentaro/workspace/claude/terminal/swift/.build/arm64-apple-macosx/debug/Modules/KetermCoreTests.swiftmodule"
+        }
+      ],
+      "prepareForIndexing" : false,
+      "sources" : [
+        "/Users/kentaro/workspace/claude/terminal/swift/Tests/KetermCoreTests/TerminalTests.swift"
+      ],
+      "tempsPath" : "/Users/kentaro/workspace/claude/terminal/swift/.build/arm64-apple-macosx/debug/KetermCoreTests.build",
+      "wholeModuleOptimization" : false
+    },
+    "C.keterm-arm64-apple-macosx-debug.module" : {
+      "executable" : "/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/swiftc",
+      "fileList" : "/Users/kentaro/workspace/claude/terminal/swift/.build/arm64-apple-macosx/debug/keterm.build/sources",
+      "importPath" : "/Users/kentaro/workspace/claude/terminal/swift/.build/arm64-apple-macosx/debug/Modules",
+      "inputs" : [
+        {
+          "kind" : "file",
+          "name" : "/Users/kentaro/workspace/claude/terminal/swift/Sources/keterm/main.swift"
+        },
+        {
+          "kind" : "file",
+          "name" : "/Users/kentaro/workspace/claude/terminal/swift/.build/arm64-apple-macosx/debug/swift-version--58304C5D6DBC2206.txt"
+        },
+        {
+          "kind" : "file",
+          "name" : "/Users/kentaro/workspace/claude/terminal/swift/.build/arm64-apple-macosx/debug/Modules/KetermCore.swiftmodule"
+        },
+        {
+          "kind" : "file",
+          "name" : "/Users/kentaro/workspace/claude/terminal/swift/.build/arm64-apple-macosx/debug/keterm.build/sources"
+        }
+      ],
+      "isLibrary" : false,
+      "moduleName" : "keterm",
+      "moduleOutputPath" : "/Users/kentaro/workspace/claude/terminal/swift/.build/arm64-apple-macosx/debug/Modules/keterm.swiftmodule",
+      "objects" : [
+        "/Users/kentaro/workspace/claude/terminal/swift/.build/arm64-apple-macosx/debug/keterm.build/main.swift.o"
+      ],
+      "otherArguments" : [
+        "-target",
+        "arm64-apple-macosx14.0",
+        "-incremental",
+        "-enable-batch-mode",
+        "-serialize-diagnostics",
+        "-index-store-path",
+        "/Users/kentaro/workspace/claude/terminal/swift/.build/arm64-apple-macosx/debug/index/store",
+        "-Onone",
+        "-enable-testing",
+        "-j10",
+        "-DSWIFT_PACKAGE",
+        "-DDEBUG",
+        "-DSWIFT_MODULE_RESOURCE_BUNDLE_UNAVAILABLE",
+        "-module-cache-path",
+        "/Users/kentaro/workspace/claude/terminal/swift/.build/arm64-apple-macosx/debug/ModuleCache",
+        "-parseable-output",
+        "-Xfrontend",
+        "-entry-point-function-name",
+        "-Xfrontend",
+        "keterm_main",
+        "-swift-version",
+        "6",
+        "-plugin-path",
+        "/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/lib/swift/host/plugins/testing",
+        "-sdk",
+        "/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX26.5.sdk",
+        "-F",
+        "/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/Library/Frameworks",
+        "-I",
+        "/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/usr/lib",
+        "-L",
+        "/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/usr/lib",
+        "-g",
+        "-Xcc",
+        "-isysroot",
+        "-Xcc",
+        "/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX26.5.sdk",
+        "-Xcc",
+        "-F",
+        "-Xcc",
+        "/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/Library/Frameworks",
+        "-Xcc",
+        "-fPIC",
+        "-Xcc",
+        "-g",
+        "-package-name",
+        "swift"
+      ],
+      "outputFileMapPath" : "/Users/kentaro/workspace/claude/terminal/swift/.build/arm64-apple-macosx/debug/keterm.build/output-file-map.json",
+      "outputs" : [
+        {
+          "kind" : "file",
+          "name" : "/Users/kentaro/workspace/claude/terminal/swift/.build/arm64-apple-macosx/debug/keterm.build/main.swift.o"
+        },
+        {
+          "kind" : "file",
+          "name" : "/Users/kentaro/workspace/claude/terminal/swift/.build/arm64-apple-macosx/debug/Modules/keterm.swiftmodule"
+        }
+      ],
+      "prepareForIndexing" : false,
+      "sources" : [
+        "/Users/kentaro/workspace/claude/terminal/swift/Sources/keterm/main.swift"
+      ],
+      "tempsPath" : "/Users/kentaro/workspace/claude/terminal/swift/.build/arm64-apple-macosx/debug/keterm.build",
+      "wholeModuleOptimization" : false
+    },
+    "C.ketermPackageTests-arm64-apple-macosx-debug.module" : {
+      "executable" : "/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/swiftc",
+      "fileList" : "/Users/kentaro/workspace/claude/terminal/swift/.build/arm64-apple-macosx/debug/ketermPackageTests.build/sources",
+      "importPath" : "/Users/kentaro/workspace/claude/terminal/swift/.build/arm64-apple-macosx/debug/Modules",
+      "inputs" : [
+        {
+          "kind" : "file",
+          "name" : "/Users/kentaro/workspace/claude/terminal/swift/.build/arm64-apple-macosx/debug/ketermPackageTests.derived/runner.swift"
+        },
+        {
+          "kind" : "file",
+          "name" : "/Users/kentaro/workspace/claude/terminal/swift/.build/arm64-apple-macosx/debug/swift-version--58304C5D6DBC2206.txt"
+        },
+        {
+          "kind" : "file",
+          "name" : "/Users/kentaro/workspace/claude/terminal/swift/.build/arm64-apple-macosx/debug/Modules/KetermCoreTests.swiftmodule"
+        },
+        {
+          "kind" : "file",
+          "name" : "/Users/kentaro/workspace/claude/terminal/swift/.build/arm64-apple-macosx/debug/ketermPackageTests.build/sources"
+        }
+      ],
+      "isLibrary" : true,
+      "moduleName" : "ketermPackageTests",
+      "moduleOutputPath" : "/Users/kentaro/workspace/claude/terminal/swift/.build/arm64-apple-macosx/debug/Modules/ketermPackageTests.swiftmodule",
+      "objects" : [
+        "/Users/kentaro/workspace/claude/terminal/swift/.build/arm64-apple-macosx/debug/ketermPackageTests.build/runner.swift.o"
+      ],
+      "otherArguments" : [
+        "-target",
+        "arm64-apple-macosx14.0",
+        "-incremental",
+        "-enable-batch-mode",
+        "-serialize-diagnostics",
+        "-index-store-path",
+        "/Users/kentaro/workspace/claude/terminal/swift/.build/arm64-apple-macosx/debug/index/store",
+        "-Onone",
+        "-enable-testing",
+        "-Xfrontend",
+        "-enable-cross-import-overlays",
+        "-j10",
+        "-DSWIFT_PACKAGE",
+        "-DDEBUG",
+        "-DSWIFT_MODULE_RESOURCE_BUNDLE_UNAVAILABLE",
+        "-module-cache-path",
+        "/Users/kentaro/workspace/claude/terminal/swift/.build/arm64-apple-macosx/debug/ModuleCache",
+        "-parseable-output",
+        "-parse-as-library",
+        "-emit-objc-header",
+        "-emit-objc-header-path",
+        "/Users/kentaro/workspace/claude/terminal/swift/.build/arm64-apple-macosx/debug/ketermPackageTests.build/include/ketermPackageTests-Swift.h",
+        "-plugin-path",
+        "/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/lib/swift/host/plugins/testing",
+        "-sdk",
+        "/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX26.5.sdk",
+        "-F",
+        "/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/Library/Frameworks",
+        "-I",
+        "/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/usr/lib",
+        "-L",
+        "/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/usr/lib",
+        "-g",
+        "-Xcc",
+        "-isysroot",
+        "-Xcc",
+        "/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX26.5.sdk",
+        "-Xcc",
+        "-F",
+        "-Xcc",
+        "/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/Library/Frameworks",
+        "-Xcc",
+        "-fPIC",
+        "-Xcc",
+        "-g",
+        "-package-name",
+        "swift"
+      ],
+      "outputFileMapPath" : "/Users/kentaro/workspace/claude/terminal/swift/.build/arm64-apple-macosx/debug/ketermPackageTests.build/output-file-map.json",
+      "outputs" : [
+        {
+          "kind" : "file",
+          "name" : "/Users/kentaro/workspace/claude/terminal/swift/.build/arm64-apple-macosx/debug/ketermPackageTests.build/runner.swift.o"
+        },
+        {
+          "kind" : "file",
+          "name" : "/Users/kentaro/workspace/claude/terminal/swift/.build/arm64-apple-macosx/debug/Modules/ketermPackageTests.swiftmodule"
+        }
+      ],
+      "prepareForIndexing" : false,
+      "sources" : [
+        "/Users/kentaro/workspace/claude/terminal/swift/.build/arm64-apple-macosx/debug/ketermPackageTests.derived/runner.swift"
+      ],
+      "tempsPath" : "/Users/kentaro/workspace/claude/terminal/swift/.build/arm64-apple-macosx/debug/ketermPackageTests.build",
+      "wholeModuleOptimization" : false
+    }
+  },
+  "swiftFrontendCommands" : {
+
+  },
+  "swiftTargetScanArgs" : {
+    "KetermCore" : [
+      "/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/swiftc",
+      "-module-name",
+      "KetermCore",
+      "-package-name",
+      "swift",
+      "-c",
+      "/Users/kentaro/workspace/claude/terminal/swift/Sources/KetermCore/Cell.swift",
+      "/Users/kentaro/workspace/claude/terminal/swift/Sources/KetermCore/Grid.swift",
+      "/Users/kentaro/workspace/claude/terminal/swift/Sources/KetermCore/Parser.swift",
+      "/Users/kentaro/workspace/claude/terminal/swift/Sources/KetermCore/Terminal.swift",
+      "/Users/kentaro/workspace/claude/terminal/swift/Sources/KetermCore/Width.swift",
+      "-I",
+      "/Users/kentaro/workspace/claude/terminal/swift/.build/arm64-apple-macosx/debug/Modules",
+      "-target",
+      "arm64-apple-macosx14.0",
+      "-incremental",
+      "-enable-batch-mode",
+      "-serialize-diagnostics",
+      "-index-store-path",
+      "/Users/kentaro/workspace/claude/terminal/swift/.build/arm64-apple-macosx/debug/index/store",
+      "-Onone",
+      "-enable-testing",
+      "-j10",
+      "-DSWIFT_PACKAGE",
+      "-DDEBUG",
+      "-DSWIFT_MODULE_RESOURCE_BUNDLE_UNAVAILABLE",
+      "-module-cache-path",
+      "/Users/kentaro/workspace/claude/terminal/swift/.build/arm64-apple-macosx/debug/ModuleCache",
+      "-parseable-output",
+      "-parse-as-library",
+      "-emit-objc-header",
+      "-emit-objc-header-path",
+      "/Users/kentaro/workspace/claude/terminal/swift/.build/arm64-apple-macosx/debug/KetermCore.build/include/KetermCore-Swift.h",
+      "-swift-version",
+      "6",
+      "-plugin-path",
+      "/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/lib/swift/host/plugins/testing",
+      "-sdk",
+      "/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX26.5.sdk",
+      "-F",
+      "/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/Library/Frameworks",
+      "-I",
+      "/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/usr/lib",
+      "-L",
+      "/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/usr/lib",
+      "-g",
+      "-Xcc",
+      "-isysroot",
+      "-Xcc",
+      "/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX26.5.sdk",
+      "-Xcc",
+      "-F",
+      "-Xcc",
+      "/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/Library/Frameworks",
+      "-Xcc",
+      "-fPIC",
+      "-Xcc",
+      "-g",
+      "-package-name",
+      "swift",
+      "-driver-use-frontend-path",
+      "/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/swiftc"
+    ],
+    "KetermCoreTests" : [
+      "/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/swiftc",
+      "-module-name",
+      "KetermCoreTests",
+      "-package-name",
+      "swift",
+      "-c",
+      "/Users/kentaro/workspace/claude/terminal/swift/Tests/KetermCoreTests/TerminalTests.swift",
+      "-I",
+      "/Users/kentaro/workspace/claude/terminal/swift/.build/arm64-apple-macosx/debug/Modules",
+      "-target",
+      "arm64-apple-macosx14.0",
+      "-incremental",
+      "-enable-batch-mode",
+      "-serialize-diagnostics",
+      "-index-store-path",
+      "/Users/kentaro/workspace/claude/terminal/swift/.build/arm64-apple-macosx/debug/index/store",
+      "-Onone",
+      "-enable-testing",
+      "-Xfrontend",
+      "-enable-cross-import-overlays",
+      "-j10",
+      "-DSWIFT_PACKAGE",
+      "-DDEBUG",
+      "-DSWIFT_MODULE_RESOURCE_BUNDLE_UNAVAILABLE",
+      "-module-cache-path",
+      "/Users/kentaro/workspace/claude/terminal/swift/.build/arm64-apple-macosx/debug/ModuleCache",
+      "-parseable-output",
+      "-parse-as-library",
+      "-swift-version",
+      "6",
+      "-plugin-path",
+      "/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/lib/swift/host/plugins/testing",
+      "-sdk",
+      "/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX26.5.sdk",
+      "-F",
+      "/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/Library/Frameworks",
+      "-I",
+      "/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/usr/lib",
+      "-L",
+      "/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/usr/lib",
+      "-g",
+      "-Xcc",
+      "-isysroot",
+      "-Xcc",
+      "/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX26.5.sdk",
+      "-Xcc",
+      "-F",
+      "-Xcc",
+      "/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/Library/Frameworks",
+      "-Xcc",
+      "-fPIC",
+      "-Xcc",
+      "-g",
+      "-package-name",
+      "swift",
+      "-driver-use-frontend-path",
+      "/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/swiftc"
+    ],
+    "keterm" : [
+      "/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/swiftc",
+      "-module-name",
+      "keterm",
+      "-package-name",
+      "swift",
+      "-c",
+      "/Users/kentaro/workspace/claude/terminal/swift/Sources/keterm/main.swift",
+      "-I",
+      "/Users/kentaro/workspace/claude/terminal/swift/.build/arm64-apple-macosx/debug/Modules",
+      "-target",
+      "arm64-apple-macosx14.0",
+      "-incremental",
+      "-enable-batch-mode",
+      "-serialize-diagnostics",
+      "-index-store-path",
+      "/Users/kentaro/workspace/claude/terminal/swift/.build/arm64-apple-macosx/debug/index/store",
+      "-Onone",
+      "-enable-testing",
+      "-j10",
+      "-DSWIFT_PACKAGE",
+      "-DDEBUG",
+      "-DSWIFT_MODULE_RESOURCE_BUNDLE_UNAVAILABLE",
+      "-module-cache-path",
+      "/Users/kentaro/workspace/claude/terminal/swift/.build/arm64-apple-macosx/debug/ModuleCache",
+      "-parseable-output",
+      "-Xfrontend",
+      "-entry-point-function-name",
+      "-Xfrontend",
+      "keterm_main",
+      "-swift-version",
+      "6",
+      "-plugin-path",
+      "/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/lib/swift/host/plugins/testing",
+      "-sdk",
+      "/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX26.5.sdk",
+      "-F",
+      "/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/Library/Frameworks",
+      "-I",
+      "/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/usr/lib",
+      "-L",
+      "/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/usr/lib",
+      "-g",
+      "-Xcc",
+      "-isysroot",
+      "-Xcc",
+      "/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX26.5.sdk",
+      "-Xcc",
+      "-F",
+      "-Xcc",
+      "/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/Library/Frameworks",
+      "-Xcc",
+      "-fPIC",
+      "-Xcc",
+      "-g",
+      "-package-name",
+      "swift",
+      "-driver-use-frontend-path",
+      "/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/swiftc"
+    ],
+    "ketermPackageTests" : [
+      "/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/swiftc",
+      "-module-name",
+      "ketermPackageTests",
+      "-package-name",
+      "swift",
+      "-c",
+      "/Users/kentaro/workspace/claude/terminal/swift/.build/arm64-apple-macosx/debug/ketermPackageTests.derived/runner.swift",
+      "-I",
+      "/Users/kentaro/workspace/claude/terminal/swift/.build/arm64-apple-macosx/debug/Modules",
+      "-target",
+      "arm64-apple-macosx14.0",
+      "-incremental",
+      "-enable-batch-mode",
+      "-serialize-diagnostics",
+      "-index-store-path",
+      "/Users/kentaro/workspace/claude/terminal/swift/.build/arm64-apple-macosx/debug/index/store",
+      "-Onone",
+      "-enable-testing",
+      "-Xfrontend",
+      "-enable-cross-import-overlays",
+      "-j10",
+      "-DSWIFT_PACKAGE",
+      "-DDEBUG",
+      "-DSWIFT_MODULE_RESOURCE_BUNDLE_UNAVAILABLE",
+      "-module-cache-path",
+      "/Users/kentaro/workspace/claude/terminal/swift/.build/arm64-apple-macosx/debug/ModuleCache",
+      "-parseable-output",
+      "-parse-as-library",
+      "-emit-objc-header",
+      "-emit-objc-header-path",
+      "/Users/kentaro/workspace/claude/terminal/swift/.build/arm64-apple-macosx/debug/ketermPackageTests.build/include/ketermPackageTests-Swift.h",
+      "-plugin-path",
+      "/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/lib/swift/host/plugins/testing",
+      "-sdk",
+      "/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX26.5.sdk",
+      "-F",
+      "/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/Library/Frameworks",
+      "-I",
+      "/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/usr/lib",
+      "-L",
+      "/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/usr/lib",
+      "-g",
+      "-Xcc",
+      "-isysroot",
+      "-Xcc",
+      "/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX26.5.sdk",
+      "-Xcc",
+      "-F",
+      "-Xcc",
+      "/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/Library/Frameworks",
+      "-Xcc",
+      "-fPIC",
+      "-Xcc",
+      "-g",
+      "-package-name",
+      "swift",
+      "-driver-use-frontend-path",
+      "/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/swiftc"
+    ]
+  },
+  "targetDependencyMap" : {
+    "KetermCore" : [
+
+    ],
+    "KetermCoreTests" : [
+      "KetermCore"
+    ],
+    "keterm" : [
+      "KetermCore"
+    ],
+    "ketermPackageTests" : [
+      "KetermCoreTests",
+      "KetermCore"
+    ]
+  },
+  "testDiscoveryCommands" : {
+
+  },
+  "testEntryPointCommands" : {
+    "/Users/kentaro/workspace/claude/terminal/swift/.build/arm64-apple-macosx/debug/ketermPackageTests.derived/runner.swift" : {
+      "inputs" : [
+
+      ],
+      "outputs" : [
+        {
+          "kind" : "file",
+          "name" : "/Users/kentaro/workspace/claude/terminal/swift/.build/arm64-apple-macosx/debug/ketermPackageTests.derived/runner.swift"
+        }
+      ]
+    }
+  },
+  "traitConfiguration" : {
+    "default" : {
+
+    }
+  },
+  "writeCommands" : {
+    "/Users/kentaro/workspace/claude/terminal/swift/.build/arm64-apple-macosx/debug/KetermCore.build/sources" : {
+      "alwaysOutOfDate" : false,
+      "inputs" : [
+        {
+          "kind" : "virtual",
+          "name" : "<sources-file-list>"
+        },
+        {
+          "kind" : "file",
+          "name" : "/Users/kentaro/workspace/claude/terminal/swift/Sources/KetermCore/Cell.swift"
+        },
+        {
+          "kind" : "file",
+          "name" : "/Users/kentaro/workspace/claude/terminal/swift/Sources/KetermCore/Grid.swift"
+        },
+        {
+          "kind" : "file",
+          "name" : "/Users/kentaro/workspace/claude/terminal/swift/Sources/KetermCore/Parser.swift"
+        },
+        {
+          "kind" : "file",
+          "name" : "/Users/kentaro/workspace/claude/terminal/swift/Sources/KetermCore/Terminal.swift"
+        },
+        {
+          "kind" : "file",
+          "name" : "/Users/kentaro/workspace/claude/terminal/swift/Sources/KetermCore/Width.swift"
+        }
+      ],
+      "outputFilePath" : "/Users/kentaro/workspace/claude/terminal/swift/.build/arm64-apple-macosx/debug/KetermCore.build/sources"
+    },
+    "/Users/kentaro/workspace/claude/terminal/swift/.build/arm64-apple-macosx/debug/KetermCoreTests.build/sources" : {
+      "alwaysOutOfDate" : false,
+      "inputs" : [
+        {
+          "kind" : "virtual",
+          "name" : "<sources-file-list>"
+        },
+        {
+          "kind" : "file",
+          "name" : "/Users/kentaro/workspace/claude/terminal/swift/Tests/KetermCoreTests/TerminalTests.swift"
+        }
+      ],
+      "outputFilePath" : "/Users/kentaro/workspace/claude/terminal/swift/.build/arm64-apple-macosx/debug/KetermCoreTests.build/sources"
+    },
+    "/Users/kentaro/workspace/claude/terminal/swift/.build/arm64-apple-macosx/debug/keterm-entitlement.plist" : {
+      "alwaysOutOfDate" : false,
+      "inputs" : [
+        {
+          "kind" : "virtual",
+          "name" : "<entitlement-plist>"
+        },
+        {
+          "kind" : "virtual",
+          "name" : "<com.apple.security.get-task-allow>"
+        }
+      ],
+      "outputFilePath" : "/Users/kentaro/workspace/claude/terminal/swift/.build/arm64-apple-macosx/debug/keterm-entitlement.plist"
+    },
+    "/Users/kentaro/workspace/claude/terminal/swift/.build/arm64-apple-macosx/debug/keterm.build/sources" : {
+      "alwaysOutOfDate" : false,
+      "inputs" : [
+        {
+          "kind" : "virtual",
+          "name" : "<sources-file-list>"
+        },
+        {
+          "kind" : "file",
+          "name" : "/Users/kentaro/workspace/claude/terminal/swift/Sources/keterm/main.swift"
+        }
+      ],
+      "outputFilePath" : "/Users/kentaro/workspace/claude/terminal/swift/.build/arm64-apple-macosx/debug/keterm.build/sources"
+    },
+    "/Users/kentaro/workspace/claude/terminal/swift/.build/arm64-apple-macosx/debug/keterm.product/Objects.LinkFileList" : {
+      "alwaysOutOfDate" : false,
+      "inputs" : [
+        {
+          "kind" : "virtual",
+          "name" : "<link-file-list>"
+        },
+        {
+          "kind" : "file",
+          "name" : "/Users/kentaro/workspace/claude/terminal/swift/.build/arm64-apple-macosx/debug/KetermCore.build/Cell.swift.o"
+        },
+        {
+          "kind" : "file",
+          "name" : "/Users/kentaro/workspace/claude/terminal/swift/.build/arm64-apple-macosx/debug/KetermCore.build/Grid.swift.o"
+        },
+        {
+          "kind" : "file",
+          "name" : "/Users/kentaro/workspace/claude/terminal/swift/.build/arm64-apple-macosx/debug/KetermCore.build/Parser.swift.o"
+        },
+        {
+          "kind" : "file",
+          "name" : "/Users/kentaro/workspace/claude/terminal/swift/.build/arm64-apple-macosx/debug/KetermCore.build/Terminal.swift.o"
+        },
+        {
+          "kind" : "file",
+          "name" : "/Users/kentaro/workspace/claude/terminal/swift/.build/arm64-apple-macosx/debug/KetermCore.build/Width.swift.o"
+        },
+        {
+          "kind" : "file",
+          "name" : "/Users/kentaro/workspace/claude/terminal/swift/.build/arm64-apple-macosx/debug/keterm.build/main.swift.o"
+        }
+      ],
+      "outputFilePath" : "/Users/kentaro/workspace/claude/terminal/swift/.build/arm64-apple-macosx/debug/keterm.product/Objects.LinkFileList"
+    },
+    "/Users/kentaro/workspace/claude/terminal/swift/.build/arm64-apple-macosx/debug/ketermPackageTests.build/sources" : {
+      "alwaysOutOfDate" : false,
+      "inputs" : [
+        {
+          "kind" : "virtual",
+          "name" : "<sources-file-list>"
+        },
+        {
+          "kind" : "file",
+          "name" : "/Users/kentaro/workspace/claude/terminal/swift/.build/arm64-apple-macosx/debug/ketermPackageTests.derived/runner.swift"
+        }
+      ],
+      "outputFilePath" : "/Users/kentaro/workspace/claude/terminal/swift/.build/arm64-apple-macosx/debug/ketermPackageTests.build/sources"
+    },
+    "/Users/kentaro/workspace/claude/terminal/swift/.build/arm64-apple-macosx/debug/ketermPackageTests.product/Objects.LinkFileList" : {
+      "alwaysOutOfDate" : false,
+      "inputs" : [
+        {
+          "kind" : "virtual",
+          "name" : "<link-file-list>"
+        },
+        {
+          "kind" : "file",
+          "name" : "/Users/kentaro/workspace/claude/terminal/swift/.build/arm64-apple-macosx/debug/KetermCore.build/Cell.swift.o"
+        },
+        {
+          "kind" : "file",
+          "name" : "/Users/kentaro/workspace/claude/terminal/swift/.build/arm64-apple-macosx/debug/KetermCore.build/Grid.swift.o"
+        },
+        {
+          "kind" : "file",
+          "name" : "/Users/kentaro/workspace/claude/terminal/swift/.build/arm64-apple-macosx/debug/KetermCore.build/Parser.swift.o"
+        },
+        {
+          "kind" : "file",
+          "name" : "/Users/kentaro/workspace/claude/terminal/swift/.build/arm64-apple-macosx/debug/KetermCore.build/Terminal.swift.o"
+        },
+        {
+          "kind" : "file",
+          "name" : "/Users/kentaro/workspace/claude/terminal/swift/.build/arm64-apple-macosx/debug/KetermCore.build/Width.swift.o"
+        },
+        {
+          "kind" : "file",
+          "name" : "/Users/kentaro/workspace/claude/terminal/swift/.build/arm64-apple-macosx/debug/KetermCoreTests.build/TerminalTests.swift.o"
+        },
+        {
+          "kind" : "file",
+          "name" : "/Users/kentaro/workspace/claude/terminal/swift/.build/arm64-apple-macosx/debug/ketermPackageTests.build/runner.swift.o"
+        }
+      ],
+      "outputFilePath" : "/Users/kentaro/workspace/claude/terminal/swift/.build/arm64-apple-macosx/debug/ketermPackageTests.product/Objects.LinkFileList"
+    },
+    "/Users/kentaro/workspace/claude/terminal/swift/.build/arm64-apple-macosx/debug/swift-version--58304C5D6DBC2206.txt" : {
+      "alwaysOutOfDate" : true,
+      "inputs" : [
+        {
+          "kind" : "virtual",
+          "name" : "<swift-get-version>"
+        },
+        {
+          "kind" : "file",
+          "name" : "/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/swiftc"
+        }
+      ],
+      "outputFilePath" : "/Users/kentaro/workspace/claude/terminal/swift/.build/arm64-apple-macosx/debug/swift-version--58304C5D6DBC2206.txt"
+    }
+  }
+}

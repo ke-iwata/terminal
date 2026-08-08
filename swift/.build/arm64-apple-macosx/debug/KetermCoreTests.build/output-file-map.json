@@ -1,0 +1,12 @@
+{
+  "": {
+    "swift-dependencies": "/Users/kentaro/workspace/claude/terminal/swift/.build/arm64-apple-macosx/debug/KetermCoreTests.build/primary.swiftdeps"
+  },
+  "/Users/kentaro/workspace/claude/terminal/swift/Tests/KetermCoreTests/TerminalTests.swift": {
+    "dependencies": "/Users/kentaro/workspace/claude/terminal/swift/.build/arm64-apple-macosx/debug/KetermCoreTests.build/TerminalTests.d",
+    "object": "/Users/kentaro/workspace/claude/terminal/swift/.build/arm64-apple-macosx/debug/KetermCoreTests.build/TerminalTests.swift.o",
+    "swiftmodule": "/Users/kentaro/workspace/claude/terminal/swift/.build/arm64-apple-macosx/debug/KetermCoreTests.build/TerminalTests~partial.swiftmodule",
+    "swift-dependencies": "/Users/kentaro/workspace/claude/terminal/swift/.build/arm64-apple-macosx/debug/KetermCoreTests.build/TerminalTests.swiftdeps",
+    "diagnostics": "/Users/kentaro/workspace/claude/terminal/swift/.build/arm64-apple-macosx/debug/KetermCoreTests.build/TerminalTests.dia"
+  }
+}

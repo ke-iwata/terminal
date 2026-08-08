@@ -1,0 +1,3 @@
+module KetermCore {
+    header "/Users/kentaro/workspace/claude/terminal/swift/.build/arm64-apple-macosx/debug/KetermCore.build/include/KetermCore-Swift.h"
+}
